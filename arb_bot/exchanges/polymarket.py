@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - optional for stream mode
 
 from arb_bot.config import PolymarketSettings
 from arb_bot.binary_math import build_quote_diagnostics, choose_effective_buy_price
-from arb_bot.models import BinaryQuote, LegExecutionResult, PairExecutionResult, Side, TradeLegPlan, TradePlan
+from arb_bot.models import BinaryQuote, LegExecutionResult, OrderState, OrderStatus, PairExecutionResult, Side, TradeLegPlan, TradePlan
 
 from .base import ExchangeAdapter
 
@@ -814,6 +814,68 @@ class PolymarketAdapter(ExchangeAdapter):
             )
 
         return self._to_leg_result(result, leg.contracts)
+
+    async def cancel_order(self, order_id: str) -> bool:
+        if self._live_client is None:
+            return False
+        try:
+            result = await asyncio.to_thread(self._live_client.cancel, order_id)
+            if isinstance(result, dict):
+                return not result.get("not_canceled", False)
+            return True
+        except Exception as exc:
+            LOGGER.warning("polymarket cancel_order failed for %s: %s", order_id, exc)
+            return False
+
+    async def get_order_status(self, order_id: str) -> OrderStatus | None:
+        if self._live_client is None:
+            return None
+        try:
+            result = await asyncio.to_thread(self._live_client.get_order, order_id)
+        except Exception as exc:
+            LOGGER.warning("polymarket get_order_status failed for %s: %s", order_id, exc)
+            return None
+
+        if not isinstance(result, dict):
+            return None
+
+        status_str = str(result.get("status", "")).lower()
+        filled = 0
+        remaining = 0
+        try:
+            size_matched = float(result.get("size_matched", 0) or 0)
+            original_size = float(result.get("original_size", 0) or result.get("size", 0) or 0)
+            filled = int(size_matched)
+            remaining = max(0, int(original_size) - filled)
+        except (TypeError, ValueError):
+            pass
+
+        avg_price = result.get("associate_trades", {}).get("avg_price") or result.get("price")
+        if avg_price is not None:
+            try:
+                avg_price = float(avg_price)
+            except (TypeError, ValueError):
+                avg_price = None
+
+        state_map = {
+            "live": OrderState.OPEN,
+            "matched": OrderState.FILLED,
+            "canceled": OrderState.CANCELLED,
+            "cancelled": OrderState.CANCELLED,
+            "expired": OrderState.EXPIRED,
+        }
+        state = state_map.get(status_str, OrderState.UNKNOWN)
+        if filled > 0 and remaining > 0 and state not in (OrderState.CANCELLED, OrderState.EXPIRED):
+            state = OrderState.PARTIALLY_FILLED
+
+        return OrderStatus(
+            order_id=order_id,
+            state=state,
+            filled_contracts=filled,
+            remaining_contracts=remaining,
+            average_price=avg_price,
+            raw=result,
+        )
 
     def _token_id_for_leg(self, leg: TradeLegPlan) -> str | None:
         if leg.side is Side.YES:
