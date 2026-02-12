@@ -277,6 +277,43 @@ pub fn simulate_execution(
     sequential: bool,
     config: &ExecutionModelConfig,
 ) -> ExecutionEstimateOutput {
+    // Early return for zero or negative contracts.
+    if contracts <= 0 {
+        let empty_legs: Vec<LegFillEstimateOutput> = legs.iter().map(|leg| {
+            LegFillEstimateOutput {
+                venue: leg.venue.clone(),
+                market_id: leg.market_id.clone(),
+                side: leg.side.clone(),
+                fill_probability: 0.0,
+                expected_fill_fraction: 0.0,
+                queue_position_score: 0.0,
+                market_impact: 0.0,
+                expected_slippage: 0.0,
+                time_offset_seconds: staleness_seconds + config.latency_seconds,
+            }
+        }).collect();
+        return ExecutionEstimateOutput {
+            legs: empty_legs,
+            all_fill_probability: 0.0,
+            expected_fill_fraction: 0.0,
+            expected_slippage_per_contract: 0.0,
+            expected_market_impact_per_contract: 0.0,
+            graduated_fill_distribution: vec![(0.0, 1.0)],
+        };
+    }
+
+    // Early return for empty legs.
+    if legs.is_empty() {
+        return ExecutionEstimateOutput {
+            legs: Vec::new(),
+            all_fill_probability: 1.0,
+            expected_fill_fraction: 0.0,
+            expected_slippage_per_contract: 0.0,
+            expected_market_impact_per_contract: 0.0,
+            graduated_fill_distribution: vec![(0.0, 1.0)],
+        };
+    }
+
     let mut leg_estimates = Vec::with_capacity(legs.len());
     let mut all_fill_prob = 1.0f64;
     let mut total_slippage = 0.0f64;

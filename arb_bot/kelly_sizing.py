@@ -222,3 +222,81 @@ def _raw_kelly(
         raw = max(0.0, (b * p - a * q) / (a * b))
     adjusted = raw * math.sqrt(p)
     return max(0.0, min(1.0, adjusted))
+
+
+# ---------------------------------------------------------------------------
+# Rust dispatch for TailRiskKelly.compute().
+# When arb_engine_rs is installed and ARB_USE_RUST_KELLY=1 (or
+# ARB_USE_RUST_ALL=1), replaces compute() with Rust implementation.
+# The lane_variance is still computed in Python (stateful tracking).
+# Set env var to "0" for instant rollback.
+# ---------------------------------------------------------------------------
+
+
+def _try_rust_dispatch() -> bool:
+    """Attempt to replace TailRiskKelly.compute with Rust implementation."""
+    import json
+    import os
+
+    if os.environ.get("ARB_USE_RUST_KELLY", "") != "1" and \
+       os.environ.get("ARB_USE_RUST_ALL", "") != "1":
+        return False
+
+    try:
+        import arb_engine_rs  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+
+    _py_compute = TailRiskKelly.compute
+
+    def _rs_compute(
+        self: TailRiskKelly,
+        edge: float,
+        cost: float,
+        fill_prob: float,
+        model_uncertainty: float = 0.0,
+        lane: str = "",
+        failure_loss: float | None = None,
+    ) -> KellySizingResult:
+        cfg = self._config
+        lane_var = self._lane_variance(lane)
+        rs_json = arb_engine_rs.compute_kelly(
+            edge, cost, fill_prob,
+            model_uncertainty, lane_var, failure_loss,
+            cfg.base_kelly_fraction,
+            cfg.uncertainty_haircut_factor,
+            cfg.variance_haircut_factor,
+            cfg.min_confidence,
+            cfg.max_model_uncertainty,
+        )
+        d = json.loads(rs_json)
+        return KellySizingResult(
+            raw_kelly=d["raw_kelly"],
+            adjusted_fraction=d["adjusted_fraction"],
+            uncertainty_haircut=d["uncertainty_haircut"],
+            variance_haircut=d["variance_haircut"],
+            confidence=d["confidence"],
+            blocked=d["blocked"],
+            block_reason=d["block_reason"],
+        )
+
+    TailRiskKelly.compute = _rs_compute  # type: ignore[assignment]
+
+    # Also dispatch _raw_kelly module-level function.
+    import sys
+    this = sys.modules[__name__]
+
+    def _rs_raw_kelly(
+        edge: float, cost: float, fill_prob: float,
+        failure_loss: float | None = None,
+    ) -> float:
+        return arb_engine_rs.execution_aware_kelly_fraction(
+            edge, cost, fill_prob, failure_loss,
+        )
+
+    setattr(this, "_raw_kelly", _rs_raw_kelly)
+
+    return True
+
+
+_RUST_ACTIVE = _try_rust_dispatch()

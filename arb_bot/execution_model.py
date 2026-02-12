@@ -374,3 +374,89 @@ class LegInput:
     available_size: float
     spread: float = 0.0
     bid_price: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Rust dispatch for ExecutionModel.simulate().
+# When arb_engine_rs is installed and ARB_USE_RUST_EXECUTION_MODEL=1 (or
+# ARB_USE_RUST_ALL=1), replaces simulate() with Rust implementation.
+# Set env var to "0" for instant rollback.
+# ---------------------------------------------------------------------------
+
+
+def _try_rust_dispatch() -> bool:
+    """Attempt to replace ExecutionModel.simulate with Rust implementation."""
+    import json
+    import os
+
+    if os.environ.get("ARB_USE_RUST_EXECUTION_MODEL", "") != "1" and \
+       os.environ.get("ARB_USE_RUST_ALL", "") != "1":
+        return False
+
+    try:
+        import arb_engine_rs  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+
+    _py_simulate = ExecutionModel.simulate
+
+    def _rs_simulate(
+        self: ExecutionModel,
+        legs: list,
+        contracts: int,
+        staleness_seconds: float = 0.0,
+        sequential: bool = False,
+    ) -> ExecutionEstimate:
+        cfg = self._config
+        legs_json = json.dumps([
+            {
+                "venue": l.venue, "market_id": l.market_id,
+                "side": l.side, "buy_price": l.buy_price,
+                "available_size": l.available_size, "spread": l.spread,
+            }
+            for l in legs
+        ])
+        config_json = json.dumps({
+            "queue_decay_half_life_seconds": cfg.queue_decay_half_life_seconds,
+            "latency_seconds": cfg.latency_seconds,
+            "market_impact_factor": cfg.market_impact_factor,
+            "max_market_impact": cfg.max_market_impact,
+            "min_fill_fraction": cfg.min_fill_fraction,
+            "fill_fraction_steps": cfg.fill_fraction_steps,
+            "sequential_leg_delay_seconds": cfg.sequential_leg_delay_seconds,
+            "enable_queue_decay": cfg.enable_queue_decay,
+            "enable_market_impact": cfg.enable_market_impact,
+        })
+        rs_json = arb_engine_rs.simulate_execution(
+            legs_json, contracts, staleness_seconds, sequential, config_json,
+        )
+        d = json.loads(rs_json)
+        leg_estimates = tuple(
+            LegFillEstimate(
+                venue=le["venue"], market_id=le["market_id"],
+                side=le["side"], fill_probability=le["fill_probability"],
+                expected_fill_fraction=le["expected_fill_fraction"],
+                queue_position_score=le["queue_position_score"],
+                market_impact=le["market_impact"],
+                expected_slippage=le["expected_slippage"],
+                time_offset_seconds=le["time_offset_seconds"],
+            )
+            for le in d["legs"]
+        )
+        return ExecutionEstimate(
+            legs=leg_estimates,
+            all_fill_probability=d["all_fill_probability"],
+            expected_fill_fraction=d["expected_fill_fraction"],
+            expected_slippage_per_contract=d["expected_slippage_per_contract"],
+            expected_market_impact_per_contract=d["expected_market_impact_per_contract"],
+            graduated_fill_distribution=tuple(
+                tuple(pair) for pair in d["graduated_fill_distribution"]
+            ),
+        )
+
+    ExecutionModel.simulate = _rs_simulate  # type: ignore[assignment]
+
+    return True
+
+
+_RUST_ACTIVE = _try_rust_dispatch()

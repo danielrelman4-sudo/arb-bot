@@ -24,9 +24,41 @@ try:
 except ImportError:
     pytest.skip("arb_engine_rs not installed", allow_module_level=True)
 
+import importlib
+import os
+
+import arb_bot.fee_model
+import arb_bot.kelly_sizing
+import arb_bot.sizing
+import arb_bot.execution_model
+
 from arb_bot.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
 from arb_bot.kelly_sizing import TailRiskKelly, TailRiskKellyConfig, _raw_kelly
 from arb_bot.sizing import PositionSizer
+
+# ---------------------------------------------------------------------------
+# Ensure clean module state (dispatch tests may have leaked)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _clean_dispatch_state():
+    """Reload modules to clear any dispatch monkey-patching from other tests."""
+    for key in list(os.environ):
+        if key.startswith("ARB_USE_RUST_"):
+            os.environ.pop(key, None)
+    importlib.reload(arb_bot.fee_model)
+    importlib.reload(arb_bot.kelly_sizing)
+    importlib.reload(arb_bot.sizing)
+    importlib.reload(arb_bot.execution_model)
+    # Re-import from clean modules.
+    global FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
+    global TailRiskKelly, TailRiskKellyConfig, _raw_kelly, PositionSizer
+    from arb_bot.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
+    from arb_bot.kelly_sizing import TailRiskKelly, TailRiskKellyConfig, _raw_kelly
+    from arb_bot.sizing import PositionSizer
+    yield
+
 
 # ---------------------------------------------------------------------------
 # Tolerance
