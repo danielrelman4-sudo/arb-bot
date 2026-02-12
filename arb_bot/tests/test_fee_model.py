@@ -155,6 +155,120 @@ class TestCombinedFees:
 
 
 # ---------------------------------------------------------------------------
+# Fee estimation — P*(1-P) curve fees (Kalshi-style)
+# ---------------------------------------------------------------------------
+
+
+class TestCurveFees:
+    def test_kalshi_curve_at_50_cents(self) -> None:
+        """Kalshi formula: ceil(0.035 * C * P * (1-P)) rounded up to cent."""
+        schedule = VenueFeeSchedule(
+            venue="kalshi",
+            taker_curve_coefficient=0.035,
+        )
+        model = _model(schedule)
+        est = model.estimate("kalshi", OrderType.TAKER, contracts=10, price=0.50)
+        # 0.035 * 10 * 0.50 * 0.50 = 0.0875 → ceil to cent = 0.09
+        assert est.total_fee == pytest.approx(0.09)
+        assert est.breakdown["curve"] == pytest.approx(0.09)
+
+    def test_kalshi_curve_at_extreme_price(self) -> None:
+        """Near 0 or 1, P*(1-P) → 0 so fee → 0."""
+        schedule = VenueFeeSchedule(
+            venue="kalshi",
+            taker_curve_coefficient=0.035,
+        )
+        model = _model(schedule)
+        est = model.estimate("kalshi", OrderType.TAKER, contracts=10, price=0.99)
+        # 0.035 * 10 * 0.99 * 0.01 = 0.003465 → ceil to cent = 0.01
+        assert est.total_fee == pytest.approx(0.01)
+
+    def test_kalshi_curve_at_low_price(self) -> None:
+        schedule = VenueFeeSchedule(
+            venue="kalshi",
+            taker_curve_coefficient=0.035,
+        )
+        model = _model(schedule)
+        est = model.estimate("kalshi", OrderType.TAKER, contracts=10, price=0.05)
+        # 0.035 * 10 * 0.05 * 0.95 = 0.016625 → ceil to cent = 0.02
+        assert est.total_fee == pytest.approx(0.02)
+
+    def test_curve_disabled_when_zero(self) -> None:
+        schedule = VenueFeeSchedule(
+            venue="test",
+            taker_curve_coefficient=0.0,
+        )
+        model = _model(schedule)
+        est = model.estimate("test", OrderType.TAKER, contracts=10, price=0.50)
+        assert est.breakdown["curve"] == pytest.approx(0.0)
+
+    def test_curve_zero_at_boundary_prices(self) -> None:
+        """Price exactly 0 or 1 should produce zero curve fee."""
+        schedule = VenueFeeSchedule(
+            venue="test",
+            taker_curve_coefficient=0.035,
+        )
+        model = _model(schedule)
+        est0 = model.estimate("test", OrderType.TAKER, contracts=10, price=0.0)
+        est1 = model.estimate("test", OrderType.TAKER, contracts=10, price=1.0)
+        assert est0.breakdown["curve"] == pytest.approx(0.0)
+        assert est1.breakdown["curve"] == pytest.approx(0.0)
+
+    def test_curve_no_round_up(self) -> None:
+        schedule = VenueFeeSchedule(
+            venue="test",
+            taker_curve_coefficient=0.035,
+            curve_round_up=False,
+        )
+        model = _model(schedule)
+        est = model.estimate("test", OrderType.TAKER, contracts=10, price=0.50)
+        # 0.035 * 10 * 0.50 * 0.50 = 0.0875 (exact, no rounding)
+        assert est.total_fee == pytest.approx(0.0875)
+
+    def test_curve_maker(self) -> None:
+        schedule = VenueFeeSchedule(
+            venue="test",
+            maker_curve_coefficient=0.02,
+        )
+        model = _model(schedule)
+        est = model.estimate("test", OrderType.MAKER, contracts=10, price=0.50)
+        # 0.02 * 10 * 0.50 * 0.50 = 0.05
+        assert est.total_fee == pytest.approx(0.05)
+
+    def test_curve_plus_flat(self) -> None:
+        """Curve fee combines with flat fee."""
+        schedule = VenueFeeSchedule(
+            venue="kalshi",
+            taker_fee_per_contract=0.01,
+            taker_curve_coefficient=0.035,
+        )
+        model = _model(schedule)
+        est = model.estimate("kalshi", OrderType.TAKER, contracts=10, price=0.50)
+        # Flat: 0.01 * 10 = 0.10
+        # Curve: ceil(0.035 * 10 * 0.25 * 100) / 100 = ceil(8.75)/100 = 0.09
+        # Total: 0.19
+        assert est.total_fee == pytest.approx(0.19)
+
+    def test_realistic_kalshi_fee_shape(self) -> None:
+        """Fee should peak at P=0.50 and decrease toward extremes."""
+        schedule = VenueFeeSchedule(
+            venue="kalshi",
+            taker_curve_coefficient=0.035,
+            curve_round_up=False,
+        )
+        model = _model(schedule)
+        fee_50 = model.estimate("kalshi", OrderType.TAKER, 10, price=0.50).total_fee
+        fee_30 = model.estimate("kalshi", OrderType.TAKER, 10, price=0.30).total_fee
+        fee_10 = model.estimate("kalshi", OrderType.TAKER, 10, price=0.10).total_fee
+        fee_90 = model.estimate("kalshi", OrderType.TAKER, 10, price=0.90).total_fee
+        # Peak at 50.
+        assert fee_50 > fee_30
+        assert fee_50 > fee_10
+        # Symmetric: P=0.30 same as P=0.70, P=0.10 same as P=0.90.
+        assert fee_10 == pytest.approx(fee_90)
+
+
+# ---------------------------------------------------------------------------
 # Fee estimation — min/max caps
 # ---------------------------------------------------------------------------
 
