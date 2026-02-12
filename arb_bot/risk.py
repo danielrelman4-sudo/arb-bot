@@ -1,16 +1,35 @@
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 from arb_bot.config import RiskSettings
 from arb_bot.models import EngineState, OpportunityKind, TradePlan
 
+if TYPE_CHECKING:
+    from arb_bot.kill_switch import KillSwitchManager
+
 
 class RiskManager:
-    def __init__(self, settings: RiskSettings) -> None:
+    def __init__(
+        self,
+        settings: RiskSettings,
+        kill_switch: KillSwitchManager | None = None,
+    ) -> None:
         self._settings = settings
+        self._kill_switch = kill_switch
+
+    @property
+    def kill_switch(self) -> KillSwitchManager | None:
+        return self._kill_switch
 
     def precheck(self, plan: TradePlan, state: EngineState) -> tuple[bool, str]:
+        # Phase 1A: Kill switch checks before anything else.
+        if self._kill_switch is not None:
+            ks_state = self._kill_switch.check(plan.venues)
+            if ks_state.halted:
+                return False, f"kill switch: {ks_state.reason}"
+
         now = time.time()
 
         for leg in plan.legs:
