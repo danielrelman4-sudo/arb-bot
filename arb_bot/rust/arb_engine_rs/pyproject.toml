@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.4"]
+build-backend = "maturin"
+
+[project]
+name = "arb_engine_rs"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "Rust hot-path engine for arb_bot"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "arb_engine_rs"

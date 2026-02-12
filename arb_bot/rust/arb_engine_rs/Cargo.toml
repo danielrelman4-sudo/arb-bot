@@ -1,0 +1,18 @@
+[package]
+name = "arb_engine_rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust hot-path engine for arb_bot (PyO3 extension module)"
+
+[lib]
+name = "arb_engine_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+approx = "0.5"
