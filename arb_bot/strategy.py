@@ -101,6 +101,9 @@ class ArbitrageFinder:
         bucket_quality_min_score: float = -0.02,
         bucket_quality_leg_count_penalty: float = 0.00025,
         bucket_quality_live_update_interval: int = 25,
+        bucket_quality_use_thompson_sampling: bool = True,
+        bucket_quality_thompson_prior_alpha: float = 1.0,
+        bucket_quality_thompson_prior_beta: float = 1.0,
     ) -> None:
         self._min_net_edge_per_contract = min_net_edge_per_contract
         self._enable_cross_venue = enable_cross_venue
@@ -137,6 +140,9 @@ class ArbitrageFinder:
                 min_score=bucket_quality_min_score,
                 leg_count_penalty=bucket_quality_leg_count_penalty,
                 live_update_interval=bucket_quality_live_update_interval,
+                use_thompson_sampling=bucket_quality_use_thompson_sampling,
+                thompson_prior_alpha=bucket_quality_thompson_prior_alpha,
+                thompson_prior_beta=bucket_quality_thompson_prior_beta,
             )
             LOGGER.info(self._bucket_quality_model.summary())
 

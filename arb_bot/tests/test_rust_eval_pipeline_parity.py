@@ -338,12 +338,24 @@ class TestKellyFullParity:
             # Re-apply the variance haircut on the raw Python result.
             raw = _raw_kelly(case["edge"], case["cost"], case["fill_prob"], case["failure_loss"])
             fraction = min(raw, case["base"])
-            u_haircut = min(1.0, case["uncertainty"] * case["u_factor"])
-            fraction *= (1.0 - u_haircut)
+            # Baker-McHale shrinkage (default).
+            edge = case["edge"]
+            cost = case["cost"]
+            unc = case["uncertainty"]
+            if cost > 0:
+                b = edge / cost
+                sigma_sq = (unc * edge) ** 2
+                b_sq_sigma_sq = b * b * sigma_sq
+                shrinkage = 1.0 / (1.0 + b_sq_sigma_sq) if b_sq_sigma_sq > 0 else 1.0
+                u_haircut = 1.0 - shrinkage
+                fraction *= shrinkage
+            else:
+                u_haircut = min(1.0, unc * case["u_factor"])
+                fraction *= (1.0 - u_haircut)
             v_haircut = min(1.0, lane_variance * case["v_factor"])
             fraction *= (1.0 - v_haircut)
             fraction = max(0.0, min(1.0, fraction))
-            confidence = max(0.0, 1.0 - case["uncertainty"])
+            confidence = max(0.0, 1.0 - unc)
             py_adj = fraction
             py_blocked = False
             py_reason = ""
@@ -365,6 +377,7 @@ class TestKellyFullParity:
             case["uncertainty"], lane_variance, case["failure_loss"],
             case["base"], case["u_factor"], case["v_factor"],
             case["min_conf"], case["max_u"],
+            True,  # use_baker_mchale_shrinkage
         )
         rs = json.loads(rs_json)
 

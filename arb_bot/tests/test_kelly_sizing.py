@@ -168,7 +168,8 @@ class TestComputeSuccess:
         no_unc = sizer.compute(edge=EDGE, cost=COST, fill_prob=FILL, model_uncertainty=0.0)
         with_unc = sizer.compute(edge=EDGE, cost=COST, fill_prob=FILL, model_uncertainty=0.3)
         assert with_unc.adjusted_fraction < no_unc.adjusted_fraction
-        assert with_unc.uncertainty_haircut == pytest.approx(0.3)
+        # Baker-McHale shrinkage: haircut is > 0 for non-zero uncertainty.
+        assert with_unc.uncertainty_haircut > 0.0
 
     def test_fractional_kelly_cap(self) -> None:
         sizer = _sizer(base_kelly_fraction=0.25)

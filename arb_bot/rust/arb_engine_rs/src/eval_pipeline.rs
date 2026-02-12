@@ -484,6 +484,7 @@ pub fn compute_kelly(
     variance_haircut_factor: f64,
     min_confidence: f64,
     max_model_uncertainty: f64,
+    use_baker_mchale_shrinkage: bool,
 ) -> KellyResult {
     // Blocking checks.
     if model_uncertainty > max_model_uncertainty {
@@ -527,9 +528,27 @@ pub fn compute_kelly(
     // Fractional cap.
     let mut fraction = rk.min(base_kelly_fraction);
 
-    // Uncertainty haircut.
-    let u_haircut = (model_uncertainty * uncertainty_haircut_factor).min(1.0);
-    fraction *= 1.0 - u_haircut;
+    // Uncertainty haircut — Baker-McHale (2013) shrinkage or legacy linear.
+    let u_haircut;
+    if use_baker_mchale_shrinkage && cost > 0.0 {
+        // Baker-McHale (2013): k* = 1 / (1 + b² σ²)
+        // b = edge/cost (the odds ratio)
+        // σ² = (model_uncertainty × edge)² — relative std dev of edge estimate
+        let b = edge / cost;
+        let sigma_sq = (model_uncertainty * edge) * (model_uncertainty * edge);
+        let b_sq_sigma_sq = b * b * sigma_sq;
+        let shrinkage = if b_sq_sigma_sq > 0.0 {
+            1.0 / (1.0 + b_sq_sigma_sq)
+        } else {
+            1.0
+        };
+        u_haircut = 1.0 - shrinkage;
+        fraction *= shrinkage;
+    } else {
+        // Legacy linear haircut.
+        u_haircut = (model_uncertainty * uncertainty_haircut_factor).min(1.0);
+        fraction *= 1.0 - u_haircut;
+    }
 
     // Variance haircut.
     let v_haircut = (lane_variance * variance_haircut_factor).min(1.0);
@@ -743,7 +762,7 @@ pub fn simulate_execution_py(
 }
 
 #[pyfunction]
-#[pyo3(name = "compute_kelly", signature = (edge, cost, fill_prob, model_uncertainty, lane_variance, failure_loss, base_kelly_fraction, uncertainty_haircut_factor, variance_haircut_factor, min_confidence, max_model_uncertainty))]
+#[pyo3(name = "compute_kelly", signature = (edge, cost, fill_prob, model_uncertainty, lane_variance, failure_loss, base_kelly_fraction, uncertainty_haircut_factor, variance_haircut_factor, min_confidence, max_model_uncertainty, use_baker_mchale_shrinkage=true))]
 pub fn compute_kelly_py(
     edge: f64,
     cost: f64,
@@ -756,6 +775,7 @@ pub fn compute_kelly_py(
     variance_haircut_factor: f64,
     min_confidence: f64,
     max_model_uncertainty: f64,
+    use_baker_mchale_shrinkage: bool,
 ) -> PyResult<String> {
     let result = compute_kelly(
         edge,
@@ -769,6 +789,7 @@ pub fn compute_kelly_py(
         variance_haircut_factor,
         min_confidence,
         max_model_uncertainty,
+        use_baker_mchale_shrinkage,
     );
     serde_json::to_string(&result)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize: {}", e)))

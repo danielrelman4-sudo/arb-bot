@@ -4,6 +4,7 @@ import csv
 import glob
 import hashlib
 import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -91,7 +92,18 @@ class BucketScore:
 
 
 class BucketQualityModel:
-    """Ranks structural bucket rules for exploit/explore selection."""
+    """Ranks structural bucket rules via Thompson Sampling.
+
+    Instead of a deterministic explore/exploit split, each bucket
+    maintains a Beta(alpha, beta) posterior over its success
+    probability.  At each recompute we sample from each bucket's
+    posterior and enable the top-k by sampled value.  This naturally
+    balances exploration (uncertain buckets have high-variance samples)
+    and exploitation (proven buckets have high-mean samples).
+
+    Reference: Agrawal & Goyal (2012), "Analysis of Thompson Sampling
+    for the Multi-armed Bandit Problem", COLT.
+    """
 
     def __init__(
         self,
@@ -107,6 +119,9 @@ class BucketQualityModel:
         min_score: float = -0.02,
         leg_count_penalty: float = 0.00025,
         live_update_interval: int = 25,
+        thompson_prior_alpha: float = 1.0,
+        thompson_prior_beta: float = 1.0,
+        use_thompson_sampling: bool = True,
     ) -> None:
         self._enabled = enabled
         self._bucket_leg_counts = dict(bucket_leg_counts)
@@ -121,6 +136,9 @@ class BucketQualityModel:
         self._leg_count_penalty = max(0.0, leg_count_penalty)
         self._live_update_interval = max(1, live_update_interval)
         self._live_updates_since_recompute = 0
+        self._thompson_prior_alpha = max(0.01, thompson_prior_alpha)
+        self._thompson_prior_beta = max(0.01, thompson_prior_beta)
+        self._use_thompson_sampling = use_thompson_sampling
 
         self._accumulators: dict[str, BucketAccumulator] = {}
         self._scores: dict[str, BucketScore] = {}
@@ -325,6 +343,52 @@ class BucketQualityModel:
             self._active_bucket_ids = set(all_ids)
             return
 
+        if self._use_thompson_sampling:
+            self._active_bucket_ids = self._thompson_select(all_ids, capacity)
+        else:
+            self._active_bucket_ids = self._deterministic_select(all_ids, capacity)
+
+    def _thompson_select(self, all_ids: list[str], capacity: int) -> set[str]:
+        """Thompson Sampling: sample from each bucket's Beta posterior,
+        enable top-k by sampled value.
+
+        Beta(alpha, beta) where:
+            alpha = positive_outcomes + prior_alpha
+            beta  = (opened - positive_outcomes) + prior_beta
+
+        Buckets with no history use the prior (uniform by default),
+        giving them high variance = natural exploration.
+        """
+        sampled: list[tuple[float, str]] = []
+        for group_id in all_ids:
+            acc = self._accumulators.get(group_id)
+            if acc is None or acc.opened == 0:
+                # No history — sample from prior (high variance = exploration).
+                alpha = self._thompson_prior_alpha
+                beta_param = self._thompson_prior_beta
+            else:
+                alpha = acc.positive_outcomes + self._thompson_prior_alpha
+                beta_param = (acc.opened - acc.positive_outcomes) + self._thompson_prior_beta
+
+            # Hard filter: if we have enough data and score is terrible, skip.
+            score = self._scores.get(group_id)
+            if score is not None and acc is not None and acc.detections >= self._min_observations:
+                if score.score < self._min_score:
+                    continue
+
+            sampled_value = random.betavariate(alpha, beta_param)
+            sampled.append((sampled_value, group_id))
+
+        # Sort by sampled value descending, take top capacity.
+        sampled.sort(key=lambda x: x[0], reverse=True)
+        active = {group_id for _, group_id in sampled[:capacity]}
+
+        if not active:
+            active = set(all_ids)
+        return active
+
+    def _deterministic_select(self, all_ids: list[str], capacity: int) -> set[str]:
+        """Legacy deterministic explore/exploit selection (fallback)."""
         ready: list[str] = []
         uncertain: list[str] = []
         for group_id in all_ids:
@@ -367,9 +431,9 @@ class BucketQualityModel:
             active.extend(uncertain[:capacity] if uncertain else all_ids[:capacity])
 
         if not active:
-            active = all_ids
+            active = list(all_ids)
 
-        self._active_bucket_ids = set(active)
+        return set(active)
 
     def _score_bucket(self, group_id: str, acc: BucketAccumulator) -> BucketScore:
         avg_edge = acc.average_detected_edge()
