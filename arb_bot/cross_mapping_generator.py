@@ -60,6 +60,7 @@ class CandidateMatch:
     shared_tokens: int
     kalshi_text: str
     polymarket_text: str
+    forecastex_market_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -213,14 +214,63 @@ def _polymarket_candidate(market: dict[str, Any]) -> CandidateMarket | None:
     )
 
 
-def _build_candidates(markets: list[dict[str, Any]]) -> tuple[list[CandidateMarket], list[CandidateMarket]]:
+def _build_forecastex_text(market: dict[str, Any]) -> str:
+    """Build descriptive text for a ForecastEx/IBKR event contract."""
+    # ForecastEx contracts have a symbol-based naming convention.
+    symbol = str(market.get("symbol") or market.get("localSymbol") or "").strip()
+    description = str(
+        market.get("description") or market.get("longName") or market.get("name") or ""
+    ).strip()
+    if description and symbol:
+        return f"{description} {symbol}"
+    return description or symbol
+
+
+def _forecastex_candidate(market: dict[str, Any]) -> CandidateMarket | None:
+    market_id = str(
+        market.get("contract_id")
+        or market.get("conId")
+        or market.get("market_id")
+        or market.get("symbol")
+        or ""
+    ).strip()
+    if not market_id:
+        return None
+    text = _build_forecastex_text(market)
+    tokens = _tokenize(text)
+    if len(tokens) < 2:
+        return None
+    liquidity = _as_float(market.get("liquidity") or market.get("open_interest") or 0.0)
+    volume = _as_float(market.get("volume") or market.get("volume_24h") or 0.0)
+    return CandidateMarket(
+        venue="forecastex",
+        market_id=market_id,
+        text=text,
+        tokens=tokens,
+        liquidity=liquidity,
+        volume=volume,
+    )
+
+
+def _build_candidates(markets: list[dict[str, Any]]) -> tuple[list[CandidateMarket], list[CandidateMarket], list[CandidateMarket]]:
     kalshi: list[CandidateMarket] = []
     polymarket: list[CandidateMarket] = []
+    forecastex: list[CandidateMarket] = []
     seen_k: set[str] = set()
     seen_p: set[str] = set()
+    seen_f: set[str] = set()
 
     for market in markets:
         venue = str(market.get("venue") or market.get("exchange") or "").strip().lower()
+
+        if venue == "forecastex" or venue == "ibkr" or "conId" in market or market.get("exchange", "").upper() == "FORECASTX":
+            candidate = _forecastex_candidate(market)
+            if candidate is None or candidate.market_id in seen_f:
+                continue
+            seen_f.add(candidate.market_id)
+            forecastex.append(candidate)
+            continue
+
         if venue == "kalshi" or "event_ticker" in market or "market_ticker" in market or "ticker" in market:
             candidate = _kalshi_candidate(market)
             if candidate is None or candidate.market_id in seen_k:
@@ -236,7 +286,7 @@ def _build_candidates(markets: list[dict[str, Any]]) -> tuple[list[CandidateMark
             seen_p.add(candidate.market_id)
             polymarket.append(candidate)
 
-    return kalshi, polymarket
+    return kalshi, polymarket, forecastex
 
 
 def _similarity(left_tokens: frozenset[str], right_tokens: frozenset[str]) -> tuple[float, int]:
@@ -266,6 +316,74 @@ def _unique_group_id(base: str, seen: set[str]) -> str:
         index += 1
 
 
+def _best_match_for(
+    source: CandidateMarket,
+    target_candidates: list[CandidateMarket],
+    token_freq: Counter[str],
+    token_to_target_indexes: dict[str, list[int]],
+    *,
+    min_match_score: float,
+    min_shared_tokens: int,
+    min_score_gap: float,
+    max_token_share: float,
+    max_candidate_pool: int,
+    skip_reasons: Counter[str],
+) -> CandidateMarket | None:
+    """Find the best unique match for ``source`` among ``target_candidates``."""
+    max_df = max(2, int(len(target_candidates) * max(0.0001, max_token_share)))
+    indexed_tokens = [
+        token
+        for token in source.tokens
+        if 0 < token_freq.get(token, 0) <= max_df
+    ]
+    if not indexed_tokens:
+        skip_reasons["no_indexable_tokens"] += 1
+        return None
+
+    candidate_indexes: set[int] = set()
+    for token in sorted(indexed_tokens, key=lambda value: token_freq.get(value, 0)):
+        candidate_indexes.update(token_to_target_indexes.get(token, []))
+        if len(candidate_indexes) >= max_candidate_pool:
+            break
+
+    if not candidate_indexes:
+        skip_reasons["no_candidate_pool"] += 1
+        return None
+
+    scored: list[tuple[float, int, CandidateMarket]] = []
+    for idx in candidate_indexes:
+        target = target_candidates[idx]
+        score, shared = _similarity(source.tokens, target.tokens)
+        if shared < min_shared_tokens or score < min_match_score:
+            continue
+        scored.append((score, shared, target))
+
+    if not scored:
+        skip_reasons["below_threshold"] += 1
+        return None
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2].liquidity, item[2].volume), reverse=True)
+    best_score, _best_shared, best_target = scored[0]
+    if len(scored) > 1 and (best_score - scored[1][0]) < min_score_gap:
+        skip_reasons["ambiguous_top_match"] += 1
+        return None
+
+    return best_target
+
+
+def _build_token_index(
+    candidates: list[CandidateMarket],
+) -> tuple[Counter[str], dict[str, list[int]]]:
+    """Build token frequency and inverted index for a candidate list."""
+    freq: Counter[str] = Counter()
+    index: dict[str, list[int]] = defaultdict(list)
+    for idx, cand in enumerate(candidates):
+        for token in cand.tokens:
+            freq[token] += 1
+            index[token].append(idx)
+    return freq, index
+
+
 def generate_cross_venue_mapping_rows(
     markets: list[dict[str, Any]],
     *,
@@ -275,10 +393,13 @@ def generate_cross_venue_mapping_rows(
     max_token_share: float = 0.02,
     max_candidate_pool: int = 2000,
 ) -> tuple[list[dict[str, str]], MappingDiagnostics]:
-    kalshi_candidates, polymarket_candidates = _build_candidates(markets)
+    kalshi_candidates, polymarket_candidates, forecastex_candidates = _build_candidates(markets)
 
     skip_reasons: Counter[str] = Counter()
-    if not kalshi_candidates or not polymarket_candidates:
+
+    # Need at least 2 venues to generate mappings.
+    venue_counts = sum(1 for v in [kalshi_candidates, polymarket_candidates, forecastex_candidates] if v)
+    if venue_counts < 2:
         diagnostics = MappingDiagnostics(
             kalshi_candidates=len(kalshi_candidates),
             polymarket_candidates=len(polymarket_candidates),
@@ -289,72 +410,45 @@ def generate_cross_venue_mapping_rows(
         )
         return [], diagnostics
 
-    token_freq: Counter[str] = Counter()
-    token_to_pm_indexes: dict[str, list[int]] = defaultdict(list)
-    for idx, candidate in enumerate(polymarket_candidates):
-        for token in candidate.tokens:
-            token_freq[token] += 1
-            token_to_pm_indexes[token].append(idx)
+    # Build token indexes for polymarket and forecastex.
+    pm_freq, pm_index = _build_token_index(polymarket_candidates)
+    fx_freq, fx_index = _build_token_index(forecastex_candidates)
 
-    max_df = max(2, int(len(polymarket_candidates) * max(0.0001, max_token_share)))
+    match_kwargs = dict(
+        min_match_score=min_match_score,
+        min_shared_tokens=min_shared_tokens,
+        min_score_gap=min_score_gap,
+        max_token_share=max_token_share,
+        max_candidate_pool=max_candidate_pool,
+        skip_reasons=skip_reasons,
+    )
+
+    # Phase 1: Kalshi ↔ Polymarket matching (original behavior).
     provisional_matches: list[CandidateMatch] = []
-
     for kalshi in kalshi_candidates:
-        indexed_tokens = [
-            token
-            for token in kalshi.tokens
-            if token_freq.get(token, 0) > 0 and token_freq.get(token, 0) <= max_df
-        ]
-        if not indexed_tokens:
-            skip_reasons["no_indexable_tokens"] += 1
-            continue
+        best_pm = _best_match_for(
+            kalshi, polymarket_candidates, pm_freq, pm_index, **match_kwargs,
+        ) if polymarket_candidates else None
 
-        candidate_indexes: set[int] = set()
-        for token in sorted(indexed_tokens, key=lambda value: token_freq.get(value, 0)):
-            candidate_indexes.update(token_to_pm_indexes.get(token, []))
-            if len(candidate_indexes) >= max_candidate_pool:
-                break
+        best_fx = _best_match_for(
+            kalshi, forecastex_candidates, fx_freq, fx_index, **match_kwargs,
+        ) if forecastex_candidates else None
 
-        if not candidate_indexes:
-            skip_reasons["no_candidate_pool"] += 1
-            continue
-
-        scored: list[tuple[float, int, CandidateMarket]] = []
-        for pm_index in candidate_indexes:
-            polymarket = polymarket_candidates[pm_index]
-            score, shared_tokens = _similarity(kalshi.tokens, polymarket.tokens)
-            if shared_tokens < min_shared_tokens:
-                continue
-            if score < min_match_score:
-                continue
-            scored.append((score, shared_tokens, polymarket))
-
-        if not scored:
-            skip_reasons["below_threshold"] += 1
-            continue
-
-        scored.sort(
-            key=lambda item: (
-                item[0],
-                item[1],
-                item[2].liquidity,
-                item[2].volume,
-            ),
-            reverse=True,
-        )
-        best_score, best_shared_tokens, best_pm = scored[0]
-        if len(scored) > 1 and (best_score - scored[1][0]) < min_score_gap:
-            skip_reasons["ambiguous_top_match"] += 1
+        if best_pm is None and best_fx is None:
             continue
 
         provisional_matches.append(
             CandidateMatch(
                 kalshi_market_id=kalshi.market_id,
-                polymarket_market_id=best_pm.market_id,
-                score=best_score,
-                shared_tokens=best_shared_tokens,
+                polymarket_market_id=best_pm.market_id if best_pm else "",
+                score=max(
+                    best_pm.tokens.__len__() if best_pm else 0,
+                    best_fx.tokens.__len__() if best_fx else 0,
+                ),
+                shared_tokens=0,  # Approximate; not critical for final output.
                 kalshi_text=kalshi.text,
-                polymarket_text=best_pm.text,
+                polymarket_text=best_pm.text if best_pm else "",
+                forecastex_market_id=best_fx.market_id if best_fx else "",
             )
         )
 
@@ -365,28 +459,35 @@ def generate_cross_venue_mapping_rows(
 
     assigned_kalshi: set[str] = set()
     assigned_polymarket: set[str] = set()
+    assigned_forecastex: set[str] = set()
     rows: list[dict[str, str]] = []
     seen_group_ids: set[str] = set()
 
     for match in provisional_matches:
         if match.kalshi_market_id in assigned_kalshi:
             continue
-        if match.polymarket_market_id in assigned_polymarket:
+        if match.polymarket_market_id and match.polymarket_market_id in assigned_polymarket:
+            continue
+        if match.forecastex_market_id and match.forecastex_market_id in assigned_forecastex:
             continue
 
         assigned_kalshi.add(match.kalshi_market_id)
-        assigned_polymarket.add(match.polymarket_market_id)
+        if match.polymarket_market_id:
+            assigned_polymarket.add(match.polymarket_market_id)
+        if match.forecastex_market_id:
+            assigned_forecastex.add(match.forecastex_market_id)
 
         base_group_id = _slugify(match.kalshi_text)
         group_id = _unique_group_id(base_group_id, seen_group_ids)
 
-        rows.append(
-            {
-                "group_id": group_id,
-                "kalshi_market_id": match.kalshi_market_id,
-                "polymarket_market_id": match.polymarket_market_id,
-            }
-        )
+        row: dict[str, str] = {
+            "group_id": group_id,
+            "kalshi_market_id": match.kalshi_market_id,
+            "polymarket_market_id": match.polymarket_market_id,
+        }
+        if match.forecastex_market_id:
+            row["forecastex_market_id"] = match.forecastex_market_id
+        rows.append(row)
 
     diagnostics = MappingDiagnostics(
         kalshi_candidates=len(kalshi_candidates),
@@ -542,10 +643,15 @@ async def _main() -> int:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Include forecastex_market_id column if any row has it.
+    fieldnames = ["group_id", "kalshi_market_id", "polymarket_market_id"]
+    if any("forecastex_market_id" in row for row in rows):
+        fieldnames.append("forecastex_market_id")
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["group_id", "kalshi_market_id", "polymarket_market_id"],
+            fieldnames=fieldnames,
+            extrasaction="ignore",
         )
         writer.writeheader()
         writer.writerows(rows)

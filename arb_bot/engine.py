@@ -31,7 +31,7 @@ from arb_bot.sizing import PositionSizer
 from arb_bot.strategy import ArbitrageFinder
 from arb_bot.universe_ranking import rank_quotes
 
-from .exchanges import ExchangeAdapter, KalshiAdapter, PolymarketAdapter
+from .exchanges import ExchangeAdapter, ForecastExAdapter, KalshiAdapter, PolymarketAdapter
 
 # Structural opportunity kinds eligible for same-venue correlated fill model.
 _STRUCTURAL_SAME_VENUE_KINDS: frozenset[OpportunityKind] = frozenset({
@@ -214,8 +214,14 @@ class ArbEngine:
         if self._settings.polymarket.enabled:
             exchanges["polymarket"] = PolymarketAdapter(self._settings.polymarket)
 
+        if self._settings.forecastex.enabled:
+            exchanges["forecastex"] = ForecastExAdapter(self._settings.forecastex)
+
         if not exchanges:
-            raise ValueError("No exchanges enabled. Set KALSHI_ENABLED or POLYMARKET_ENABLED.")
+            raise ValueError(
+                "No exchanges enabled. Set KALSHI_ENABLED, POLYMARKET_ENABLED, "
+                "or FORECASTEX_ENABLED."
+            )
 
         return exchanges
 

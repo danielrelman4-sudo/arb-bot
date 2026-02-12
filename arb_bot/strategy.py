@@ -7,7 +7,14 @@ from itertools import combinations
 from typing import Any
 
 from arb_bot.bucket_quality import BucketQualityModel, bucket_leg_count_map
-from arb_bot.cross_mapping import CrossVenueMapping, VenueRef, load_cross_venue_mappings
+from arb_bot.cross_mapping import (
+    CrossVenueMapping,
+    VenuePair,
+    VenueRef,
+    all_venue_refs,
+    load_cross_venue_mappings,
+    venue_pairs,
+)
 from arb_bot.models import (
     ArbitrageOpportunity,
     BinaryQuote,
@@ -186,24 +193,23 @@ class ArbitrageFinder:
         for quote in quotes:
             by_venue.setdefault(quote.venue, []).append(quote)
 
-        mapping_k_refs_total: set[str] = set()
-        mapping_p_refs_total: set[str] = set()
-        mapping_k_refs_seen: set[str] = set()
-        mapping_p_refs_seen: set[str] = set()
+        # Per-venue ref tracking (backward-compatible keys + forecastex).
+        refs_total_by_venue: dict[str, set[str]] = {"kalshi": set(), "polymarket": set(), "forecastex": set()}
+        refs_seen_by_venue: dict[str, set[str]] = {"kalshi": set(), "polymarket": set(), "forecastex": set()}
         mapping_pairs_covered = 0
         for mapping in self._mappings:
-            kalshi_identity = self._mapping_ref_identity(mapping.kalshi)
-            polymarket_identity = self._mapping_ref_identity(mapping.polymarket)
-            mapping_k_refs_total.add(kalshi_identity)
-            mapping_p_refs_total.add(polymarket_identity)
+            # Track per-venue refs.
+            resolved_venues: list[str] = []
+            for venue_name, ref in all_venue_refs(mapping):
+                identity = self._mapping_ref_identity(ref)
+                refs_total_by_venue[venue_name].add(identity)
+                found = self._lookup_mapped_quote(venue_name, ref, by_venue.get(venue_name, []))
+                if found is not None:
+                    refs_seen_by_venue[venue_name].add(identity)
+                    resolved_venues.append(venue_name)
 
-            kalshi_quote = self._lookup_mapped_quote("kalshi", mapping.kalshi, by_venue.get("kalshi", []))
-            polymarket_quote = self._lookup_mapped_quote("polymarket", mapping.polymarket, by_venue.get("polymarket", []))
-            if kalshi_quote is not None:
-                mapping_k_refs_seen.add(kalshi_identity)
-            if polymarket_quote is not None:
-                mapping_p_refs_seen.add(polymarket_identity)
-            if kalshi_quote is not None and polymarket_quote is not None:
+            # Count tradeable pairs (at least 2 venues resolved).
+            if len(resolved_venues) >= 2:
                 mapping_pairs_covered += 1
 
         quote_keys = {(quote.venue.lower(), quote.market_id.lower()) for quote in quotes}
@@ -224,10 +230,14 @@ class ArbitrageFinder:
         return {
             "cross_mapping_pairs_total": len(self._mappings),
             "cross_mapping_pairs_covered": mapping_pairs_covered,
-            "cross_mapping_kalshi_refs_total": len(mapping_k_refs_total),
-            "cross_mapping_kalshi_refs_seen": len(mapping_k_refs_seen),
-            "cross_mapping_polymarket_refs_total": len(mapping_p_refs_total),
-            "cross_mapping_polymarket_refs_seen": len(mapping_p_refs_seen),
+            # Backward-compatible kalshi/polymarket keys.
+            "cross_mapping_kalshi_refs_total": len(refs_total_by_venue["kalshi"]),
+            "cross_mapping_kalshi_refs_seen": len(refs_seen_by_venue["kalshi"]),
+            "cross_mapping_polymarket_refs_total": len(refs_total_by_venue["polymarket"]),
+            "cross_mapping_polymarket_refs_seen": len(refs_seen_by_venue["polymarket"]),
+            # ForecastEx coverage.
+            "cross_mapping_forecastex_refs_total": len(refs_total_by_venue["forecastex"]),
+            "cross_mapping_forecastex_refs_seen": len(refs_seen_by_venue["forecastex"]),
             "structural_parity_rules_total": parity_rules_total,
             "structural_parity_rules_covered": parity_rules_covered,
             "structural_parity_markets_total": len(parity_markets_total),
@@ -298,21 +308,26 @@ class ArbitrageFinder:
 
         opportunities: list[ArbitrageOpportunity] = []
         for mapping in self._mappings:
-            kalshi_quote = self._lookup_mapped_quote("kalshi", mapping.kalshi, by_venue.get("kalshi", []))
-            polymarket_quote = self._lookup_mapped_quote("polymarket", mapping.polymarket, by_venue.get("polymarket", []))
-
-            if kalshi_quote is None or polymarket_quote is None:
-                continue
-
-            opportunities.extend(
-                self._cross_pair_opportunities(
-                    left_quote=kalshi_quote,
-                    right_quote=polymarket_quote,
-                    match_key=mapping.group_id,
-                    match_score=1.0,
-                    min_threshold=min_threshold,
+            for pair in venue_pairs(mapping):
+                left_quote = self._lookup_mapped_quote(
+                    pair.left_venue, pair.left_ref, by_venue.get(pair.left_venue, [])
                 )
-            )
+                right_quote = self._lookup_mapped_quote(
+                    pair.right_venue, pair.right_ref, by_venue.get(pair.right_venue, [])
+                )
+
+                if left_quote is None or right_quote is None:
+                    continue
+
+                opportunities.extend(
+                    self._cross_pair_opportunities(
+                        left_quote=left_quote,
+                        right_quote=right_quote,
+                        match_key=f"{pair.group_id}:{pair.left_venue}:{pair.right_venue}",
+                        match_score=1.0,
+                        min_threshold=min_threshold,
+                    )
+                )
 
         return opportunities
 
@@ -779,7 +794,15 @@ class ArbitrageFinder:
     def _quote_matches_ref(quote: BinaryQuote, mapping_ref: VenueRef, target: str) -> bool:
         key = mapping_ref.key.strip().lower()
 
-        if key in {"kalshi_market_id", "kalshi_ticker", "polymarket_market_id", "polymarket_condition_id"}:
+        # Direct market_id match (works for all venues).
+        if key in {
+            "kalshi_market_id",
+            "kalshi_ticker",
+            "polymarket_market_id",
+            "polymarket_condition_id",
+            "forecastex_market_id",
+            "forecastex_contract_id",
+        }:
             return quote.market_id.strip().lower() == target
 
         if key == "kalshi_event_ticker":
@@ -789,6 +812,14 @@ class ArbitrageFinder:
         if key == "polymarket_slug":
             value = str(quote.metadata.get("slug") or "").strip().lower()
             return value == target
+
+        # ForecastEx symbol match (underlying symbol, not full contract id).
+        if key == "forecastex_symbol":
+            value = str(quote.metadata.get("symbol") or "").strip().lower()
+            if value == target:
+                return True
+            # Also try market_id for symbol-style refs.
+            return quote.market_id.strip().lower() == target
 
         return False
 

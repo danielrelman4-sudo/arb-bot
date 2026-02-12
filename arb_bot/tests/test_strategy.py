@@ -125,7 +125,7 @@ def test_uses_mapping_file_for_cross_venue_pairing(tmp_path: Path) -> None:
     opportunities = finder.find(quotes)
     cross = [opp for opp in opportunities if opp.kind is OpportunityKind.CROSS_VENUE]
     assert cross
-    assert any(opp.match_key == "g1" for opp in cross)
+    assert any(opp.match_key.startswith("g1") for opp in cross)
 
 
 def test_maker_estimate_and_near_detection() -> None:
