@@ -228,10 +228,13 @@ class StrictMapper:
     ) -> MappingTier:
         """Register or update a cross-venue mapping.
 
-        Returns the assigned tier.
+        Returns the assigned tier. Confidence is clamped to [0.0, 1.0].
         """
         if now is None:
             now = time.time()
+
+        # Clamp confidence to valid range.
+        confidence = max(0.0, min(1.0, confidence))
 
         tier = self._classify(confidence, signals)
         self._mappings[market_id] = MappingEntry(
@@ -259,12 +262,16 @@ class StrictMapper:
         """Update confidence for an existing mapping.
 
         Returns new tier, or None if mapping not found.
+        Confidence is clamped to [0.0, 1.0].
         """
         if now is None:
             now = time.time()
         entry = self._mappings.get(market_id)
         if entry is None:
             return None
+
+        # Clamp confidence to valid range.
+        confidence = max(0.0, min(1.0, confidence))
 
         old_tier = entry.tier
         entry.confidence = confidence
@@ -363,6 +370,10 @@ class StrictMapper:
 
         if entry.tier == MappingTier.FALLBACK and not self._config.fallback_enabled:
             entry.rejection_count += 1
+            self._add_audit(
+                market_id, "rejected", entry.tier, entry.confidence,
+                detail="fallback_disabled", now=now,
+            )
             return MappingResolution(
                 market_id=market_id,
                 accepted=False,

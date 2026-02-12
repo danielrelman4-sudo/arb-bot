@@ -142,7 +142,11 @@ def _jaccard_similarity(a: Set[str], b: Set[str]) -> float:
 
 
 def _pearson_correlation(xs: List[float], ys: List[float]) -> float:
-    """Compute Pearson correlation between two price series."""
+    """Compute Pearson correlation between two price series.
+
+    Returns 0.0 for degenerate inputs (too few points, zero variance,
+    NaN results). Safe against all floating-point edge cases.
+    """
     n = min(len(xs), len(ys))
     if n < 2:
         return 0.0
@@ -160,7 +164,14 @@ def _pearson_correlation(xs: List[float], ys: List[float]) -> float:
     if denom_x == 0 or denom_y == 0:
         return 0.0
 
-    return num / (denom_x * denom_y)
+    result = num / (denom_x * denom_y)
+
+    # Guard against NaN/Inf from floating-point edge cases.
+    if math.isnan(result) or math.isinf(result):
+        return 0.0
+
+    # Clamp to [-1, 1] to handle floating-point drift.
+    return max(-1.0, min(1.0, result))
 
 
 # ---------------------------------------------------------------------------

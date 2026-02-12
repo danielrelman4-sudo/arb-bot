@@ -186,12 +186,30 @@ class TestValidate:
         assert v.status == ValidationStatus.NO_CHILDREN
 
     def test_zero_price_without_update_is_missing(self) -> None:
-        """Price=0.0 with updated_at=0.0 counts as missing."""
+        """A child with no set_price() call is missing, regardless of price value."""
         t = _tree()
         t.add_event("e1", children=["a", "b"], now=100.0)
         t.set_price("e1", "a", 0.5, now=100.0)
         v = t.validate("e1", now=100.0)
         assert v.status == ValidationStatus.MISSING_PRICES
+
+    def test_explicit_zero_price_is_not_missing(self) -> None:
+        """A legitimate 0.0 price that was explicitly set is NOT missing.
+
+        This is the critical fix — the old sentinel-check approach would
+        have falsely flagged a 0.0 price as missing. The new price_set
+        flag ensures we only flag outcomes where set_price() was never
+        called.
+        """
+        t = _tree(sum_tolerance=1.0)  # Loose tolerance for this test.
+        t.add_event("e1", children=["a", "b"], now=100.0)
+        t.set_price("e1", "a", 0.0, now=100.0)   # Legitimate zero.
+        t.set_price("e1", "b", 1.0, now=100.0)
+        v = t.validate("e1", now=100.0)
+        # Should NOT be MISSING_PRICES — both prices were explicitly set.
+        assert v.status == ValidationStatus.VALID
+        assert v.missing_prices == ()
+        assert abs(v.price_sum - 1.0) < 0.001
 
 
 # ---------------------------------------------------------------------------

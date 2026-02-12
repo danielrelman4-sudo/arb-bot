@@ -118,7 +118,18 @@ class TestPearson:
     def test_constant_series(self) -> None:
         xs = [5.0, 5.0, 5.0]
         ys = [1.0, 2.0, 3.0]
-        assert _pearson_correlation(xs, ys) == 0.0  # Zero variance.
+        assert _pearson_correlation(xs, ys) == 0.0  # Zero variance in xs.
+
+    def test_both_constant_series(self) -> None:
+        """Both series constant → both denominators zero → 0/0 → must return 0.0.
+
+        This is the edge case the NaN/Inf guard protects against. Without
+        the guard, denom_x * denom_y = 0 * 0 = 0, causing ZeroDivisionError
+        or NaN depending on the numerator.
+        """
+        xs = [3.0, 3.0, 3.0]
+        ys = [7.0, 7.0, 7.0]
+        assert _pearson_correlation(xs, ys) == 0.0
 
     def test_too_few_points(self) -> None:
         assert _pearson_correlation([1.0], [2.0]) == 0.0

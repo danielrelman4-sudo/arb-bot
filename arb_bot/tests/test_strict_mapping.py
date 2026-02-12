@@ -89,6 +89,32 @@ class TestRegistration:
         assert entry is not None
         assert entry.confidence == 0.95
 
+    def test_confidence_clamped_above_1(self) -> None:
+        """Confidence > 1.0 is clamped to 1.0."""
+        m = _mapper()
+        m.register_mapping("a", "k", "p", confidence=1.5, signals=2, now=1.0)
+        entry = m.get_mapping("a")
+        assert entry is not None
+        assert entry.confidence == 1.0
+
+    def test_confidence_clamped_below_0(self) -> None:
+        """Negative confidence is clamped to 0.0 → REJECTED tier."""
+        m = _mapper()
+        tier = m.register_mapping("a", "k", "p", confidence=-0.5, signals=2, now=1.0)
+        assert tier == MappingTier.REJECTED
+        entry = m.get_mapping("a")
+        assert entry is not None
+        assert entry.confidence == 0.0
+
+    def test_update_confidence_clamped(self) -> None:
+        """update_confidence clamps values too."""
+        m = _mapper()
+        m.register_mapping("a", "k", "p", confidence=0.95, signals=2, now=1.0)
+        m.update_confidence("a", confidence=2.0, now=2.0)
+        entry = m.get_mapping("a")
+        assert entry is not None
+        assert entry.confidence == 1.0
+
 
 # ---------------------------------------------------------------------------
 # Resolution

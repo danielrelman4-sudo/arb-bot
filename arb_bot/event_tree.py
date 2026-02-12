@@ -84,6 +84,7 @@ class ChildOutcome:
     payout: float  # Usually 1.0 for binary, can vary.
     price: float = 0.0
     price_updated_at: float = 0.0
+    price_set: bool = False  # True once set_price() called.
     venue: str = ""
 
 
@@ -235,6 +236,7 @@ class EventTree:
             return False
         child.price = price
         child.price_updated_at = now
+        child.price_set = True
         child.venue = venue
         return True
 
@@ -297,10 +299,12 @@ class EventTree:
                 detail=f"need {cfg.min_children}, have {len(node.children)}",
             )
 
-        # Check for missing prices.
+        # Check for missing prices — a price is missing if set_price()
+        # was never called, regardless of the price value. This avoids
+        # falsely flagging legitimate 0.0 prices as missing.
         missing = [
             cid for cid, c in node.children.items()
-            if c.price == 0.0 and c.price_updated_at == 0.0
+            if not c.price_set
         ]
         if missing:
             return TreeValidation(
@@ -314,10 +318,11 @@ class EventTree:
                 stale_prices=(),
             )
 
-        # Check for stale prices.
+        # Check for stale prices — since all prices are now set
+        # (price_set=True), we check staleness using price_updated_at.
         stale = [
             cid for cid, c in node.children.items()
-            if c.price_updated_at > 0 and (now - c.price_updated_at) > cfg.price_stale_seconds
+            if (now - c.price_updated_at) > cfg.price_stale_seconds
         ]
         if stale:
             return TreeValidation(
