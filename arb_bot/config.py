@@ -597,6 +597,34 @@ class PolymarketSettings:
 
 
 @dataclass(frozen=True)
+class ForecastExSettings:
+    """Settings for ForecastEx / Interactive Brokers TWS adapter.
+
+    ForecastEx event contracts are binary ($1 payout) options routed via
+    the IBKR TWS API.  Connection requires a running TWS or IB Gateway
+    instance.
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 7496  # 7496=TWS live, 7497=TWS paper, 4001=Gateway live, 4002=Gateway paper
+    client_id: int = 1
+    account_id: str = ""
+    market_limit: int = 50
+    enable_stream: bool = True
+    contract_type: str = "forecast"  # "forecast" for ForecastEx ($1), "cme" for CME event ($100)
+    default_tif: str = "GTC"  # DAY, GTC, or IOC
+    # Fee: $0.01 per YES/NO pair = $0.005 per individual contract
+    fee_per_contract: float = 0.005
+    # Payout per contract ($1.00 for ForecastEx, $100.00 for CME)
+    payout_per_contract: float = 1.0
+    # Priority tickers to always fetch
+    priority_symbols: List[str] = field(default_factory=list)
+    # Symbols to exclude from discovery
+    exclude_symbols: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class AppSettings:
     live_mode: bool
     run_once: bool
@@ -622,6 +650,7 @@ class AppSettings:
     fill_model: FillModelSettings
     kalshi: KalshiSettings
     polymarket: PolymarketSettings
+    forecastex: ForecastExSettings = field(default_factory=ForecastExSettings)
     stream_poll_decision_clock: bool = True
     stream_full_discovery_interval_seconds: int = 600
     stream_low_coverage_trigger_cycles: int = 3
@@ -1144,5 +1173,20 @@ def load_settings() -> AppSettings:
             api_key=os.getenv("POLYMARKET_API_KEY"),
             api_secret=os.getenv("POLYMARKET_API_SECRET"),
             api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE"),
+        ),
+        forecastex=ForecastExSettings(
+            enabled=_as_bool(os.getenv("FORECASTEX_ENABLED"), False),
+            host=os.getenv("FORECASTEX_HOST", "127.0.0.1"),
+            port=_as_int(os.getenv("FORECASTEX_PORT"), 7496),
+            client_id=_as_int(os.getenv("FORECASTEX_CLIENT_ID"), 1),
+            account_id=os.getenv("FORECASTEX_ACCOUNT_ID", ""),
+            market_limit=_as_int(os.getenv("FORECASTEX_MARKET_LIMIT"), 50),
+            enable_stream=_as_bool(os.getenv("FORECASTEX_ENABLE_STREAM"), True),
+            contract_type=os.getenv("FORECASTEX_CONTRACT_TYPE", "forecast").strip().lower(),
+            default_tif=os.getenv("FORECASTEX_DEFAULT_TIF", "GTC").strip().upper(),
+            fee_per_contract=_as_float(os.getenv("FORECASTEX_FEE_PER_CONTRACT"), 0.005),
+            payout_per_contract=_as_float(os.getenv("FORECASTEX_PAYOUT_PER_CONTRACT"), 1.0),
+            priority_symbols=_as_csv(os.getenv("FORECASTEX_PRIORITY_SYMBOLS")),
+            exclude_symbols=_as_csv(os.getenv("FORECASTEX_EXCLUDE_SYMBOLS")),
         ),
     )
