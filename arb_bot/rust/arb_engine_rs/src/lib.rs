@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 
 pub mod types;
 pub mod binary_math;
+pub mod strategy;
 
 /// Returns the version of the Rust engine module.
 #[pyfunction]
@@ -26,6 +27,7 @@ fn available_functions() -> Vec<&'static str> {
         "reconstruct_binary_quote",
         "choose_effective_buy_price",
         "build_quote_diagnostics",
+        "find_opportunities",
     ]
 }
 
@@ -37,6 +39,9 @@ fn arb_engine_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // binary_math functions (7B-1)
     binary_math::register(m)?;
+
+    // strategy functions (7B-2)
+    strategy::register(m)?;
 
     Ok(())
 }
