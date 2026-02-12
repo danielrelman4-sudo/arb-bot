@@ -148,6 +148,7 @@ def test_strategy_filters_structural_buckets_via_quality_model(tmp_path: Path) -
         bucket_quality_explore_fraction=0.0,
         bucket_quality_min_score=-1.0,
         bucket_quality_live_update_interval=1000,
+        bucket_quality_use_thompson_sampling=False,  # deterministic for test
     )
 
     quotes = [

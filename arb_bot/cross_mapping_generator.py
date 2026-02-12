@@ -4,11 +4,14 @@ import argparse
 import asyncio
 import csv
 import json
+import logging
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from arb_bot.structural_rule_generator import (
     fetch_kalshi_markets_all_events,
@@ -17,6 +20,16 @@ from arb_bot.structural_rule_generator import (
     fetch_polymarket_markets_for_events,
     load_markets_from_json,
 )
+
+# Optional sentence-transformers for embedding-based matching.
+try:
+    from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
+    _HAS_SENTENCE_TRANSFORMERS = True
+except ImportError:
+    SentenceTransformer = None  # type: ignore[assignment,misc]
+    _HAS_SENTENCE_TRANSFORMERS = False
+
+_LOG = logging.getLogger(__name__)
 
 _STOPWORDS = {
     "a",
@@ -384,6 +397,69 @@ def _build_token_index(
     return freq, index
 
 
+def _compute_embeddings(
+    candidates: list[CandidateMarket],
+    model: Any,
+    batch_size: int = 256,
+) -> Any:
+    """Compute L2-normalized embeddings for candidate market texts.
+
+    Returns an (N, D) numpy array of float32 embeddings.
+    """
+    texts = [c.text for c in candidates]
+    if not texts:
+        return np.empty((0, 0), dtype=np.float32)
+    embeddings = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+    return np.asarray(embeddings, dtype=np.float32)
+
+
+def _embedding_best_match_for(
+    source_idx: int,
+    source_embeddings: Any,
+    target_embeddings: Any,
+    target_candidates: list[CandidateMarket],
+    *,
+    min_match_score: float,
+    min_score_gap: float,
+    skip_reasons: Counter[str],
+) -> CandidateMarket | None:
+    """Find best match for source using cosine similarity on embeddings."""
+    if target_embeddings.shape[0] == 0:
+        skip_reasons["no_candidate_pool"] += 1
+        return None
+
+    # Cosine similarity = dot product of L2-normalized vectors.
+    source_vec = source_embeddings[source_idx]
+    scores = target_embeddings @ source_vec
+
+    # Find top-2 for ambiguity check.
+    if len(scores) >= 2:
+        top2_idx = np.argpartition(scores, -2)[-2:]
+        top2_idx = top2_idx[np.argsort(scores[top2_idx])[::-1]]
+        best_idx = top2_idx[0]
+        best_score = float(scores[best_idx])
+        second_score = float(scores[top2_idx[1]])
+    else:
+        best_idx = 0
+        best_score = float(scores[0])
+        second_score = -1.0
+
+    if best_score < min_match_score:
+        skip_reasons["below_threshold"] += 1
+        return None
+
+    if second_score >= 0 and (best_score - second_score) < min_score_gap:
+        skip_reasons["ambiguous_top_match"] += 1
+        return None
+
+    return target_candidates[best_idx]
+
+
 def generate_cross_venue_mapping_rows(
     markets: list[dict[str, Any]],
     *,
@@ -392,6 +468,9 @@ def generate_cross_venue_mapping_rows(
     min_score_gap: float = 0.03,
     max_token_share: float = 0.02,
     max_candidate_pool: int = 2000,
+    use_embeddings: bool = False,
+    embedding_model_name: str = "all-MiniLM-L6-v2",
+    embedding_min_match_score: float = 0.55,
 ) -> tuple[list[dict[str, str]], MappingDiagnostics]:
     kalshi_candidates, polymarket_candidates, forecastex_candidates = _build_candidates(markets)
 
@@ -410,7 +489,27 @@ def generate_cross_venue_mapping_rows(
         )
         return [], diagnostics
 
-    # Build token indexes for polymarket and forecastex.
+    # Decide whether to use embedding-based matching.
+    _use_emb = use_embeddings and _HAS_SENTENCE_TRANSFORMERS
+    if use_embeddings and not _HAS_SENTENCE_TRANSFORMERS:
+        _LOG.warning(
+            "use_embeddings=True but sentence-transformers not installed; "
+            "falling back to Jaccard"
+        )
+
+    if _use_emb:
+        _LOG.info("Loading embedding model %s ...", embedding_model_name)
+        _emb_model = SentenceTransformer(embedding_model_name)
+        _LOG.info("Computing embeddings for %d Kalshi candidates ...", len(kalshi_candidates))
+        k_emb = _compute_embeddings(kalshi_candidates, _emb_model)
+        _LOG.info("Computing embeddings for %d Polymarket candidates ...", len(polymarket_candidates))
+        pm_emb = _compute_embeddings(polymarket_candidates, _emb_model) if polymarket_candidates else np.empty((0, 0), dtype=np.float32)
+        _LOG.info("Computing embeddings for %d ForecastEx candidates ...", len(forecastex_candidates))
+        fx_emb = _compute_embeddings(forecastex_candidates, _emb_model) if forecastex_candidates else np.empty((0, 0), dtype=np.float32)
+    else:
+        k_emb = pm_emb = fx_emb = None  # type: ignore[assignment]
+
+    # Build token indexes for Jaccard fallback / non-embedding mode.
     pm_freq, pm_index = _build_token_index(polymarket_candidates)
     fx_freq, fx_index = _build_token_index(forecastex_candidates)
 
@@ -423,16 +522,29 @@ def generate_cross_venue_mapping_rows(
         skip_reasons=skip_reasons,
     )
 
-    # Phase 1: Kalshi ↔ Polymarket matching (original behavior).
-    provisional_matches: list[CandidateMatch] = []
-    for kalshi in kalshi_candidates:
-        best_pm = _best_match_for(
-            kalshi, polymarket_candidates, pm_freq, pm_index, **match_kwargs,
-        ) if polymarket_candidates else None
+    emb_match_kwargs = dict(
+        min_match_score=embedding_min_match_score,
+        min_score_gap=min_score_gap,
+        skip_reasons=skip_reasons,
+    )
 
-        best_fx = _best_match_for(
-            kalshi, forecastex_candidates, fx_freq, fx_index, **match_kwargs,
-        ) if forecastex_candidates else None
+    # Phase 1: Kalshi ↔ Polymarket/ForecastEx matching.
+    provisional_matches: list[CandidateMatch] = []
+    for ki, kalshi in enumerate(kalshi_candidates):
+        if _use_emb:
+            best_pm = _embedding_best_match_for(
+                ki, k_emb, pm_emb, polymarket_candidates, **emb_match_kwargs,
+            ) if polymarket_candidates else None
+            best_fx = _embedding_best_match_for(
+                ki, k_emb, fx_emb, forecastex_candidates, **emb_match_kwargs,
+            ) if forecastex_candidates else None
+        else:
+            best_pm = _best_match_for(
+                kalshi, polymarket_candidates, pm_freq, pm_index, **match_kwargs,
+            ) if polymarket_candidates else None
+            best_fx = _best_match_for(
+                kalshi, forecastex_candidates, fx_freq, fx_index, **match_kwargs,
+            ) if forecastex_candidates else None
 
         if best_pm is None and best_fx is None:
             continue
@@ -572,6 +684,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSON path for diagnostics summary.",
     )
+    parser.add_argument(
+        "--use-embeddings",
+        action="store_true",
+        help="Use sentence-transformer embeddings for semantic matching (requires sentence-transformers).",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="all-MiniLM-L6-v2",
+        help="Sentence-transformer model name for embedding-based matching.",
+    )
+    parser.add_argument(
+        "--embedding-min-match-score",
+        type=float,
+        default=0.55,
+        help="Minimum cosine similarity for embedding-based matching (default: 0.55).",
+    )
     return parser.parse_args()
 
 
@@ -639,6 +768,9 @@ async def _main() -> int:
         min_score_gap=max(0.0, args.min_score_gap),
         max_token_share=max(0.0001, min(1.0, args.max_token_share)),
         max_candidate_pool=max(50, args.max_candidate_pool),
+        use_embeddings=args.use_embeddings,
+        embedding_model_name=args.embedding_model,
+        embedding_min_match_score=max(0.0, min(1.0, args.embedding_min_match_score)),
     )
 
     output_path = Path(args.output)

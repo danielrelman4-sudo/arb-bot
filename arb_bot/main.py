@@ -13,6 +13,72 @@ from arb_bot.paper import run_paper_session
 
 LOGGER = logging.getLogger(__name__)
 
+# Default output path for auto-refreshed cross-venue mappings.
+_DEFAULT_MAPPING_OUTPUT = "arb_bot/config/cross_venue_map.live.csv"
+
+
+async def _refresh_cross_venue_mappings(
+    output_path: str,
+    *,
+    kalshi_api_base_url: str = "https://api.elections.kalshi.com/trade-api/v2",
+    polymarket_gamma_base_url: str = "https://gamma-api.polymarket.com",
+) -> str:
+    """Regenerate cross-venue mappings from live Kalshi + Polymarket data.
+
+    Returns the output path so it can be wired into settings.
+    """
+    from arb_bot.cross_mapping_generator import generate_cross_venue_mapping_rows
+    from arb_bot.structural_rule_generator import (
+        fetch_kalshi_markets_all_events,
+        fetch_polymarket_markets_all_events,
+    )
+
+    LOGGER.info("refreshing cross-venue mappings from live market data ...")
+
+    kalshi_markets, polymarket_markets = await asyncio.gather(
+        fetch_kalshi_markets_all_events(api_base_url=kalshi_api_base_url),
+        fetch_polymarket_markets_all_events(gamma_base_url=polymarket_gamma_base_url),
+    )
+    LOGGER.info(
+        "fetched markets: kalshi=%d polymarket=%d",
+        len(kalshi_markets),
+        len(polymarket_markets),
+    )
+
+    if not kalshi_markets:
+        raise RuntimeError("Kalshi market fetch returned 0 markets — cannot generate mappings")
+    if not polymarket_markets:
+        raise RuntimeError("Polymarket market fetch returned 0 markets — cannot generate mappings")
+
+    import csv
+    from pathlib import Path
+
+    rows, diagnostics = generate_cross_venue_mapping_rows(
+        [*kalshi_markets, *polymarket_markets],
+    )
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["group_id", "kalshi_market_id", "polymarket_market_id"]
+    if any("forecastex_market_id" in row for row in rows):
+        fieldnames.append("forecastex_market_id")
+    with out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    LOGGER.info(
+        "cross-venue mappings refreshed: %d mappings written to %s "
+        "(kalshi_candidates=%d polymarket_candidates=%d unmatched_k=%d unmatched_p=%d)",
+        diagnostics.mappings_emitted,
+        output_path,
+        diagnostics.kalshi_candidates,
+        diagnostics.polymarket_candidates,
+        diagnostics.unmatched_kalshi,
+        diagnostics.unmatched_polymarket,
+    )
+    return output_path
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -56,6 +122,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap on paper-session cycles",
     )
+    parser.add_argument(
+        "--refresh-mappings",
+        action="store_true",
+        help="Regenerate cross-venue mappings from live market data before running. "
+        "Required for paper/live runs to avoid stale mappings.",
+    )
+    parser.add_argument(
+        "--mapping-output",
+        type=str,
+        default=_DEFAULT_MAPPING_OUTPUT,
+        help="Output path for refreshed cross-venue mapping CSV "
+        f"(default: {_DEFAULT_MAPPING_OUTPUT})",
+    )
     return parser.parse_args()
 
 
@@ -75,6 +154,16 @@ async def _run() -> None:
 
     configure_logging(settings.log_level)
 
+    # Refresh cross-venue mappings from live data if requested.
+    if args.refresh_mappings:
+        mapping_path = await _refresh_cross_venue_mappings(
+            args.mapping_output,
+            kalshi_api_base_url=settings.kalshi.api_base_url,
+            polymarket_gamma_base_url=settings.polymarket.gamma_base_url,
+        )
+        strategy = replace(settings.strategy, cross_venue_mapping_path=mapping_path)
+        settings = replace(settings, strategy=strategy)
+
     if args.paper_minutes is not None:
         output_path = args.paper_output
         if not output_path:
@@ -83,12 +172,13 @@ async def _run() -> None:
 
         paper_settings = replace(settings, live_mode=False, dry_run=True, run_once=False)
         LOGGER.info(
-            "paper mode duration=%.2fmin poll_interval=%ss output=%s discovery=%s stream=%s",
+            "paper mode duration=%.2fmin poll_interval=%ss output=%s discovery=%s stream=%s mappings=%s",
             args.paper_minutes,
             paper_settings.poll_interval_seconds,
             output_path,
             paper_settings.strategy.discovery_mode,
             paper_settings.stream_mode,
+            paper_settings.strategy.cross_venue_mapping_path or "(none)",
         )
 
         summary = await run_paper_session(

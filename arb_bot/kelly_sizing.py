@@ -34,8 +34,8 @@ class TailRiskKellyConfig:
     base_kelly_fraction:
         Maximum Kelly fraction to use (fractional Kelly). Default 0.25.
     uncertainty_haircut_factor:
-        How much to reduce sizing per unit of model uncertainty.
-        Applied as: fraction *= (1 - uncertainty * factor). Default 1.0.
+        Legacy linear haircut factor.  Only used when
+        ``use_baker_mchale_shrinkage`` is False.  Default 1.0.
     variance_haircut_factor:
         How much to reduce sizing per unit of lane variance.
         Applied as: fraction *= (1 - variance * factor). Default 0.5.
@@ -45,6 +45,14 @@ class TailRiskKellyConfig:
         Above this uncertainty, sizing is zero. Default 0.8.
     lane_variance_window:
         Number of recent outcomes to consider for variance. Default 50.
+    use_baker_mchale_shrinkage:
+        When True, replace the linear uncertainty haircut with the
+        Baker-McHale (2013) closed-form shrinkage:
+            k* = 1 / (1 + b² × σ²)
+        where b = edge/cost (the odds) and σ² is the variance of
+        the estimated edge (derived from model_uncertainty).
+        Reference: Baker & McHale, "Optimal Betting Under Parameter
+        Uncertainty", Decision Analysis 10(3):189-199, 2013.
     """
 
     base_kelly_fraction: float = 0.25
@@ -53,6 +61,7 @@ class TailRiskKellyConfig:
     min_confidence: float = 0.1
     max_model_uncertainty: float = 0.8
     lane_variance_window: int = 50
+    use_baker_mchale_shrinkage: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +158,22 @@ class TailRiskKelly:
         # Apply fractional Kelly cap.
         fraction = min(raw, cfg.base_kelly_fraction)
 
-        # Uncertainty haircut.
-        u_haircut = min(1.0, model_uncertainty * cfg.uncertainty_haircut_factor)
-        fraction *= (1.0 - u_haircut)
+        # Uncertainty haircut — Baker-McHale shrinkage or legacy linear.
+        if cfg.use_baker_mchale_shrinkage and cost > 0:
+            # Baker-McHale (2013): k* = 1 / (1 + b² σ²)
+            # b = edge/cost (the odds ratio)
+            # σ² = variance of estimated edge ≈ (model_uncertainty × edge)²
+            #   We interpret model_uncertainty as the relative std dev of
+            #   our edge estimate, so σ = uncertainty × edge.
+            b = edge / cost
+            sigma_sq = (model_uncertainty * edge) ** 2
+            shrinkage = 1.0 / (1.0 + b * b * sigma_sq) if (b * b * sigma_sq) > 0 else 1.0
+            u_haircut = 1.0 - shrinkage
+            fraction *= shrinkage
+        else:
+            # Legacy linear haircut.
+            u_haircut = min(1.0, model_uncertainty * cfg.uncertainty_haircut_factor)
+            fraction *= (1.0 - u_haircut)
 
         # Variance haircut.
         lane_var = self._lane_variance(lane)
@@ -268,6 +290,7 @@ def _try_rust_dispatch() -> bool:
             cfg.variance_haircut_factor,
             cfg.min_confidence,
             cfg.max_model_uncertainty,
+            cfg.use_baker_mchale_shrinkage,
         )
         d = json.loads(rs_json)
         return KellySizingResult(

@@ -39,15 +39,23 @@ from arb_bot.models import (
 from .base import ExchangeAdapter
 
 # ---------------------------------------------------------------------------
-# Optional ib_async import
+# Optional ib_async / ib_insync import
 # ---------------------------------------------------------------------------
+# ib_async (v1.0+) requires Python ≥ 3.10.  ib_insync (v0.9.x) is the
+# predecessor and works on Python 3.9+.  The API surface is identical — we
+# import whichever is available under the ``ibasync`` alias.
 try:
     import ib_async as ibasync  # type: ignore[import-untyped]
 
     _HAS_IB_ASYNC = True
 except ImportError:
-    ibasync = None  # type: ignore[assignment]
-    _HAS_IB_ASYNC = False
+    try:
+        import ib_insync as ibasync  # type: ignore[import-untyped, no-redef]
+
+        _HAS_IB_ASYNC = True
+    except ImportError:
+        ibasync = None  # type: ignore[assignment]
+        _HAS_IB_ASYNC = False
 
 
 LOGGER = logging.getLogger(__name__)
