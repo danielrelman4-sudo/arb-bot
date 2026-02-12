@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 pub mod types;
 pub mod binary_math;
 pub mod strategy;
+pub mod eval_pipeline;
 
 /// Returns the version of the Rust engine module.
 #[pyfunction]
@@ -28,6 +29,12 @@ fn available_functions() -> Vec<&'static str> {
         "choose_effective_buy_price",
         "build_quote_diagnostics",
         "find_opportunities",
+        "estimate_fee",
+        "estimate_fill",
+        "simulate_execution",
+        "compute_kelly",
+        "compute_sizing",
+        "execution_aware_kelly_fraction",
     ]
 }
 
@@ -42,6 +49,9 @@ fn arb_engine_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // strategy functions (7B-2)
     strategy::register(m)?;
+
+    // eval_pipeline functions (7B-3)
+    eval_pipeline::register(m)?;
 
     Ok(())
 }
