@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 
-from arb_bot.models import BinaryQuote, LegExecutionResult, PairExecutionResult, TradeLegPlan, TradePlan
+from arb_bot.models import BinaryQuote, LegExecutionResult, OrderStatus, PairExecutionResult, TradeLegPlan, TradePlan
 
 
 class ExchangeAdapter(ABC):
@@ -27,6 +27,14 @@ class ExchangeAdapter(ABC):
         for q in quotes:
             if q.market_id == market_id:
                 return q
+        return None
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order. Returns True if cancelled successfully."""
+        return False
+
+    async def get_order_status(self, order_id: str) -> OrderStatus | None:
+        """Get current status of an order. Returns None if not supported."""
         return None
 
     async def get_available_cash(self) -> float | None:

@@ -24,6 +24,25 @@ class ExecutionStyle(str, Enum):
     MAKER_ESTIMATE = "maker_estimate"
 
 
+class OrderState(str, Enum):
+    OPEN = "open"
+    FILLED = "filled"
+    PARTIALLY_FILLED = "partially_filled"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class OrderStatus:
+    order_id: str
+    state: OrderState
+    filled_contracts: int = 0
+    remaining_contracts: int = 0
+    average_price: Optional[float] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class BinaryQuote:
     venue: str

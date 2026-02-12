@@ -473,6 +473,9 @@ class RiskSettings:
     sequential_legs: bool = True
     leg_quote_drift_tolerance: float = 0.03
     leg_max_time_window_seconds: float = 10.0
+    order_poll_interval_seconds: float = 1.0
+    order_poll_timeout_seconds: float = 15.0
+    cancel_on_poll_timeout: bool = True
 
 
 @dataclass(frozen=True)

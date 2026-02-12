@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - optional until live mode is enabled
 
 from arb_bot.config import KalshiSettings
 from arb_bot.binary_math import build_quote_diagnostics, choose_effective_buy_price
-from arb_bot.models import BinaryQuote, LegExecutionResult, PairExecutionResult, Side, TradeLegPlan, TradePlan
+from arb_bot.models import BinaryQuote, LegExecutionResult, OrderState, OrderStatus, PairExecutionResult, Side, TradeLegPlan, TradePlan
 
 from .base import ExchangeAdapter
 
@@ -1688,6 +1688,60 @@ class KalshiAdapter(ExchangeAdapter):
 
         result = await self._private_request("POST", "/portfolio/orders", json=payload)
         return self._to_leg_result(result, leg.contracts)
+
+    async def cancel_order(self, order_id: str) -> bool:
+        if self._private_key is None or not self._settings.key_id:
+            return False
+        try:
+            await self._private_request("DELETE", f"/portfolio/orders/{order_id}")
+            return True
+        except Exception as exc:
+            LOGGER.warning("kalshi cancel_order failed for %s: %s", order_id, exc)
+            return False
+
+    async def get_order_status(self, order_id: str) -> OrderStatus | None:
+        if self._private_key is None or not self._settings.key_id:
+            return None
+        try:
+            payload = await self._private_request("GET", f"/portfolio/orders/{order_id}")
+        except Exception as exc:
+            LOGGER.warning("kalshi get_order_status failed for %s: %s", order_id, exc)
+            return None
+
+        order = payload.get("order") if isinstance(payload.get("order"), dict) else payload
+        status_str = str(order.get("status", "")).lower()
+        filled = int(order.get("filled_count", 0) or 0)
+        remaining = int(order.get("remaining_count", 0) or 0)
+
+        avg_price = order.get("average_price")
+        if avg_price is not None:
+            try:
+                avg_price = float(avg_price)
+                if avg_price > 1:
+                    avg_price /= 100.0
+            except (TypeError, ValueError):
+                avg_price = None
+
+        state_map = {
+            "resting": OrderState.OPEN,
+            "pending": OrderState.OPEN,
+            "executed": OrderState.FILLED,
+            "canceled": OrderState.CANCELLED,
+            "cancelled": OrderState.CANCELLED,
+            "expired": OrderState.EXPIRED,
+        }
+        state = state_map.get(status_str, OrderState.UNKNOWN)
+        if state is OrderState.UNKNOWN and filled > 0 and remaining > 0:
+            state = OrderState.PARTIALLY_FILLED
+
+        return OrderStatus(
+            order_id=order_id,
+            state=state,
+            filled_contracts=filled,
+            remaining_contracts=remaining,
+            average_price=avg_price,
+            raw=payload,
+        )
 
     async def get_available_cash(self) -> float | None:
         if self._private_key is None or not self._settings.key_id:
