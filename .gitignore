@@ -3,3 +3,9 @@
 secrets/
 .DS_Store
 arb_bot/output/
+
+# Rust build artifacts
+arb_bot/rust/target/
+*.so
+*.dylib
+*.pyd

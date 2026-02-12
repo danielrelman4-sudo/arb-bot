@@ -173,3 +173,101 @@ def _normalize_size(value: float) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, numeric)
+
+
+# ---------------------------------------------------------------------------
+# Rust dispatch (Phase 7B-1)
+# ---------------------------------------------------------------------------
+# When arb_engine_rs is installed and ARB_USE_RUST_BINARY_MATH=1,
+# hot-path functions are replaced with Rust wrappers.  The wrapper
+# functions return the same Python types (QuoteDecomposition, etc.)
+# so callers see no difference.  Set env var to "0" for instant rollback.
+# ---------------------------------------------------------------------------
+
+def _try_rust_dispatch() -> bool:
+    """Attempt to replace module functions with Rust implementations.
+
+    Returns True if Rust dispatch was activated.
+    """
+    import os
+
+    if os.environ.get("ARB_USE_RUST_BINARY_MATH", "0") != "1":
+        return False
+
+    try:
+        import arb_engine_rs  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+
+    import sys
+
+    this = sys.modules[__name__]
+
+    # --- decompose_binary_quote ---
+    _py_decompose = decompose_binary_quote
+
+    def _rs_decompose(yes_price: float, no_price: float) -> QuoteDecomposition:
+        ip, eps = arb_engine_rs.decompose_binary_quote(yes_price, no_price)
+        return QuoteDecomposition(implied_probability=ip, edge_per_side=eps)
+
+    setattr(this, "decompose_binary_quote", _rs_decompose)
+
+    # --- reconstruct_binary_quote ---
+    _py_reconstruct = reconstruct_binary_quote
+
+    def _rs_reconstruct(
+        implied_probability: float,
+        edge_per_side: float,
+    ) -> tuple:
+        return arb_engine_rs.reconstruct_binary_quote(implied_probability, edge_per_side)
+
+    setattr(this, "reconstruct_binary_quote", _rs_reconstruct)
+
+    # --- choose_effective_buy_price ---
+    _py_choose = choose_effective_buy_price
+
+    def _rs_choose(
+        side: str,
+        direct_ask_price: float | None,
+        direct_ask_size: float,
+        opposite_bid_price: float | None,
+        opposite_bid_size: float,
+    ) -> EffectiveBuy | None:
+        result = arb_engine_rs.choose_effective_buy_price(
+            side, direct_ask_price, direct_ask_size, opposite_bid_price, opposite_bid_size,
+        )
+        if result is None:
+            return None
+        return EffectiveBuy(price=result[0], size=result[1], source=result[2])
+
+    setattr(this, "choose_effective_buy_price", _rs_choose)
+
+    # --- build_quote_diagnostics ---
+    _py_diagnostics = build_quote_diagnostics
+
+    def _rs_diagnostics(
+        yes_buy_price: float,
+        no_buy_price: float,
+        yes_bid_price: float | None = None,
+        no_bid_price: float | None = None,
+    ) -> QuoteDiagnostics:
+        d = arb_engine_rs.build_quote_diagnostics(
+            yes_buy_price, no_buy_price, yes_bid_price, no_bid_price,
+        )
+        return QuoteDiagnostics(
+            ask_implied_probability=d["ask_implied_probability"],
+            ask_edge_per_side=d["ask_edge_per_side"],
+            bid_implied_probability=d["bid_implied_probability"],
+            bid_edge_per_side=d["bid_edge_per_side"],
+            midpoint_consistency_gap=d["midpoint_consistency_gap"],
+            yes_spread=d["yes_spread"],
+            no_spread=d["no_spread"],
+            spread_asymmetry=d["spread_asymmetry"],
+        )
+
+    setattr(this, "build_quote_diagnostics", _rs_diagnostics)
+
+    return True
+
+
+_RUST_ACTIVE = _try_rust_dispatch()

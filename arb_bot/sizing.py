@@ -158,3 +158,46 @@ class PositionSizer:
             raw = max(0.0, (b * p - a * q) / (a * b))
         adjusted = raw * math.sqrt(p)
         return max(0.0, min(1.0, adjusted))
+
+
+# ---------------------------------------------------------------------------
+# Rust dispatch for execution_aware_kelly_fraction.
+# When arb_engine_rs is installed and ARB_USE_RUST_SIZING=1 (or
+# ARB_USE_RUST_ALL=1), replaces the static method with the Rust
+# implementation. Set env var to "0" for instant rollback.
+# ---------------------------------------------------------------------------
+
+
+def _try_rust_dispatch() -> bool:
+    """Attempt to replace static method with Rust implementation."""
+    import os
+
+    if os.environ.get("ARB_USE_RUST_SIZING", "") != "1" and \
+       os.environ.get("ARB_USE_RUST_ALL", "") != "1":
+        return False
+
+    try:
+        import arb_engine_rs  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+
+    _py_kelly = PositionSizer.execution_aware_kelly_fraction
+
+    @staticmethod  # type: ignore[misc]
+    def _rs_kelly(
+        edge_per_contract: float,
+        cost_per_contract: float,
+        fill_probability: float,
+        failure_loss_per_contract: float | None = None,
+    ) -> float:
+        return arb_engine_rs.execution_aware_kelly_fraction(
+            edge_per_contract, cost_per_contract,
+            fill_probability, failure_loss_per_contract,
+        )
+
+    PositionSizer.execution_aware_kelly_fraction = _rs_kelly  # type: ignore[assignment]
+
+    return True
+
+
+_RUST_ACTIVE = _try_rust_dispatch()

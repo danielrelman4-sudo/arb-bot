@@ -403,3 +403,100 @@ class FeeModel:
     @property
     def reconciliation_count(self) -> int:
         return len(self._reconciliation_entries)
+
+
+# ---------------------------------------------------------------------------
+# Rust dispatch for FeeModel.estimate().
+# When arb_engine_rs is installed and ARB_USE_RUST_FEE_MODEL=1 (or
+# ARB_USE_RUST_ALL=1), replaces estimate() with Rust implementation.
+# Reconciliation tracking remains in Python.
+# Set env var to "0" for instant rollback.
+# ---------------------------------------------------------------------------
+
+
+def _try_rust_dispatch() -> bool:
+    """Attempt to replace FeeModel.estimate with Rust implementation."""
+    import json
+    import os
+
+    if os.environ.get("ARB_USE_RUST_FEE_MODEL", "") != "1" and \
+       os.environ.get("ARB_USE_RUST_ALL", "") != "1":
+        return False
+
+    try:
+        import arb_engine_rs  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+
+    _py_estimate = FeeModel.estimate
+
+    def _rs_estimate(
+        self: FeeModel,
+        venue: str,
+        order_type: OrderType,
+        contracts: int,
+        price: float = 0.0,
+    ) -> FeeEstimate:
+        schedule = self._schedules.get(venue)
+        if schedule is None:
+            # Fallback: no Rust schedule, use Python default path.
+            return _py_estimate(self, venue, order_type, contracts, price)
+
+        schedule_json = json.dumps({
+            "venue": schedule.venue,
+            "taker_fee_per_contract": schedule.taker_fee_per_contract,
+            "maker_fee_per_contract": schedule.maker_fee_per_contract,
+            "taker_fee_rate": schedule.taker_fee_rate,
+            "maker_fee_rate": schedule.maker_fee_rate,
+            "taker_curve_coefficient": schedule.taker_curve_coefficient,
+            "maker_curve_coefficient": schedule.maker_curve_coefficient,
+            "curve_round_up": schedule.curve_round_up,
+            "settlement_fee_per_contract": schedule.settlement_fee_per_contract,
+            "min_fee_per_order": schedule.min_fee_per_order,
+            "max_fee_per_order": schedule.max_fee_per_order,
+        })
+        ot_str = order_type.value
+        rs_json = arb_engine_rs.estimate_fee(
+            venue, ot_str, contracts, price, schedule_json,
+        )
+        d = json.loads(rs_json)
+
+        # Reconstruct breakdown to match Python's detailed keys.
+        is_taker = order_type == OrderType.TAKER
+        flat_per = schedule.taker_fee_per_contract if is_taker else schedule.maker_fee_per_contract
+        rate = schedule.taker_fee_rate if is_taker else schedule.maker_fee_rate
+        coeff = schedule.taker_curve_coefficient if is_taker else schedule.maker_curve_coefficient
+        flat_total = flat_per * contracts
+        prop_total = rate * price * contracts
+        breakdown: Dict[str, float] = {
+            "flat": flat_total,
+            "proportional": prop_total,
+        }
+        if coeff != 0.0 and 0.0 < price < 1.0:
+            raw_curve = coeff * contracts * price * (1.0 - price)
+            breakdown["curve"] = math.ceil(raw_curve * 100) / 100 if schedule.curve_round_up else raw_curve
+        else:
+            breakdown["curve"] = 0.0
+        raw_total = flat_total + prop_total + breakdown["curve"]
+        if schedule.min_fee_per_order > 0 and raw_total < schedule.min_fee_per_order:
+            breakdown["min_floor_applied"] = schedule.min_fee_per_order
+        if schedule.max_fee_per_order > 0 and raw_total > schedule.max_fee_per_order:
+            breakdown["max_cap_applied"] = schedule.max_fee_per_order
+        breakdown["settlement"] = d["settlement_fee"]
+
+        return FeeEstimate(
+            venue=d["venue"],
+            order_type=order_type,
+            contracts=d["contracts"],
+            per_contract_fee=d["per_contract_fee"],
+            total_fee=d["total_fee"],
+            settlement_fee=d["settlement_fee"],
+            breakdown=breakdown,
+        )
+
+    FeeModel.estimate = _rs_estimate  # type: ignore[assignment]
+
+    return True
+
+
+_RUST_ACTIVE = _try_rust_dispatch()

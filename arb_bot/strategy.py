@@ -800,3 +800,22 @@ class ArbitrageFinder:
     def _flip_ref(ref: MarketLegRef) -> MarketLegRef:
         flipped_side = Side.NO if ref.side is Side.YES else Side.YES
         return MarketLegRef(venue=ref.venue, market_id=ref.market_id, side=flipped_side)
+
+
+# ---------------------------------------------------------------------------
+# Rust dispatch note for strategy module.
+#
+# The Rust find_opportunities() function exists in arb_engine_rs but uses
+# JSON serialization for the complex input types (quotes, rules, mappings).
+# For small workloads, JSON overhead negates Rust's compute advantage.
+# The Rust strategy port shows benefit only at scale (200+ quotes with
+# fuzzy matching).
+#
+# Future optimization: use PyO3 native types instead of JSON for the
+# strategy function to eliminate serialization overhead.
+#
+# For now, binary_math functions (used internally by strategy) benefit
+# from Rust dispatch via ARB_USE_RUST_BINARY_MATH=1.
+# ---------------------------------------------------------------------------
+
+_RUST_ACTIVE = False  # Strategy dispatch not yet wired (see note above).
