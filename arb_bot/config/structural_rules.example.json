@@ -1,0 +1,58 @@
+{
+  "mutually_exclusive_buckets": [
+    {
+      "group_id": "bucket_example",
+      "payout_per_contract": 1.0,
+      "legs": [
+        {
+          "venue": "kalshi",
+          "market_id": "EXAMPLE-A",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "EXAMPLE-B",
+          "side": "yes"
+        }
+      ]
+    }
+  ],
+  "event_trees": [
+    {
+      "group_id": "event_tree_example",
+      "parent": {
+        "venue": "kalshi",
+        "market_id": "PARENT-MKT",
+        "side": "yes"
+      },
+      "children": [
+        {
+          "venue": "kalshi",
+          "market_id": "CHILD-ONE",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "CHILD-TWO",
+          "side": "yes"
+        }
+      ]
+    }
+  ],
+  "cross_market_parity_checks": [
+    {
+      "group_id": "equivalent_market_pair",
+      "relationship": "equivalent",
+      "left": {
+        "venue": "kalshi",
+        "market_id": "EQ-A",
+        "side": "yes"
+      },
+      "right": {
+        "venue": "polymarket",
+        "market_id": "EQ-B",
+        "side": "yes"
+      }
+    }
+  ]
+}

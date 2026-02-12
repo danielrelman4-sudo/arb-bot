@@ -1,0 +1,408 @@
+{
+  "mutually_exclusive_buckets": [
+    {
+      "group_id": "kalshi_kxpresnomd_28_exclusive",
+      "payout_per_contract": 1.0,
+      "legs": [
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-AB",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-AKLO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-AOC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-BOBA",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-BS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-CBOO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-CMUR",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-DJOH",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-ESLO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-GN",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-GR",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-GW",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-HBID",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-HCLI",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JAM",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JBP",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JF",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JOSS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JP",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JSTE",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JTAL",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-KH",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-LC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-LJAM",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-MC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-MK",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-MO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-PB",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-PHI",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-REMA",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RGAL",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RKHA",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RW",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-SAS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-TW",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-WM",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-ZMAM",
+          "side": "yes"
+        }
+      ]
+    }
+  ],
+  "event_trees": [
+    {
+      "group_id": "kalshi_kxpresnomd_28_partition",
+      "parent": {
+        "venue": "kalshi",
+        "market_id": "KXPRESNOMD-28-GN",
+        "side": "no"
+      },
+      "children": [
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-AB",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-AKLO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-AOC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-BOBA",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-BS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-CBOO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-CMUR",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-DJOH",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-ESLO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-GR",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-GW",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-HBID",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-HCLI",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JAM",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JBP",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JF",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JOSS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JP",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JSTE",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-JTAL",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-KH",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-LC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-LJAM",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-MC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-MK",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-MO",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-PB",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-PHI",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RC",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-REMA",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RGAL",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RKHA",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-RW",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-SAS",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-TW",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-WM",
+          "side": "yes"
+        },
+        {
+          "venue": "kalshi",
+          "market_id": "KXPRESNOMD-28-ZMAM",
+          "side": "yes"
+        }
+      ]
+    }
+  ],
+  "cross_market_parity_checks": []
+}

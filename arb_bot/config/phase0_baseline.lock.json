@@ -1,0 +1,26 @@
+{
+  "created_at_utc": "2026-02-11T21:44:29.330186+00:00",
+  "cross_map_file": {
+    "exists": true,
+    "path": "/Users/danielelman/Documents/New project/arb_bot/config/cross_venue_map.generated.csv",
+    "sha256": "325c2b481c57d38ddf1eebbf45d9b3449889eead39aebc720b25b046322e445e"
+  },
+  "env_file": {
+    "exists": true,
+    "path": "/Users/danielelman/Documents/New project/.env",
+    "sha256": "5a5bf56e7c4dbd288e0f44d73a34af11f10f288a2d949ee18ad8823f7b085de5"
+  },
+  "profile_file": {
+    "exists": false,
+    "path": null,
+    "sha256": null
+  },
+  "structural_rules_file": {
+    "exists": true,
+    "path": "/Users/danielelman/Documents/New project/arb_bot/config/structural_rules.generated.json",
+    "sha256": "36f0120573aad2cf9166c3281a8124faf2d32a49bc091a6a815ae4ffdc7c18f3"
+  },
+  "tracked_env_fingerprint_sha256": "a9a39039ec47126f58926c391c521a2aad5131c964f1267b50dece790e69ca77",
+  "tracked_env_key_count": 139,
+  "version": 1
+}
