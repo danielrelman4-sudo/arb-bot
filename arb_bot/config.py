@@ -509,6 +509,8 @@ class FillModelSettings:
     partial_fill_penalty_per_contract: float = 0.01
     min_fill_quality_score: float = -0.5
     min_expected_realized_profit_usd: float = 0.0
+    # Phase 8A: Correlated multi-leg fill model
+    same_venue_fill_correlation: float = 0.7  # 0.0 = independent, 1.0 = single fill
     enable_lane_fill_autotune: bool = True
     lane_fill_autotune_step: float = 0.02
     lane_fill_autotune_decay_step: float = 0.01
@@ -531,6 +533,7 @@ class KalshiSettings:
     stream_subscription_ack_timeout_seconds: float = 2.5
     stream_max_tickers_per_socket: int = 250
     stream_priority_tickers: List[str] = field(default_factory=list)
+    stream_pinned_tickers: List[str] = field(default_factory=list)
     stream_priority_refresh_limit: int = 300
     stream_allow_rest_topup: bool = False
     stream_bootstrap_scan_pages: int = 3
@@ -582,6 +585,7 @@ class PolymarketSettings:
     taker_fee_per_contract: float = 0.0
     market_ids: List[str] = field(default_factory=list)
     priority_market_ids: List[str] = field(default_factory=list)
+    pinned_market_ids: List[str] = field(default_factory=list)
 
     # Needed for live order posting through py-clob-client
     chain_id: int = 137
@@ -630,6 +634,10 @@ class AppSettings:
     stream_recovery_attempt_seconds: float = 30.0
     paper_checkpoint_flush_rows: int = 1
     paper_checkpoint_fsync: bool = False
+    # Phase 8C: Rolling settlement — settle oldest positions early when they
+    # exceed min_hold time, freeing capital for new opportunities.
+    paper_rolling_settlement_enabled: bool = False
+    paper_rolling_settlement_min_hold_seconds: int = 120
 
 
 
@@ -690,6 +698,19 @@ def load_settings() -> AppSettings:
         cross_quota=polymarket_priority_cross_quota,
         bucket_quota=polymarket_priority_bucket_quota,
     )
+
+    # Phase 8B: Pinned tickers — always fetched every REST refresh cycle.
+    pin_structural = _as_bool(os.getenv("ARB_PIN_STRUCTURAL_TICKERS"), True)
+    if pin_structural:
+        kalshi_pinned_tickers = _dedupe_in_order(
+            _read_kalshi_tickers_from_structural_rules(structural_rules_path)
+        )
+        polymarket_pinned_market_ids = _dedupe_in_order(
+            _read_polymarket_market_ids_from_structural_rules(structural_rules_path)
+        )
+    else:
+        kalshi_pinned_tickers = []
+        polymarket_pinned_market_ids = []
 
     def _lane(prefix: str) -> LaneTuningSettings:
         return LaneTuningSettings(
@@ -756,6 +777,14 @@ def load_settings() -> AppSettings:
         paper_checkpoint_fsync=_as_bool(
             os.getenv("ARB_PAPER_CHECKPOINT_FSYNC"),
             False,
+        ),
+        paper_rolling_settlement_enabled=_as_bool(
+            os.getenv("ARB_PAPER_ROLLING_SETTLEMENT_ENABLED"),
+            False,
+        ),
+        paper_rolling_settlement_min_hold_seconds=_as_int(
+            os.getenv("ARB_PAPER_ROLLING_SETTLEMENT_MIN_HOLD_SECONDS"),
+            120,
         ),
         stream_mode=_as_bool(os.getenv("ARB_STREAM_MODE"), False),
         stream_recompute_cooldown_ms=_as_int(os.getenv("ARB_STREAM_RECOMPUTE_COOLDOWN_MS"), 400),
@@ -1001,6 +1030,10 @@ def load_settings() -> AppSettings:
             partial_fill_penalty_per_contract=_as_float(os.getenv("ARB_FILL_PARTIAL_PENALTY_PER_CONTRACT"), 0.01),
             min_fill_quality_score=_as_float(os.getenv("ARB_FILL_MIN_QUALITY_SCORE"), -0.5),
             min_expected_realized_profit_usd=_as_float(os.getenv("ARB_FILL_MIN_REALIZED_PROFIT_USD"), 0.0),
+            same_venue_fill_correlation=_as_float(
+                os.getenv("ARB_FILL_SAME_VENUE_CORRELATION"),
+                0.7,
+            ),
             enable_lane_fill_autotune=_as_bool(
                 os.getenv("ARB_ENABLE_LANE_FILL_AUTOTUNE"),
                 True,
@@ -1048,6 +1081,7 @@ def load_settings() -> AppSettings:
             ),
             stream_max_tickers_per_socket=_as_int(os.getenv("KALSHI_STREAM_MAX_TICKERS_PER_SOCKET"), 250),
             stream_priority_tickers=kalshi_stream_priority_tickers,
+            stream_pinned_tickers=kalshi_pinned_tickers,
             stream_priority_refresh_limit=_as_int(os.getenv("KALSHI_STREAM_PRIORITY_REFRESH_LIMIT"), 300),
             stream_allow_rest_topup=_as_bool(os.getenv("KALSHI_STREAM_ALLOW_REST_TOPUP"), False),
             stream_bootstrap_scan_pages=_as_int(os.getenv("KALSHI_STREAM_BOOTSTRAP_SCAN_PAGES"), 3),
@@ -1103,6 +1137,7 @@ def load_settings() -> AppSettings:
             taker_fee_per_contract=_as_float(os.getenv("POLYMARKET_TAKER_FEE_PER_CONTRACT"), 0.0),
             market_ids=_as_csv(os.getenv("POLYMARKET_MARKET_IDS")),
             priority_market_ids=polymarket_priority_market_ids,
+            pinned_market_ids=polymarket_pinned_market_ids,
             chain_id=_as_int(os.getenv("POLYMARKET_CHAIN_ID"), 137),
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY"),
             funder=os.getenv("POLYMARKET_FUNDER"),

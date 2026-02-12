@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from arb_bot.config import AppSettings, LaneTuningSettings
 from arb_bot.correlation import CorrelationAssessment, CorrelationConstraintModel
-from arb_bot.fill_model import FillEstimate, FillModel
+from arb_bot.fill_model import CorrelationMode, FillEstimate, FillModel
 from arb_bot.models import (
     ArbitrageOpportunity,
     EngineState,
@@ -32,6 +32,13 @@ from arb_bot.strategy import ArbitrageFinder
 from arb_bot.universe_ranking import rank_quotes
 
 from .exchanges import ExchangeAdapter, KalshiAdapter, PolymarketAdapter
+
+# Structural opportunity kinds eligible for same-venue correlated fill model.
+_STRUCTURAL_SAME_VENUE_KINDS: frozenset[OpportunityKind] = frozenset({
+    OpportunityKind.STRUCTURAL_BUCKET,
+    OpportunityKind.STRUCTURAL_PARITY,
+    OpportunityKind.STRUCTURAL_EVENT_TREE,
+})
 
 LOGGER = logging.getLogger(__name__)
 _OPPORTUNITY_FAMILIES: tuple[str, ...] = (
@@ -92,6 +99,33 @@ class OpportunityRegimePolicy:
 class OpportunityLane:
     kind: OpportunityKind
     settings: LaneTuningSettings
+
+
+def _choose_correlation_mode(opportunity: ArbitrageOpportunity) -> CorrelationMode:
+    """Select the fill correlation mode based on opportunity structure.
+
+    Structural multi-leg opportunities (bucket, parity, event-tree) where all legs
+    trade on the same venue share correlated fill dynamics — the same market-maker
+    presence, liquidity regime, and volatility conditions affect all legs.  Using
+    independent fill multiplication drastically underestimates the joint fill
+    probability (the "multi-leg death spiral": 3 legs at 0.54 → 0.157 independent
+    vs 0.374 with rho=0.7).
+
+    Cross-venue opportunities genuinely face independent fill conditions across
+    exchanges and should always use the independent product.
+    """
+    if opportunity.kind not in _STRUCTURAL_SAME_VENUE_KINDS:
+        return CorrelationMode.INDEPENDENT
+
+    if len(opportunity.legs) <= 1:
+        return CorrelationMode.INDEPENDENT
+
+    # Only apply same-venue correlation when ALL legs share the same venue.
+    venues = {leg.venue for leg in opportunity.legs}
+    if len(venues) == 1:
+        return CorrelationMode.SAME_VENUE
+
+    return CorrelationMode.INDEPENDENT
 
 
 class ArbEngine:
@@ -2370,8 +2404,20 @@ class ArbEngine:
         settled: list[OpportunityDecision] = []
         still_open: list[PaperSimPosition] = []
 
+        # Phase 8C: Rolling settlement — settle positions past the min hold time
+        # when rolling mode is enabled, freeing capital for new opportunities.
+        rolling_enabled = getattr(self._settings, "paper_rolling_settlement_enabled", False)
+        min_hold_seconds = max(1, getattr(self._settings, "paper_rolling_settlement_min_hold_seconds", 120))
+        rolling_cutoff = now - timedelta(seconds=min_hold_seconds)
+
         for position in self._paper_positions:
-            if position.release_at > now:
+            # Always settle positions that have reached their scheduled lifetime.
+            if position.release_at <= now:
+                pass  # Falls through to settlement below.
+            elif rolling_enabled and position.opened_at <= rolling_cutoff:
+                # Rolling settlement: this position has been held long enough.
+                pass  # Falls through to settlement below.
+            else:
                 still_open.append(position)
                 continue
 
@@ -2441,7 +2487,11 @@ class ArbEngine:
     ) -> FillEstimate | None:
         if plan is None or not self._fill_model.enabled:
             return None
-        return self._fill_model.estimate(opportunity, plan, now=datetime.now(timezone.utc))
+        correlation_mode = _choose_correlation_mode(opportunity)
+        return self._fill_model.estimate(
+            opportunity, plan, now=datetime.now(timezone.utc),
+            correlation_mode=correlation_mode,
+        )
 
     def _decision_metrics(
         self,
