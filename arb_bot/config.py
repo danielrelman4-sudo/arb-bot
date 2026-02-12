@@ -476,6 +476,15 @@ class RiskSettings:
     order_poll_interval_seconds: float = 1.0
     order_poll_timeout_seconds: float = 15.0
     cancel_on_poll_timeout: bool = True
+    # Phase 1A: Operational risk controls
+    kill_switch_file: str = ".kill_switch"
+    kill_switch_env_var: str = "ARB_KILL_SWITCH"
+    venue_kill_switch_env_prefix: str = "ARB_KILL_"
+    daily_loss_cap_usd: float = 0.0  # 0 = disabled
+    max_consecutive_failures: int = 0  # 0 = disabled
+    canary_mode: bool = False
+    canary_max_dollars_per_trade: float = 10.0
+    canary_max_contracts_per_trade: int = 25
 
 
 @dataclass(frozen=True)
@@ -964,6 +973,14 @@ def load_settings() -> AppSettings:
             market_cooldown_seconds=_as_int(os.getenv("ARB_MARKET_COOLDOWN_SECONDS"), 900),
             market_cooldown_scope=(os.getenv("ARB_MARKET_COOLDOWN_SCOPE") or "market").strip().lower(),
             opportunity_cooldown_seconds=_as_int(os.getenv("ARB_OPPORTUNITY_COOLDOWN_SECONDS"), 0),
+            kill_switch_file=os.getenv("ARB_KILL_SWITCH_FILE", ".kill_switch"),
+            kill_switch_env_var=os.getenv("ARB_KILL_SWITCH_ENV_VAR", "ARB_KILL_SWITCH"),
+            venue_kill_switch_env_prefix=os.getenv("ARB_VENUE_KILL_SWITCH_ENV_PREFIX", "ARB_KILL_"),
+            daily_loss_cap_usd=_as_float(os.getenv("ARB_DAILY_LOSS_CAP_USD"), 0.0),
+            max_consecutive_failures=_as_int(os.getenv("ARB_MAX_CONSECUTIVE_FAILURES"), 0),
+            canary_mode=_as_bool(os.getenv("ARB_CANARY_MODE"), False),
+            canary_max_dollars_per_trade=_as_float(os.getenv("ARB_CANARY_MAX_DOLLARS_PER_TRADE"), 10.0),
+            canary_max_contracts_per_trade=_as_int(os.getenv("ARB_CANARY_MAX_CONTRACTS_PER_TRADE"), 25),
         ),
         universe=UniverseRankingSettings(
             enabled=_as_bool(os.getenv("ARB_UNIVERSE_RANKING_ENABLED"), True),
