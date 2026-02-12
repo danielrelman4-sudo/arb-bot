@@ -538,6 +538,15 @@ class KalshiAdapter(ExchangeAdapter):
 
         ordered: list[str] = []
         seen: set[str] = set()
+
+        # Phase 8B: Pinned tickers (structural rules) get highest subscription priority.
+        for ticker in self._settings.stream_pinned_tickers:
+            value = ticker.strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+
         for ticker in self._settings.stream_priority_tickers:
             value = ticker.strip()
             if not value or value in seen:
@@ -1326,12 +1335,37 @@ class KalshiAdapter(ExchangeAdapter):
         if count >= size:
             return list(universe)
 
-        start = self._priority_refresh_cursor % size
+        # Phase 8B: Always include pinned tickers (structural rules) first,
+        # then fill remaining slots from the rotating cursor window.
+        pinned = self._settings.stream_pinned_tickers
         selected: list[str] = []
-        for offset in range(count):
-            selected.append(universe[(start + offset) % size])
+        seen: set[str] = set()
 
-        self._priority_refresh_cursor = (start + count) % size
+        for ticker in pinned:
+            value = ticker.strip()
+            if value and value not in seen:
+                selected.append(value)
+                seen.add(value)
+            if len(selected) >= count:
+                break
+
+        remaining = count - len(selected)
+        if remaining > 0:
+            start = self._priority_refresh_cursor % size
+            scanned = 0
+            added = 0
+            while added < remaining and scanned < size:
+                candidate = universe[(start + scanned) % size]
+                scanned += 1
+                if candidate not in seen:
+                    selected.append(candidate)
+                    seen.add(candidate)
+                    added += 1
+            self._priority_refresh_cursor = (start + scanned) % size
+        else:
+            # All slots taken by pinned tickers — still advance cursor.
+            self._priority_refresh_cursor = (self._priority_refresh_cursor + 1) % max(1, size)
+
         return selected
 
     def _rebalance_priority_refresh_limit(self, attempted: int, successful: int, throttled: int) -> None:

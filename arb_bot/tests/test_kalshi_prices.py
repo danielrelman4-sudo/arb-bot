@@ -158,6 +158,7 @@ def test_canonical_ws_signing_path_normalizes_short_ws_path() -> None:
 
 def test_priority_refresh_tickers_round_robin_windows() -> None:
     adapter = KalshiAdapter.__new__(KalshiAdapter)
+    adapter._settings = KalshiSettings(stream_pinned_tickers=[])
     adapter._priority_refresh_cursor = 0
 
     universe = ["A", "B", "C", "D", "E"]
