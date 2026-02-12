@@ -337,3 +337,45 @@
 - [ ] Deferred (after fast track)
   - Advanced auto-tuning loops, broader event-tree automation, and capacity optimizations beyond immediate reliability/signal goals.
   - Plan and execute a staged Rust refactor (hot-path first) for pre-live latency/throughput gains while preserving Python parity tests and rollout safety gates.
+
+## Infra Hardening Gaps (New)
+
+- [ ] Pre-run hard gate wrapper
+  - Before any long unattended run, enforce a startup gate chain (`kalshi_stream_preflight` + dual-venue smoke + phase0 mini-gate).
+  - Abort launch automatically if any gate is red instead of running in degraded mode.
+
+- [ ] Automatic mode degradation with hysteresis
+  - Add deterministic failover between `stream`, `hybrid`, and `poll-only` when coverage/timeouts degrade.
+  - Add hysteresis windows so mode does not flap under transient blips.
+
+- [ ] Dual-venue bootstrap budget enforcement
+  - Reserve startup API budget for mapped cross/parity symbols on both venues during first cycles.
+  - Prevent one-venue bootstrap from starving mapped overlap acquisition.
+
+- [ ] Endpoint-specific circuit breakers
+  - Add independent circuit breakers for high-risk endpoints (`kalshi /markets`, `/events`, `/orderbook`; polymarket book endpoints).
+  - Include cooldown + jittered probe-recovery path before reopening full traffic.
+
+- [ ] Cross/parity keepalive probe set
+  - Run low-rate targeted probes for mapped pairs/rules to maintain non-zero overlap readiness.
+  - Alert when probe coverage falls below floor for consecutive windows.
+
+- [ ] Persistent warm-cache snapshots
+  - Persist normalized quote cache + coverage state and reload at startup.
+  - Reduce time-to-first-dual-venue-readiness after restarts.
+
+- [ ] Metrics export + alert dashboard
+  - Export coverage/readiness/skip-reason/429/reconnect metrics to a time-series backend (Prometheus/StatsD).
+  - Define alert thresholds and pager signals for sustained lane starvation.
+
+- [ ] Secret and credential hardening
+  - Move live credentials from plain `.env` to secure retrieval (OS keychain/secret manager wrapper).
+  - Add key-scope/expiry validation and rotation runbook.
+
+- [ ] Process supervision policy
+  - Run bot under a supervisor (`launchd`/`systemd`/container runtime) with bounded restart/backoff policy.
+  - Add crash-loop detection and explicit safe-stop behavior.
+
+- [ ] Incident replay bundle automation
+  - Add one-command export of run artifacts (logs, config snapshot, coverage timeline, sampled decisions) for failures.
+  - Ensure deterministic replay harness can consume the bundle without manual stitching.
