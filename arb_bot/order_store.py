@@ -462,6 +462,70 @@ class OrderStore:
             markets.setdefault(pos.venue, set()).add(pos.market_id)
         return markets
 
+    def update_leg_fill(
+        self,
+        intent_id: str,
+        leg_index: int,
+        filled_contracts: int,
+        average_price: float | None = None,
+    ) -> None:
+        """Update a leg's fill count from a poll result (partial or full)."""
+        now = time.time()
+        with self._tx() as cur:
+            leg_rows = cur.execute(
+                "SELECT contracts, status FROM leg_executions WHERE intent_id = ? AND leg_index = ?",
+                (intent_id, leg_index),
+            ).fetchone()
+            if leg_rows is None:
+                return
+
+            requested = leg_rows[0]
+            if filled_contracts >= requested:
+                new_status = LegStatus.FILLED.value
+            elif filled_contracts > 0:
+                new_status = LegStatus.PARTIALLY_FILLED.value
+            else:
+                new_status = leg_rows[1]  # Keep current status
+
+            cur.execute(
+                """UPDATE leg_executions
+                   SET filled_contracts = ?, average_price = COALESCE(?, average_price),
+                       status = ?, updated_at = ?
+                   WHERE intent_id = ? AND leg_index = ?""",
+                (filled_contracts, average_price, new_status, now, intent_id, leg_index),
+            )
+
+    def compute_hedge_exposure(self, intent_id: str) -> dict[str, int]:
+        """Compute hedged vs exposed contracts for an intent.
+
+        Returns dict with keys:
+            hedged: contracts covered across all legs (min fill)
+            exposed: contracts filled on some legs but not others
+            unfilled: contracts not filled on any leg
+        """
+        legs = self.get_legs(intent_id)
+        if not legs:
+            return {"hedged": 0, "exposed": 0, "unfilled": 0}
+
+        fills = [leg.filled_contracts for leg in legs]
+        requested = legs[0].contracts  # All legs in a plan have the same contract count
+
+        hedged = min(fills)
+        max_fill = max(fills)
+        exposed = max_fill - hedged
+        unfilled = max(0, requested - max_fill)
+
+        return {"hedged": hedged, "exposed": exposed, "unfilled": unfilled}
+
+    def get_partially_filled_intents(self) -> list[StoredIntent]:
+        """Get all intents in PARTIALLY_FILLED status."""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT * FROM order_intents WHERE status = ? ORDER BY created_at",
+            (IntentStatus.PARTIALLY_FILLED.value,),
+        ).fetchall()
+        return [_row_to_intent(r) for r in rows]
+
     def _fetch_legs(self, cur: sqlite3.Cursor, intent_id: str) -> list[StoredLeg]:
         rows = cur.execute(
             "SELECT * FROM leg_executions WHERE intent_id = ? ORDER BY leg_index",
