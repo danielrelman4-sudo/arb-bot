@@ -23,6 +23,7 @@ from arb_bot.models import (
     OpportunityKind,
     PlannedLegExecutionResult,
     Side,
+    TradeLegPlan,
     TradePlan,
 )
 from arb_bot.risk import RiskManager
@@ -2088,8 +2089,7 @@ class ArbEngine:
                 error=pair.error,
             )
 
-        tasks = []
-        plan_legs = []
+        # Validate all adapters up front.
         for leg in plan.legs:
             adapter = self._exchanges.get(leg.venue)
             if adapter is None:
@@ -2106,6 +2106,22 @@ class ArbEngine:
                     error=f"missing adapter for {leg.venue}",
                 )
 
+        use_sequential = (
+            self._settings.risk.sequential_legs
+            and len(plan.legs) >= 2
+            and len(plan.venues) > 1
+        )
+
+        if use_sequential:
+            return await self._execute_sequential_legs(plan)
+        return await self._execute_parallel_legs(plan)
+
+    async def _execute_parallel_legs(self, plan: TradePlan) -> MultiLegExecutionResult:
+        """Original parallel execution for same-venue multi-leg plans."""
+        tasks = []
+        plan_legs = []
+        for leg in plan.legs:
+            adapter = self._exchanges[leg.venue]
             tasks.append(adapter.place_single_order(leg))
             plan_legs.append(leg)
 
@@ -2133,6 +2149,129 @@ class ArbEngine:
 
         error = "one or more legs failed" if any_failure else None
         return MultiLegExecutionResult(legs=tuple(merged), error=error)
+
+    async def _execute_sequential_legs(self, plan: TradePlan) -> MultiLegExecutionResult:
+        """Execute cross-venue legs sequentially with quote freshness re-check.
+
+        After leg A fills, re-check leg B's quote.  If the price has drifted
+        beyond ``risk.leg_quote_drift_tolerance`` or the time between legs
+        exceeds ``risk.leg_max_time_window_seconds``, abort remaining legs.
+        """
+        tolerance = self._settings.risk.leg_quote_drift_tolerance
+        max_window = self._settings.risk.leg_max_time_window_seconds
+
+        merged: list[PlannedLegExecutionResult] = []
+        first_fill_ts: float | None = None
+        any_failure = False
+        aborted = False
+
+        for idx, leg in enumerate(plan.legs):
+            adapter = self._exchanges[leg.venue]
+
+            # After the first leg fills, re-check quote freshness for remaining legs.
+            if first_fill_ts is not None:
+                elapsed = time.perf_counter() - first_fill_ts
+                if elapsed > max_window:
+                    LOGGER.warning(
+                        "Leg time window exceeded (%.1fs > %.1fs), aborting remaining legs for %s",
+                        elapsed, max_window, plan.market_key,
+                    )
+                    aborted = True
+                    any_failure = True
+                    merged.append(PlannedLegExecutionResult(
+                        leg=leg,
+                        result=LegExecutionResult(
+                            success=False, order_id=None,
+                            requested_contracts=leg.contracts,
+                            filled_contracts=0, average_price=None,
+                            raw={"error": "leg time window exceeded"},
+                        ),
+                    ))
+                    continue
+
+                drift_ok = await self._check_leg_quote_drift(leg, tolerance)
+                if not drift_ok:
+                    LOGGER.warning(
+                        "Quote drift exceeded tolerance (%.1f%%) for %s:%s, aborting remaining legs",
+                        tolerance * 100, leg.venue, leg.market_id,
+                    )
+                    aborted = True
+                    any_failure = True
+                    merged.append(PlannedLegExecutionResult(
+                        leg=leg,
+                        result=LegExecutionResult(
+                            success=False, order_id=None,
+                            requested_contracts=leg.contracts,
+                            filled_contracts=0, average_price=None,
+                            raw={"error": "quote drift exceeded tolerance"},
+                        ),
+                    ))
+                    continue
+
+            # Submit the leg.
+            try:
+                result = await adapter.place_single_order(leg)
+            except Exception as exc:
+                result = LegExecutionResult(
+                    success=False, order_id=None,
+                    requested_contracts=leg.contracts,
+                    filled_contracts=0, average_price=None,
+                    raw={"error": str(exc)},
+                )
+
+            if not result.success:
+                any_failure = True
+                # If a non-first leg fails, mark remaining as aborted too.
+                if idx > 0:
+                    aborted = True
+            elif first_fill_ts is None:
+                first_fill_ts = time.perf_counter()
+
+            merged.append(PlannedLegExecutionResult(leg=leg, result=result))
+
+            # If any leg fails, skip remaining legs.
+            if not result.success:
+                for remaining_leg in plan.legs[idx + 1:]:
+                    any_failure = True
+                    merged.append(PlannedLegExecutionResult(
+                        leg=remaining_leg,
+                        result=LegExecutionResult(
+                            success=False, order_id=None,
+                            requested_contracts=remaining_leg.contracts,
+                            filled_contracts=0, average_price=None,
+                            raw={"error": "prior leg failed"},
+                        ),
+                    ))
+                break
+
+        error = None
+        if aborted:
+            error = "legging aborted: quote drift or time window exceeded"
+        elif any_failure:
+            error = "one or more legs failed"
+        return MultiLegExecutionResult(legs=tuple(merged), error=error)
+
+    async def _check_leg_quote_drift(self, leg: TradeLegPlan, tolerance: float) -> bool:
+        """Fetch a fresh quote and check whether the price has moved beyond tolerance."""
+        adapter = self._exchanges.get(leg.venue)
+        if adapter is None:
+            return False
+        try:
+            fresh_quote = await adapter.fetch_quote(leg.market_id)
+        except Exception:
+            LOGGER.warning("Failed to fetch fresh quote for %s:%s", leg.venue, leg.market_id)
+            return False
+
+        if fresh_quote is None:
+            return False
+
+        if leg.side is Side.YES:
+            current_price = fresh_quote.yes_buy_price
+        else:
+            current_price = fresh_quote.no_buy_price
+
+        drift = abs(current_price - leg.limit_price)
+        return drift <= tolerance
 
     async def _refresh_venue_balances(self) -> None:
         for adapter in self._exchanges.values():
