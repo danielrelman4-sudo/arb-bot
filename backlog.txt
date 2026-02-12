@@ -1,381 +1,400 @@
-# Backlog
-
-- [ ] Maker-first live execution policy
-  - Prefer passive entry when queue/fill model implies positive expected value net of adverse-selection risk.
-  - Fall back to taker only when expected realized edge stays above threshold.
-
-- [ ] Latency SLO + auto-throttle
-  - Track quote age / decision latency / execution latency as first-class SLOs.
-  - Auto-throttle or skip markets/venues when stale-data or latency breaches are persistent.
-
-- [ ] KPI-driven auto-tuning loop
-  - Periodically adjust thresholds (edge, fill quality, fill probability, sizing caps) from paper-trade KPIs.
-  - Guardrails: bounded parameter ranges + minimum sample sizes before retuning.
-
-- [ ] Hold-time / exit discipline engine
-  - Add explicit close/hedge/abandon logic before resolution when edge decays or risk rises.
-  - Support time-stop and EV-stop exits for open paper/live positions.
-
-- [ ] Auto dependency discovery (candidate rules + human approval)
-  - Detect likely market-link constraints/correlations from text + historical co-movement.
-  - Propose structural rules for review before activation (no blind auto-enable).
-
-- [ ] Event-tree basket coverage (unlock `structural_event_tree`)
-  - Build robust event-tree rule generation from real parent/child metadata (and fallback heuristics when explicit links are sparse).
-  - Validate payout math and basket construction (`parent_no_children_yes`, `parent_yes_children_no`) against real market structures.
-  - Add diagnostics for why event-tree opportunities are not emitted/opened (rule missing vs quote missing vs gating).
-  - Run targeted paper experiments to measure incremental expected-realized and settled contribution from event-tree lane.
-
-- [ ] Stream ingestion hardening (backpressure + recovery)
-  - Add bounded per-venue queues with explicit backpressure/drop policy to avoid memory blowups under burst traffic.
-  - Add stream health watchdogs (heartbeat lag, reconnect rate, message gap rate) with automatic degraded-mode handling.
-
-- [ ] Delta/snapshot reconciliation loop
-  - Periodically reconcile websocket state with REST snapshots to repair missed messages/out-of-order updates.
-  - Track per-market checksum/version and force resync when divergence is detected.
-
-- [ ] Deterministic dedupe + idempotency keys
-  - Introduce stable opportunity IDs (kind + legs + execution style + time bucket) to prevent duplicate decisions/executions.
-  - Enforce idempotent order intents across retries/reconnects.
-
-- [ ] Market mapping QA pipeline
-  - Validate cross-venue mapping cardinality (1:1 expectations), stale links, and semantic drift.
-  - Auto-flag suspicious mappings using text/price-consistency checks before they can trade.
-
-- [ ] Data-quality firewall
-  - Reject/quarantine quotes with invalid prices/sizes, stale timestamps, or impossible bid/ask relationships.
-  - Add anomaly guards for abrupt price jumps and missing-side books.
-
-- [ ] Parallel lane execution architecture
-  - Run lane detection in isolated workers/tasks with bounded fan-out and deterministic merge order.
-  - Add per-lane timing metrics and timeout budgets so one lane cannot block the full cycle.
-
-- [ ] Replay + deterministic simulation harness
-  - Record raw stream/poll events and decisions, then replay deterministically for debugging/regression testing.
-  - Support A/B profile replay on identical market data for fair tuning comparisons.
-
-- [ ] Long-run storage + analytics pipeline
-  - Persist quote/decision/position events to a queryable store (DuckDB/Parquet) with partitioning and retention policy.
-  - Build daily summary jobs for lane-level conversion, fill-quality drift, and concentration risk.
-
-- [ ] Execution realism upgrades (paper/live parity)
-  - Simulate independent leg fill paths, queue position decay, and leg slippage instead of aggregate fill only.
-  - Add adverse fill scenarios and partial-hedge penalties to reduce optimistic bias.
-
-- [ ] Dynamic capacity controller
-  - Adjust universe size, scoring depth, and scan cadence automatically based on CPU/memory/API/latency budgets.
-  - Prefer highest value-per-compute markets during load spikes.
-
-- [ ] Initialization speed + startup progress visibility
-  - Reduce cold-start latency (parallelize market discovery/bootstrap, cache warm starts, and defer non-critical setup).
-  - Emit explicit startup progress logs with timings per stage (config load, venue auth, market discovery, first quote readiness).
-  - Add a startup timeout/fail-fast path so runs do not appear stuck with no output.
-
-- [ ] Operational risk controls
-  - Add global kill switch, venue kill switches, max daily loss, and max consecutive execution failure guardrails.
-  - Add canary mode for new profiles (small capital slice + automatic rollback on KPI breach).
-
-- [ ] Adaptive per-endpoint API rate governor (AIMD + token buckets)
-  - Maintain independent budgets per venue and endpoint class (`markets`, `orderbook`, `events`, account/order endpoints).
-  - Increase request rate gradually when healthy; cut quickly on `429`/timeouts and honor `Retry-After` automatically.
-  - Operate near max safe throughput (target utilization band) instead of static pause/concurrency settings.
-
-- [ ] Tiered polling scheduler for full-universe with minimum latency
-  - Implement `hot` / `warm` / `cold` market tiers with different cadences (sub-second to minutes).
-  - Promote markets to `hot` on stream updates, open positions, recent opportunities, or mapped cross/parity relevance.
-  - Demote inactive markets automatically to preserve API budget for highest-EV symbols.
-
-- [ ] Poll budget allocator + fairness controls
-  - Allocate finite request budget across lanes (`intra`, `cross`, `bucket`, `parity`) and venues each cycle.
-  - Prevent one lane/venue from starving the others under load.
-  - Add strict ceilings and burst allowances per class so full-universe scans do not collapse real-time coverage.
-
-- [ ] Cross/parity coverage watchdog with automatic repair
-  - Track `cross_pairs_covered` and `parity_rules_covered` as hard health metrics.
-  - Trigger targeted remap/reload/re-scan when coverage remains below thresholds for N cycles.
-  - Fail fast (or alert loudly) if lane readiness is persistently zero while streams are nominal.
-
-- [ ] Low-latency execution path optimization
-  - Split detection and execution workers so order submission cannot block quote ingestion.
-  - Pre-build and cache signed/authenticated request components where safe.
-  - Measure and optimize `detect->plan->submit->ack` latency percentiles by venue.
+# Consolidated Master Plan: Dry-Run to Live Trading Readiness
 
-- [ ] Confidence-scored strict mapping mode (reduce false positives without zeroing coverage)
-  - Keep strict map IDs as primary, but allow a gated confidence fallback only when strict overlap is absent.
-  - Require multi-signal agreement (text similarity + temporal overlap + price coherence) before fallback mapping is tradable.
-  - Log fallback-origin opportunities separately for audit and rapid rollback.
+## Context
 
-## Primetime Readiness Checklist (Pass/Fail Gates)
+The arb bot has mature detection, sizing, and paper simulation, but critical gaps in post-execution lifecycle (order tracking, crash recovery, legging safety), operational controls (kill switches, circuit breakers), and execution latency (Python too slow for live edge capture) make it unsafe for real money. This plan consolidates **all 59 existing backlog items** plus **6 new items** identified during code review into a single dependency-ordered, safety-first roadmap. The Rust hot-path migration is a prerequisite for live trading — Python latency cannot capture real edge on live markets.
 
-- [ ] Identification quality benchmark (precision over volume)
-  - Define an adjudication sample of detected opportunities by lane (`intra`, `cross/parity family`, `bucket`, `event_tree`).
-  - PASS when false-positive rate stays below target and remains stable across at least 3 distinct sessions.
+Every item from the original backlog appears exactly once in the cross-reference table at the bottom.
 
-- [ ] Mapping integrity and drift checks
-  - Track mapping confidence and drift alarms for strict map entries over time.
-  - PASS when no high-severity mapping drift alerts persist for more than N cycles.
+---
 
-- [ ] Structural rule confidence labeling
-  - Label rules as `exhaustive`, `non_exhaustive`, or `unknown`; price payouts from label instead of global assumption.
-  - PASS when all high-notional structural buckets used for trading have explicit confidence labels.
+## PHASE 0: Crash Safety and Order Lifecycle (Week 1-2)
 
-- [ ] Quote sanity firewall hardening
-  - Reject micro-price artifacts, stale/degenerate books, and impossible quote states before planning.
-  - PASS when zero opened trades rely on rejected/invalid quote states in audit logs.
+**Why first:** A crash between leg A filling and leg B submitting leaves an unhedged position with no record. This is the #1 capital-loss risk.
 
-- [ ] Cross/parity family canonicalization and reporting
-  - Keep dedupe to avoid double counting, but report family-level metrics so alias selection cannot hide lane behavior.
-  - PASS when family totals reconcile exactly with opened trades and no duplicate family keys execute in same cooldown window.
+### 0A. Persistent order/position store (SQLite) — [NEW 60]
+- New module `arb_bot/order_store.py` with SQLite-backed `order_intents` and `positions` tables
+- Write intent row BEFORE calling `place_single_order()`, update on response
+- Back `EngineState` in-memory dicts (`cash_by_venue`, `locked_capital_by_venue`, `open_markets_by_venue`) from store on startup
 
-- [ ] Fill and slippage calibration
-  - Calibrate fill probability and slippage model against paper-forward realized outcomes (not just detected edge).
-  - PASS when realized/expected ratio remains inside an agreed band for multi-hour runs.
+### 0B. Legging risk controls — [Backlog 32]
+- Execute cross-venue legs sequentially (not `asyncio.gather`) in `_execute_live_plan` (engine.py:2112)
+- After leg A fills: re-check leg B quote freshness, abort + cancel leg A if book moved beyond tolerance
+- Max time window between leg fills (config param), cancel/unwind/hedge fallback on miss
 
-- [ ] Execution-cost completeness
-  - Include all venue-specific fees/frictions used in live mode in expected-realized calculation.
-  - PASS when cost reconciliation vs venue statements shows no systematic underestimation.
+### 0C. Cancel/replace for unfilled legs — [NEW 65]
+- Add `cancel_order()` and `get_order_status()` to `ExchangeAdapter` ABC (exchanges/base.py)
+- Implement for Kalshi (10s expiry needs re-submit logic) and Polymarket
 
-- [ ] Outlier robustness in performance reporting
-  - Always publish raw, micro-price-filtered, and top-outlier-removed KPIs.
-  - PASS when strategy conclusions do not flip sign solely because of one outlier trade.
+### 0D. Post-submission order status polling — [NEW 63]
+- Poll order status after placement to verify fills, update persistent store
+- Timeout triggers cancel/unwind policy from 0B
 
-- [ ] Lane health SLOs
-  - Monitor coverage/readiness and open-share by lane family with alert thresholds.
-  - PASS when no lane remains unintentionally starved or zero-ready beyond allowed windows.
+### 0E. Partial fill handling — [NEW 64]
+- Track per-leg fill state in persistent store
+- Compute hedged vs exposed portion, decide close/wait for exposed remainder
 
-- [ ] Long-run stability test
-  - Run multi-hour paper sessions with no manual intervention and no critical data/execution regressions.
-  - PASS when uptime, coverage, and lane participation remain within thresholds for the full window.
+### 0F. Crash recovery startup — [NEW 61]
+- On boot: read persistent store, reconcile against exchange account/position APIs
+- Unhedged positions discovered → safe mode (no new trades until operator acknowledges)
 
-- [ ] Live-forward canary protocol
-  - Start with minimal notional and strict kill switches, then step capital only after gate pass.
-  - PASS when each stage meets realized PnL, drawdown, and execution quality criteria.
+### 0G. Automatic balance refresh — [NEW 62]
+- Periodic venue balance refresh on timer (default 60s) instead of only at `run_once` start
+- Auto-release stale locked capital by reconciling against exchange balance
 
-## Sizing Improvements Backlog
+**Exit gate:** Crash mid-execution recovers to correct state on reboot. Leg-A-fills/leg-B-fails triggers cancel and store reflects correct state. All existing tests pass.
 
-- [ ] Tail-risk-aware Kelly sizing
-  - Add uncertainty haircuts to edge inputs per lane/market family before Kelly fraction is computed.
-  - Reduce effective Kelly when model error/variance increases.
+---
 
-- [ ] Liquidity impact curve integration
-  - Replace static size assumptions with empirically learned slippage/impact curves vs notional.
-  - Size down automatically when marginal impact erodes expected-realized edge.
+## PHASE 1: Kill Switches and Circuit Breakers (Week 2-3)
 
-- [ ] Dynamic per-lane bankroll allocation
-  - Allocate bankroll adaptively across `intra`, `cross/parity`, `bucket`, `event_tree` using realized risk-adjusted efficiency.
-  - Prevent persistent over-allocation to lanes with deteriorating realized performance.
+**Why second:** With persistent state, we need the ability to halt the bot before it loses more money.
 
-- [ ] Confidence-scaled max-loss cap
-  - Cap trade size by worst-case loss under model-error scenarios, not only expected edge.
-  - Enforce tighter loss caps for low-confidence opportunities.
+### 1A. Operational risk controls — [Backlog 17]
+- Global kill switch (file/env), per-venue kill switch, daily loss cap, max consecutive failures, canary mode
 
-- [ ] Outlier-robust sizing inputs
-  - Block or heavily downweight suspicious/micro-price quote states in sizing calculations.
-  - Ensure one anomalous book snapshot cannot drive oversized positions.
+### 1B. Circuit breakers and auto-pause — [Backlog 34]
+- Data-health-triggered pause, explicit recovery criteria before auto-resume
 
-- [ ] Time-to-resolution capital lock penalty
-  - Apply explicit carry/lock-up penalty for long-duration positions in effective sizing.
-  - Require higher edge to justify size on slower-resolving opportunities.
+### 1C. Endpoint-specific circuit breakers — [Backlog 41]
+- Independent per-endpoint circuits (kalshi `/markets`, `/events`, `/orderbook`; polymarket book), jittered probe recovery
 
-- [ ] Drawdown-adaptive de-risking
-  - Auto-reduce global and per-lane sizing when rolling realized underperforms expected or drawdown thresholds trigger.
-  - Restore size gradually only after recovery criteria are met.
+### 1D. Automatic mode degradation with hysteresis — [Backlog 39]
+- Deterministic failover: stream → hybrid → poll-only, hysteresis to prevent flapping
 
-## Risk Controls Backlog
+### 1E. Pre-run hard gate wrapper — [Backlog 38]
+- Startup gate chain (stream preflight + dual-venue smoke + phase0 mini-gate), abort if red
 
-- [ ] Pre-trade quote and mapping risk gates
-  - Enforce strict quote sanity/staleness checks and mapping-confidence minimums before a trade can be planned.
-  - Block trading on invalid/low-confidence states rather than allowing sizing to proceed.
+### 1F. Process supervision policy — [Backlog 46]
+- launchd/systemd/container config, crash-loop detection, safe-stop, restart invokes crash recovery (0F)
 
-- [ ] Legging risk controls (non-atomic execution)
-  - Define max time window between first and second leg fills.
-  - Implement cancel/unwind/hedge fallback policy when second leg misses or partial-fills outside tolerance.
+**Exit gate:** Kill switch halts orders within 1 cycle. Daily loss cap triggers halt before threshold. Circuit breaker opens on simulated 429 storm and recovers.
 
-- [ ] Exposure and concentration controls
-  - Add hard caps by venue, market family, and correlation cluster.
-  - Enforce max concurrent at-risk positions for each lane and family.
+---
 
-- [ ] Circuit breakers and auto-pause logic
-  - Add daily loss cap, consecutive execution-failure cap, and data-health-triggered pause.
-  - Require explicit recovery criteria before auto-resume.
+## PHASE 2: Data Quality and Measurement Baseline (Week 3-4)
 
-- [ ] Lane readiness watchdog enforcement
-  - Pause affected lanes when coverage/readiness stays below thresholds for N cycles.
-  - Prevent degraded lanes from trading on partial/broken signal state.
+**Why third:** Before optimizing, we need trustworthy signals and trustworthy measurement.
 
-- [ ] Expected-vs-realized drift monitoring
-  - Track drift by lane/family and trigger de-risk mode when realized outcomes diverge from model expectations.
-  - Add alerting and automatic throttle-down on sustained negative drift.
+### 2A. Pre-trade quote and mapping risk gates — [Backlog 31]
+- Strict quote sanity/staleness checks and mapping-confidence minimums before planning
 
-- [ ] Operational failure handling playbooks
-  - Codify runbook behavior for 429 storms, stream disconnect loops, and venue-specific outages.
-  - Ensure deterministic fail-safe behavior instead of continuing with stale/incomplete inputs.
+### 2B. Quote sanity firewall hardening — [Backlog 51 / Gate]
+- Reject micro-price artifacts, stale/degenerate books, impossible quote states, price jump anomaly guards
 
-## Primetime Workstreams (Explicit)
+### 2C. Delta/snapshot reconciliation loop — [Backlog 8]
+- Periodic REST snapshot vs WebSocket state reconciliation, per-market checksum/version, force resync on divergence
 
-- [ ] Execution quality
-  - Improve realistic fill behavior, queue position modeling, cancel/replace logic, and partial-leg risk handling.
+### 2D. Stream ingestion hardening — [Backlog 7]
+- Bounded per-venue queues with backpressure/drop policy, stream health watchdogs (heartbeat lag, reconnect rate, gap rate)
 
-- [ ] Cost realism
-  - Complete fee/friction accounting per venue and order type.
-  - Continuously reconcile modeled costs to realized fills.
+### 2E. Deterministic dedupe + idempotency keys — [Backlog 9]
+- Stable opportunity IDs (kind + legs + style + time bucket), idempotent order intents via persistent store
 
-- [ ] Risk controls
-  - Implement hard kill switches, daily drawdown stops, venue/lane shutdown logic, and automatic de-risk mode.
+### 2F. Market mapping QA pipeline — [Backlog 10]
+- Validate mapping cardinality, stale links, semantic drift; auto-flag suspicious mappings
 
-- [ ] Data quality + integrity
-  - Enforce strong quote firewall, stale/malformed-state rejection, stream/snapshot reconciliation, and gap recovery.
+### 2G. Long-run storage + analytics pipeline — [Backlog 13]
+- DuckDB/Parquet store with partitioning and retention, daily summary jobs (lane conversion, fill-quality drift, concentration)
 
-- [ ] Reliability/operations
-  - Build health checks, alerting, retry policies, rate-limit governance, and degraded-venue recovery.
+### 2H. Metrics export + alert dashboard — [Backlog 44]
+- Prometheus/StatsD export (coverage, readiness, skip-reason, 429, reconnect), alert thresholds, pager signals
 
-- [ ] Performance measurement discipline
-  - Standardize KPI stack: raw vs filtered vs outlier-removed, detected vs expected-realized vs realized, and lane-family attribution.
+**Exit gate:** Zero invalid-quote opens in audit sample. Stream/snapshot reconciliation corrects injected drift within 2 refresh cycles. Reproducible KPI report for every paper run. DuckDB queryable for daily summaries.
 
-- [ ] Live-forward deployment process
-  - Use canary capital stages with objective promotion criteria and rollback rules.
+**Primetime gates achievable:** Identification quality benchmark [48], Mapping integrity [49], Structural rule confidence labeling [50], Quote sanity firewall [51], Cross/parity family canonicalization [52]
 
-## Execution Plan (Backlog Order)
+---
 
-- [ ] Phase 1: Data correctness and measurement baseline (Week 1)
-  - Scope: Data quality + integrity, performance measurement discipline, cross/parity family reporting.
-  - Key outputs: quote firewall enabled, stream/snapshot reconciliation checks, standardized KPI report (raw/filtered/outlier-removed, detected vs expected-realized vs realized, lane-family attribution).
-  - Exit gate: zero invalid-quote opens in audit sample and reproducible KPI report for every paper run.
+## PHASE 3: Execution Quality and Cost Realism (Week 4-5)
 
-- [ ] Phase 2: Identification hardening (Week 2)
-  - Scope: mapping integrity/drift checks, structural rule confidence labels (`exhaustive`/`non_exhaustive`/`unknown`), strict mapping confidence fallback.
-  - Key outputs: mapping QA pipeline, structural confidence labels on active rules, precision benchmark by lane.
-  - Exit gate: false-positive rate within target band and no unresolved high-severity mapping drift alerts.
+**Why fourth:** With reliable data, improve execution modeling so paper results predict live results.
 
-- [ ] Phase 3: Execution and cost realism (Week 3)
-  - Scope: execution quality + cost realism.
-  - Key outputs: improved fill/queue/partial-leg model, cancel/replace policy, complete fee/friction accounting reconciled to realized fills.
-  - Exit gate: realized/expected ratio in target band on multi-hour paper sessions after outlier controls.
+### 3A. Execution realism upgrades — [Backlog 14]
+- Independent leg fill paths, queue position decay, leg slippage (replace scalar fill model in engine.py:2154)
 
-- [ ] Phase 4: Risk control framework (Week 4)
-  - Scope: risk controls + sizing safety overlays.
-  - Key outputs: kill switches, daily drawdown stop, lane/venue shutdown rules, legging controls, drawdown-adaptive sizing, confidence-scaled loss caps.
-  - Exit gate: fault-injection tests trigger the expected pause/de-risk behavior with deterministic recovery.
+### 3B. Fill and slippage calibration — [Backlog 53 / Gate]
+- Calibrate fill/slippage model against paper-forward realized outcomes using DuckDB store
 
-- [ ] Phase 5: Reliability and scale stability (Week 5)
-  - Scope: reliability/operations for long unattended runs.
-  - Key outputs: health checks + alerting, adaptive rate governor, tiered polling scheduler, runbooks for degraded venue states.
-  - Exit gate: long-run paper stability target met (coverage, lane participation, and no critical outages for full test window).
+### 3C. Execution-cost completeness — [Backlog 54 / Gate]
+- Complete fee/friction accounting per venue and order type, reconcile vs venue statements
 
-- [ ] Phase 6: Live-forward canary rollout (Week 6+)
-  - Scope: controlled production validation.
-  - Key outputs: staged notional ramp with hard rollback criteria and objective promotion gates.
-  - Exit gate: each stage passes realized PnL quality, drawdown, and execution reliability thresholds before capital increase.
+### 3D. Maker-first live execution policy — [Backlog 1]
+- Passive entry when queue/fill model implies positive EV net of adverse selection, taker fallback
 
-## Immediate Plan (Next 72 Hours)
+### 3E. Latency SLO + auto-throttle — [Backlog 2]
+- First-class SLOs for quote age / decision latency / execution latency, auto-throttle on persistent breaches
 
-- [ ] Day 1: Stabilize signal integrity
-  - Implement lane-family accounting so `cross_venue` and `structural_parity` share one canonical family key in KPI output (no double counting, no hidden suppression).
-  - Lock strict quote-quality gates before planning/sizing and record explicit reject reasons.
-  - Deliverable: one 2-4h paper run where family totals reconcile exactly with opened rows.
+### 3F. Low-latency execution path optimization — [Backlog 22]
+- Split detection and execution workers, pre-build signed request components, measure detect-to-ack p95
 
-- [ ] Day 1: Confirm full-universe coverage behavior
-  - Run hybrid mode with adaptive polling budgets and lane fairness controls enabled.
-  - Record coverage SLOs every cycle (`cross_pairs_covered`, `parity_rules_covered`, lane-ready flags).
-  - Deliverable: no persistent unintended lane starvation window longer than threshold.
+**Exit gate:** Realized/expected ratio inside target band on multi-hour paper. Cost reconciliation shows no systematic underestimation. Latency p95 measured and below threshold.
 
-- [ ] Day 2: Execution realism + costs
-  - Add/verify partial-leg penalties, queue-aware fill probability checks, and complete fee/friction accounting.
-  - Publish side-by-side KPI table (`detected`, `expected_realized`, `simulated_realized`) with outlier-removed view.
-  - Deliverable: realized/expected ratio in target band on at least one multi-hour paper run.
+**Primetime gates achievable:** Fill and slippage calibration [53], Execution-cost completeness [54]
 
-- [ ] Day 2: Sizing safety overlays
-  - Add confidence-scaled size haircut and drawdown-adaptive de-risk multiplier around current Kelly sizing.
-  - Add explicit time-to-resolution lock-up penalty in effective edge.
-  - Deliverable: no outsized positions from low-confidence or micro-price inputs.
+---
 
-- [ ] Day 3: Reliability hardening
-  - Add lane-readiness watchdog actions (auto-pause/throttle affected lane, alert reason).
-  - Add 429/degraded-venue runbook automation and deterministic recovery checks.
-  - Deliverable: unattended 6h+ paper run with stable coverage and no critical recovery failures.
+## PHASE 4: Sizing Safety and Risk Framework (Week 5-6)
 
-- [ ] Day 3: Go/No-Go packet for canary live-forward
-  - Produce one decision report: KPI summary, failure budget consumed, open risks, recommended canary notional.
-  - Deliverable: explicit promotion criteria and rollback triggers for Stage 1 live-forward.
+**Why fifth:** Accurate execution modeling is a prerequisite for reliable sizing and risk controls.
 
-- [ ] Day 3: Rust migration prep (pre-live)
-  - Define hot-path modules to port first (`opportunity scan`, `quote normalization`, `sizing/eval`) and lock Python↔Rust parity tests.
-  - Produce phased cutover plan (FFI/service boundary, benchmarks, rollback path) with no strategy logic drift.
-  - Deliverable: approved migration design doc + parity benchmark harness ready before live-capital scaling.
+### 4A. Tail-risk-aware Kelly sizing — [Backlog 24]
+- Uncertainty haircuts per lane/family, reduce Kelly when model error/variance increases (sizing.py)
 
-## Accelerated Plan (5-Day Fast Track)
+### 4B. Liquidity impact curve integration — [Backlog 25]
+- Empirically learned slippage/impact curves, auto size-down when marginal impact erodes edge
 
-- [x] Day 0 (Today): Signal correctness lock
-  - Finalize lane-family accounting (`cross_venue` + `structural_parity` family reconciliation).
-  - Enforce quote-quality gating with explicit reject-reason telemetry.
-  - Exit: family totals exactly match opened rows; no invalid-quote opens.
+### 4C. Confidence-scaled max-loss cap — [Backlog 27]
+- Worst-case loss cap under model-error scenarios, tighter caps for low-confidence opportunities
 
-- [ ] Day 1: Full-universe coverage stability
-  - Run hybrid poll/stream with lane fairness and coverage watchdogs.
-  - Tune per-venue/per-endpoint polling budgets to avoid starvation.
-  - Exit: `cross_pairs_covered` and `parity_rules_covered` remain non-zero and stable for multi-hour paper run.
+### 4D. Outlier-robust sizing inputs — [Backlog 28]
+- Block/downweight suspicious quote states in sizing, prevent anomalous books from driving oversized positions
 
-- [ ] Day 2: Execution realism and cost realism
-  - Tighten fill/queue/partial-leg assumptions and complete fee/friction accounting.
-  - Publish KPI set: raw vs filtered vs outlier-removed; detected vs expected-realized vs simulated-realized.
-  - Exit: expected/realized gap inside agreed tolerance band.
+### 4E. Time-to-resolution capital lock penalty — [Backlog 29]
+- Carry/lock-up penalty for long-duration positions, require higher edge for slower-resolving opportunities
 
-- [ ] Day 3: Risk and safety hardening
-  - Add hard kill switches, lane auto-pause on degraded readiness, drawdown-based de-risk mode.
-  - Add deterministic recovery actions for 429/degraded venue states.
-  - Exit: fault-injection checks pass for pause/resume/de-risk behavior.
+### 4F. Drawdown-adaptive de-risking — [Backlog 30]
+- Auto-reduce sizing when rolling realized underperforms expected, restore gradually after recovery criteria met
 
-- [ ] Day 4: Long-run validation + canary decision
-  - Run unattended long paper session with full-universe config.
-  - Produce promotion packet (go/no-go, rollback triggers, initial canary capital).
-  - Exit: all critical gates green for Stage-1 live-forward.
+### 4G. Dynamic per-lane bankroll allocation — [Backlog 26]
+- Adaptive allocation across lanes by realized risk-adjusted efficiency, prevent over-allocation to deteriorating lanes
 
-- [ ] Day 4: Rust refactor plan lock-in
-  - Finalize staged Rust rollout plan and performance SLOs (latency, throughput, CPU/memory) for pre-live readiness.
-  - Exit: implementation-ready backlog with module order, parity gates, and measurable performance targets.
+### 4H. Exposure and concentration controls — [Backlog 33]
+- Hard caps by venue, market family, and correlation cluster; max concurrent at-risk positions per lane/family (risk.py)
 
-- [ ] Deferred (after fast track)
-  - Advanced auto-tuning loops, broader event-tree automation, and capacity optimizations beyond immediate reliability/signal goals.
-  - Plan and execute a staged Rust refactor (hot-path first) for pre-live latency/throughput gains while preserving Python parity tests and rollout safety gates.
+### 4I. Expected-vs-realized drift monitoring — [Backlog 36]
+- Track drift by lane/family, trigger de-risk mode on sustained negative drift, alerting + auto throttle-down
 
-## Infra Hardening Gaps (New)
+### 4J. Lane readiness watchdog enforcement — [Backlog 35]
+- Auto-pause lanes below coverage/readiness thresholds, prevent trading on partial/broken signal state
 
-- [ ] Pre-run hard gate wrapper
-  - Before any long unattended run, enforce a startup gate chain (`kalshi_stream_preflight` + dual-venue smoke + phase0 mini-gate).
-  - Abort launch automatically if any gate is red instead of running in degraded mode.
+**Exit gate:** Fault-injection triggers expected de-risk behavior. No outsized positions from low-confidence inputs in 24h paper run. Drawdown-adaptive sizing reduces exposure during simulated drawdown.
 
-- [ ] Automatic mode degradation with hysteresis
-  - Add deterministic failover between `stream`, `hybrid`, and `poll-only` when coverage/timeouts degrade.
-  - Add hysteresis windows so mode does not flap under transient blips.
+**Primetime gates achievable:** Outlier robustness in reporting [55]
 
-- [ ] Dual-venue bootstrap budget enforcement
-  - Reserve startup API budget for mapped cross/parity symbols on both venues during first cycles.
-  - Prevent one-venue bootstrap from starving mapped overlap acquisition.
+---
 
-- [ ] Endpoint-specific circuit breakers
-  - Add independent circuit breakers for high-risk endpoints (`kalshi /markets`, `/events`, `/orderbook`; polymarket book endpoints).
-  - Include cooldown + jittered probe-recovery path before reopening full traffic.
+## PHASE 5: Reliability and Operational Readiness (Week 6-7)
 
-- [ ] Cross/parity keepalive probe set
-  - Run low-rate targeted probes for mapped pairs/rules to maintain non-zero overlap readiness.
-  - Alert when probe coverage falls below floor for consecutive windows.
+**Why sixth:** All safety systems in place; now harden for unattended multi-hour/multi-day operation.
 
-- [ ] Persistent warm-cache snapshots
-  - Persist normalized quote cache + coverage state and reload at startup.
-  - Reduce time-to-first-dual-venue-readiness after restarts.
+### 5A. Adaptive per-endpoint API rate governor — [Backlog 18]
+- AIMD + token buckets per venue/endpoint, Retry-After parsing (replace basic `_endpoint_next_request_ts` in kalshi.py)
 
-- [ ] Metrics export + alert dashboard
-  - Export coverage/readiness/skip-reason/429/reconnect metrics to a time-series backend (Prometheus/StatsD).
-  - Define alert thresholds and pager signals for sustained lane starvation.
+### 5B. Tiered polling scheduler — [Backlog 19]
+- Hot/warm/cold tiers (sub-second to minutes), promote on stream updates/positions/opportunities, auto-demote inactive
 
-- [ ] Secret and credential hardening
-  - Move live credentials from plain `.env` to secure retrieval (OS keychain/secret manager wrapper).
-  - Add key-scope/expiry validation and rotation runbook.
+### 5C. Poll budget allocator + fairness — [Backlog 20]
+- Budget across lanes/venues per cycle, prevent starvation, strict ceilings + burst allowances
 
-- [ ] Process supervision policy
-  - Run bot under a supervisor (`launchd`/`systemd`/container runtime) with bounded restart/backoff policy.
-  - Add crash-loop detection and explicit safe-stop behavior.
+### 5D. Cross/parity coverage watchdog — [Backlog 21]
+- Track `cross_pairs_covered` / `parity_rules_covered` as health metrics, targeted repair on threshold breach
 
-- [ ] Incident replay bundle automation
-  - Add one-command export of run artifacts (logs, config snapshot, coverage timeline, sampled decisions) for failures.
-  - Ensure deterministic replay harness can consume the bundle without manual stitching.
+### 5E. Cross/parity keepalive probe set — [Backlog 42]
+- Low-rate probes for mapped pairs/rules, alert on coverage floor breach
+
+### 5F. Dual-venue bootstrap budget enforcement — [Backlog 40]
+- Reserve startup API budget for mapped overlap symbols, prevent one-venue starvation
+
+### 5G. Persistent warm-cache snapshots — [Backlog 43]
+- Persist quote cache + coverage state, reload at startup, reduce time-to-readiness after restarts
+
+### 5H. Initialization speed + startup progress — [Backlog 16]
+- Parallelize discovery/bootstrap, cache warm starts, startup progress logs with timings, timeout/fail-fast path
+
+### 5I. Parallel lane execution architecture — [Backlog 11]
+- Isolated lane workers with bounded fan-out, deterministic merge, per-lane timing metrics + timeout budgets
+
+### 5J. Dynamic capacity controller — [Backlog 15]
+- Auto-adjust universe size/scoring depth/scan cadence by CPU/memory/API/latency budgets
+
+### 5K. Operational failure handling playbooks — [Backlog 37]
+- Codified runbooks for 429 storms, stream disconnect loops, venue outages; deterministic fail-safe behavior
+
+### 5L. Secret and credential hardening — [Backlog 45]
+- OS keychain/secret manager, key-scope/expiry validation, rotation runbook
+
+### 5M. Incident replay bundle automation — [Backlog 47]
+- One-command export of run artifacts (logs, config, coverage, decisions), consumable by replay harness
+
+### 5N. Replay + deterministic simulation harness — [Backlog 12]
+- Record raw stream/poll events + decisions, deterministic replay, A/B profile replay on identical data
+
+**Exit gate:** 8+ hour paper session with stable coverage and no critical regressions. Rate governor backs off on 429 storms and recovers. Cold start time below target.
+
+**Primetime gates achievable:** Lane health SLOs [56], Long-run stability test [57]
+
+---
+
+## PHASE 6: Signal Intelligence and Strategy Upgrades (Week 7-8)
+
+**Note:** Phase 6 and Phase 7 (Rust migration) can proceed in parallel if resources allow, since they have no dependencies on each other. Both must complete before Phase 8 (live canary).
+
+**Why seventh:** System is safe and reliable; now improve signal quality and strategy sophistication.
+
+### 6A. Confidence-scored strict mapping mode — [Backlog 23]
+- Strict map primary, gated confidence fallback with multi-signal agreement, separate audit logging
+
+### 6B. Event-tree basket coverage — [Backlog 6]
+- Robust rule generation from real parent/child metadata, payout math validation, diagnostics, paper experiments
+
+### 6C. Auto dependency discovery — [Backlog 5]
+- Detect likely market-link constraints from text + co-movement, propose rules for human review
+
+### 6D. Hold-time / exit discipline engine — [Backlog 4]
+- Close/hedge/abandon logic on edge decay or risk rise, time-stop and EV-stop exits
+
+### 6E. KPI-driven auto-tuning loop — [Backlog 3]
+- Periodic threshold adjustment from paper KPIs, bounded parameter ranges, minimum sample sizes
+
+**Exit gate:** Event-tree lane contributes non-trivially to paper PnL across 2+ multi-hour sessions. Auto-tuning produces no degenerate parameters in 48h run.
+
+---
+
+## PHASE 7: Rust Migration (Week 8-10)
+
+**Why before live:** Python is too slow to capture real edge on live markets. The hot-path latency improvement from Rust is essential for any live trading to be profitable. This must be complete before canary deployment.
+
+### 7A. Migration design and parity harness — [Backlog 59]
+- Define hot-path modules to port first: opportunity scan, quote normalization, sizing/eval
+- Lock Python-to-Rust parity tests: identical inputs must produce identical outputs across both implementations
+- Design FFI/service boundary (PyO3 extension module vs separate process with IPC)
+- Establish performance SLOs: latency targets (detect-to-plan p95/p99), throughput (quotes/sec), CPU/memory budgets
+
+### 7B. Hot-path implementation
+- Port quote normalization and binary math (highest call frequency, simplest logic)
+- Port opportunity detection (5 lanes — largest latency contributor)
+- Port sizing/eval (Kelly, fill model, ranking)
+- Each module: implement in Rust, validate parity, benchmark vs Python baseline
+
+### 7C. Integration and cutover
+- Wire Rust modules into Python engine via chosen boundary (PyO3 recommended for lowest-latency path)
+- Run parallel Python + Rust execution in paper mode, compare outputs for drift
+- Staged cutover: one module at a time, rollback path for each
+- Final benchmark: full cycle latency end-to-end must meet SLOs
+
+**Exit gate:** All hot-path modules ported. Parity tests pass. Latency SLOs met. Multi-hour paper session with Rust hot path shows no regression vs Python-only baseline in detection quality.
+
+---
+
+## PHASE 8: Live-Forward Canary Rollout (Week 10+)
+
+**Why last:** All phases including Rust migration must pass before live capital.
+
+### 8A. Live-forward canary protocol — [Backlog 58 / Gate]
+- **Stage 1:** $25-50, kill switches armed, 1-2 lanes (intra-venue + one cross-venue pair)
+- **Stage 2:** $100-200, all lanes, 48h minimum
+- **Stage 3:** Scale to target notional after gate pass
+
+### 8B. Primetime readiness gate evaluation
+- Run full gate checklist before Stage 1, re-run between each stage promotion
+
+**Exit gate:** Each stage passes realized PnL, drawdown, execution reliability thresholds. Zero unacknowledged unhedged positions. Rust hot path running in production.
+
+---
+
+## PRIMETIME READINESS GATES
+
+All must be green before Phase 8 Stage 1.
+
+| Gate | Phase |
+|------|-------|
+| Identification quality benchmark [48] | 2 |
+| Mapping integrity and drift checks [49] | 2 |
+| Structural rule confidence labeling [50] | 2 |
+| Quote sanity firewall hardening [51] | 2 |
+| Cross/parity family canonicalization [52] | 2 |
+| Fill and slippage calibration [53] | 3 |
+| Execution-cost completeness [54] | 3 |
+| Outlier robustness in reporting [55] | 4 |
+| Lane health SLOs [56] | 5 |
+| Long-run stability test [57] | 5 |
+| Rust hot-path latency SLOs [59] | 7 |
+| Live-forward canary protocol [58] | 8 |
+
+---
+
+## ITEM-TO-PHASE CROSS-REFERENCE
+
+| # | Item | Phase |
+|---|------|-------|
+| 1 | Maker-first live execution policy | 3D |
+| 2 | Latency SLO + auto-throttle | 3E |
+| 3 | KPI-driven auto-tuning loop | 6E |
+| 4 | Hold-time / exit discipline engine | 6D |
+| 5 | Auto dependency discovery | 6C |
+| 6 | Event-tree basket coverage | 6B |
+| 7 | Stream ingestion hardening | 2D |
+| 8 | Delta/snapshot reconciliation | 2C |
+| 9 | Deterministic dedupe + idempotency | 2E |
+| 10 | Market mapping QA pipeline | 2F |
+| 11 | Parallel lane execution | 5I |
+| 12 | Replay + simulation harness | 5N |
+| 13 | Long-run storage + analytics | 2G |
+| 14 | Execution realism upgrades | 3A |
+| 15 | Dynamic capacity controller | 5J |
+| 16 | Initialization speed + startup | 5H |
+| 17 | Operational risk controls | 1A |
+| 18 | Adaptive API rate governor | 5A |
+| 19 | Tiered polling scheduler | 5B |
+| 20 | Poll budget allocator + fairness | 5C |
+| 21 | Cross/parity coverage watchdog | 5D |
+| 22 | Low-latency execution path | 3F |
+| 23 | Confidence-scored strict mapping | 6A |
+| 24 | Tail-risk-aware Kelly sizing | 4A |
+| 25 | Liquidity impact curve | 4B |
+| 26 | Dynamic per-lane bankroll | 4G |
+| 27 | Confidence-scaled max-loss cap | 4C |
+| 28 | Outlier-robust sizing inputs | 4D |
+| 29 | Time-to-resolution lock penalty | 4E |
+| 30 | Drawdown-adaptive de-risking | 4F |
+| 31 | Pre-trade quote/mapping gates | 2A |
+| 32 | Legging risk controls | 0B |
+| 33 | Exposure + concentration controls | 4H |
+| 34 | Circuit breakers + auto-pause | 1B |
+| 35 | Lane readiness watchdog | 4J |
+| 36 | Expected-vs-realized drift | 4I |
+| 37 | Operational failure playbooks | 5K |
+| 38 | Pre-run hard gate wrapper | 1E |
+| 39 | Auto mode degradation + hysteresis | 1D |
+| 40 | Dual-venue bootstrap budget | 5F |
+| 41 | Endpoint-specific circuit breakers | 1C |
+| 42 | Cross/parity keepalive probes | 5E |
+| 43 | Persistent warm-cache snapshots | 5G |
+| 44 | Metrics export + alert dashboard | 2H |
+| 45 | Secret + credential hardening | 5L |
+| 46 | Process supervision policy | 1F |
+| 47 | Incident replay bundle | 5M |
+| 48 | Identification quality gate | Primetime/2 |
+| 49 | Mapping integrity gate | Primetime/2 |
+| 50 | Structural rule confidence gate | Primetime/2 |
+| 51 | Quote sanity firewall gate | Primetime/2 |
+| 52 | Cross/parity family gate | Primetime/2 |
+| 53 | Fill + slippage calibration gate | Primetime/3 |
+| 54 | Execution-cost completeness gate | Primetime/3 |
+| 55 | Outlier robustness gate | Primetime/4 |
+| 56 | Lane health SLOs gate | Primetime/5 |
+| 57 | Long-run stability gate | Primetime/5 |
+| 58 | Live-forward canary gate | Primetime/8 |
+| 59 | Rust migration (hot-path port) | 7A-7C |
+| 60 | Persistent order/position store | 0A |
+| 61 | Crash recovery startup | 0F |
+| 62 | Automatic balance refresh | 0G |
+| 63 | Post-submission order status polling | 0D |
+| 64 | Partial fill handling | 0E |
+| 65 | Cancel/replace for unfilled legs | 0C |
+
+---
+
+## KEY FILES
+
+- `arb_bot/engine.py` — Core engine, `_execute_live_plan` (line 2069), in-memory state management
+- `arb_bot/exchanges/base.py` — ExchangeAdapter ABC (needs `cancel_order`, `get_order_status`, `get_positions`)
+- `arb_bot/exchanges/kalshi.py` — Kalshi API + WebSocket (order placement line 1678, auth line 1746)
+- `arb_bot/exchanges/polymarket.py` — Polymarket API + WebSocket (order placement line 777)
+- `arb_bot/risk.py` — RiskManager `precheck` and `record_fill` (needs kill switches, daily loss, concentration)
+- `arb_bot/sizing.py` — PositionSizer `execution_aware_kelly_fraction` (line 127, needs Phase 4 modifications)
+- `arb_bot/models.py` — EngineState (line 201), execution result types (needs persistent state extension)
+- `arb_bot/paper.py` — Paper simulation (needs Phase 3 execution realism upgrades)
+- `arb_bot/config.py` — Configuration (needs new params for all phases)
+- `arb_bot/order_store.py` — NEW: persistent SQLite store (Phase 0)
