@@ -470,6 +470,9 @@ class RiskSettings:
     market_cooldown_seconds: int = 900
     market_cooldown_scope: str = "market"
     opportunity_cooldown_seconds: int = 0
+    sequential_legs: bool = True
+    leg_quote_drift_tolerance: float = 0.03
+    leg_max_time_window_seconds: float = 10.0
 
 
 @dataclass(frozen=True)

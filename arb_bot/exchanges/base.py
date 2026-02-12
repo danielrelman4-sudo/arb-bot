@@ -21,6 +21,14 @@ class ExchangeAdapter(ABC):
     async def place_single_order(self, leg: TradeLegPlan) -> LegExecutionResult:
         raise NotImplementedError
 
+    async def fetch_quote(self, market_id: str) -> BinaryQuote | None:
+        """Fetch a fresh quote for a single market. Returns None if unavailable."""
+        quotes = await self.fetch_quotes()
+        for q in quotes:
+            if q.market_id == market_id:
+                return q
+        return None
+
     async def get_available_cash(self) -> float | None:
         return None
 
