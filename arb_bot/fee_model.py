@@ -2,7 +2,8 @@
 
 Complete fee and friction accounting per venue and order type.
 Supports tiered fee schedules, maker/taker distinction, settlement
-fees, and reconciliation against actual venue statements.
+fees, Kalshi-style P*(1-P) curve fees, and reconciliation against
+actual venue statements.
 
 Usage::
 
@@ -14,6 +15,7 @@ Usage::
 
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import dataclass, field
 from enum import Enum
@@ -52,6 +54,15 @@ class VenueFeeSchedule:
         Proportional taker fee as fraction of price. Default 0.0.
     maker_fee_rate:
         Proportional maker fee as fraction of price. Default 0.0.
+    taker_curve_coefficient:
+        Coefficient for P*(1-P) curve-based taker fee. Kalshi uses
+        this formula: fee = ceil(coeff * C * P * (1-P)) where P is
+        price and C is contracts. Set to 0.0 to disable. Default 0.0.
+    maker_curve_coefficient:
+        Same as above for maker orders. Default 0.0.
+    curve_round_up:
+        Whether to round up curve-based fees (Kalshi style).
+        Default True.
     settlement_fee_per_contract:
         Fee charged on settlement/expiry. Default 0.0.
     min_fee_per_order:
@@ -65,6 +76,9 @@ class VenueFeeSchedule:
     maker_fee_per_contract: float = 0.0
     taker_fee_rate: float = 0.0
     maker_fee_rate: float = 0.0
+    taker_curve_coefficient: float = 0.0
+    maker_curve_coefficient: float = 0.0
+    curve_round_up: bool = True
     settlement_fee_per_contract: float = 0.0
     min_fee_per_order: float = 0.0
     max_fee_per_order: float = 0.0
@@ -245,8 +259,24 @@ class FeeModel:
         prop_total = rate * price * contracts
         breakdown["proportional"] = prop_total
 
+        # Curve-based fee component: coeff * C * P * (1-P).
+        # Used by Kalshi where fee peaks at P=0.50 and drops to 0
+        # at extreme prices.
+        if order_type == OrderType.TAKER:
+            curve_coeff = schedule.taker_curve_coefficient
+        else:
+            curve_coeff = schedule.maker_curve_coefficient
+        curve_total = 0.0
+        if curve_coeff != 0.0 and 0.0 < price < 1.0:
+            raw_curve = curve_coeff * contracts * price * (1.0 - price)
+            if schedule.curve_round_up:
+                curve_total = math.ceil(raw_curve * 100) / 100  # Round up to nearest cent.
+            else:
+                curve_total = raw_curve
+        breakdown["curve"] = curve_total
+
         # Raw total before min/max.
-        raw_total = flat_total + prop_total
+        raw_total = flat_total + prop_total + curve_total
 
         # Apply min/max caps.
         if schedule.min_fee_per_order > 0 and raw_total < schedule.min_fee_per_order:
