@@ -446,7 +446,7 @@ class SizingSettings:
     max_liquidity_fraction_per_trade: float = 0.5
     enable_execution_aware_kelly: bool = True
     kelly_fraction_cap: float = 1.0
-    kelly_failure_loss_floor_fraction: float = 0.005
+    kelly_failure_loss_floor_fraction: float = 0.0005
     enable_kelly_confidence_shrinkage: bool = True
     kelly_confidence_window: int = 200
     kelly_confidence_sensitivity: float = 1.0
@@ -501,12 +501,12 @@ class UniverseRankingSettings:
 @dataclass(frozen=True)
 class FillModelSettings:
     enabled: bool = True
-    min_fill_probability: float = 0.35
+    min_fill_probability: float = 0.50
     queue_depth_factor: float = 1.5
     stale_quote_half_life_seconds: float = 20.0
     spread_penalty_weight: float = 1.5
     transform_source_penalty: float = 0.05
-    partial_fill_penalty_per_contract: float = 0.01
+    partial_fill_penalty_per_contract: float = 0.0003
     min_fill_quality_score: float = -0.5
     min_expected_realized_profit_usd: float = 0.0
     # Phase 8A: Correlated multi-leg fill model
@@ -978,7 +978,7 @@ def load_settings() -> AppSettings:
             kelly_fraction_cap=_as_float(os.getenv("ARB_KELLY_FRACTION_CAP"), 1.0),
             kelly_failure_loss_floor_fraction=_as_float(
                 os.getenv("ARB_KELLY_FAILURE_LOSS_FLOOR_FRACTION"),
-                0.005,
+                0.0005,
             ),
             enable_kelly_confidence_shrinkage=_as_bool(
                 os.getenv("ARB_ENABLE_KELLY_CONFIDENCE_SHRINKAGE"),
@@ -1051,12 +1051,12 @@ def load_settings() -> AppSettings:
         ),
         fill_model=FillModelSettings(
             enabled=_as_bool(os.getenv("ARB_FILL_MODEL_ENABLED"), True),
-            min_fill_probability=_as_float(os.getenv("ARB_FILL_MIN_PROBABILITY"), 0.35),
+            min_fill_probability=_as_float(os.getenv("ARB_FILL_MIN_PROBABILITY"), 0.50),
             queue_depth_factor=_as_float(os.getenv("ARB_FILL_QUEUE_DEPTH_FACTOR"), 1.5),
             stale_quote_half_life_seconds=_as_float(os.getenv("ARB_FILL_STALE_HALF_LIFE_SECONDS"), 20.0),
             spread_penalty_weight=_as_float(os.getenv("ARB_FILL_SPREAD_PENALTY_WEIGHT"), 1.5),
             transform_source_penalty=_as_float(os.getenv("ARB_FILL_TRANSFORM_SOURCE_PENALTY"), 0.05),
-            partial_fill_penalty_per_contract=_as_float(os.getenv("ARB_FILL_PARTIAL_PENALTY_PER_CONTRACT"), 0.01),
+            partial_fill_penalty_per_contract=_as_float(os.getenv("ARB_FILL_PARTIAL_PENALTY_PER_CONTRACT"), 0.0003),
             min_fill_quality_score=_as_float(os.getenv("ARB_FILL_MIN_QUALITY_SCORE"), -0.5),
             min_expected_realized_profit_usd=_as_float(os.getenv("ARB_FILL_MIN_REALIZED_PROFIT_USD"), 0.0),
             same_venue_fill_correlation=_as_float(
