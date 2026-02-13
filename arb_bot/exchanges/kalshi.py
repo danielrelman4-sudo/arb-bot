@@ -245,27 +245,53 @@ class KalshiAdapter(ExchangeAdapter):
         enrich_task: asyncio.Task[None] | None = None
 
         async def _background_enrich() -> None:
+            """Fetch market summaries via REST and push as quotes.
+
+            This serves two purposes:
+            1. Populates ``market_cache`` with metadata (event_ticker, title)
+               needed for cross-venue matching.
+            2. Converts REST summaries into ``BinaryQuote`` objects and pushes
+               them to the output queue, providing the paper sim with a full
+               initial snapshot of Kalshi quotes.  Without this, the engine
+               only sees the handful of tickers that have had stream updates
+               (event-driven), which is far too few for cross-venue coverage.
+            """
             try:
                 await asyncio.sleep(2.0)
+                all_summaries: list[dict[str, Any]] = []
                 summaries = await self._fetch_market_summaries_paged()
                 if summaries:
                     for market in summaries:
                         ticker = str(market.get("ticker") or market.get("market_ticker") or "").strip()
                         if ticker and ticker not in market_cache:
                             market_cache[ticker] = dict(market)
+                    all_summaries.extend(summaries)
                     LOGGER.info(
                         "kalshi subscribe-all background enrichment loaded %d market summaries",
                         len(summaries),
                     )
                 if self._settings.stream_priority_tickers:
-                    summaries = await self._backfill_priority_tickers_into_summaries(summaries or [])
+                    summaries = await self._backfill_priority_tickers_into_summaries(all_summaries)
                     for market in summaries:
                         ticker = str(market.get("ticker") or market.get("market_ticker") or "").strip()
                         if ticker and ticker not in market_cache:
                             market_cache[ticker] = dict(market)
+                    all_summaries = summaries  # backfill returns merged list
                 LOGGER.info(
                     "kalshi subscribe-all background enrichment total cache: %d markets",
                     len(market_cache),
+                )
+
+                # Convert REST summaries to BinaryQuotes and push to stream.
+                pushed = 0
+                for market in all_summaries:
+                    quote = self._quote_from_market_summary(market)
+                    if quote is not None and self._quote_passes_filters(quote, market):
+                        await queue.put(quote)
+                        pushed += 1
+                LOGGER.info(
+                    "kalshi subscribe-all background enrichment pushed %d quotes to stream",
+                    pushed,
                 )
             except asyncio.CancelledError:
                 raise
