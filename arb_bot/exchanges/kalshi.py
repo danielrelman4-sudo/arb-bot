@@ -79,6 +79,9 @@ class KalshiAdapter(ExchangeAdapter):
         self._endpoint_success_streak: dict[str, int] = {}
         self._dynamic_priority_refresh_limit = max(1, int(self._settings.stream_priority_refresh_limit))
         self._dynamic_priority_limit_success_streak = 0
+        # Track whether the stream is actively running.  When False, poll mode uses
+        # paged scan + priority backfill instead of individual ticker fetches.
+        self._stream_active: bool = False
 
     async def fetch_quotes(self) -> list[BinaryQuote]:
         return await self._fetch_quotes_impl(force_full_scan=False)
@@ -91,10 +94,16 @@ class KalshiAdapter(ExchangeAdapter):
             return await self._fetch_ticker_quotes(self._settings.market_tickers)
         if (
             not force_full_scan
-            and self._settings.enable_stream
+            and self._stream_active
+            and not self._settings.stream_subscribe_all
             and self._settings.stream_priority_tickers
         ):
-            # Keep stream-mode REST refresh bounded to avoid 429 storms on expanded universes.
+            # When the legacy sharded WebSocket stream is actively running, use
+            # individual ticker fetches for priority tickers (supplements real-time
+            # stream data).  In subscribe-all mode the stream already covers all
+            # tickers, so fall through to the paged scan + backfill path instead.
+            # When stream is NOT active (poll-only mode), also skip this and use
+            # the much more API-efficient paged scan + priority backfill below.
             priority_limit = max(
                 1,
                 min(self._dynamic_priority_refresh_limit, max(1, self._settings.market_limit)),
@@ -104,13 +113,32 @@ class KalshiAdapter(ExchangeAdapter):
             if priority_tickers:
                 return await self._fetch_ticker_quotes(priority_tickers)
 
-        summaries = await self._fetch_market_summaries_paged()
+        # In subscribe-all mode the stream provides real-time updates for ALL
+        # tickers.  The poll-refresh only needs a lightweight snapshot (3 pages,
+        # no orderbook, no backfill) to seed markets that haven't had stream
+        # activity yet.  The full 18-page scan + orderbook is too slow (>15s).
+        subscribe_all_active = self._stream_active and self._settings.stream_subscribe_all
+
+        if subscribe_all_active:
+            summaries = await self._fetch_market_summaries_paged(max_pages_override=3)
+        else:
+            summaries = await self._fetch_market_summaries_paged()
         if not summaries:
             summaries = await self._fetch_market_summaries_from_events_cached()
         if not summaries:
             return []
 
-        if self._settings.use_orderbook_quotes:
+        # Phase 8B: In poll mode, backfill priority tickers that the paged scan missed.
+        # This ensures cross-venue and structural rule tickers get refreshed every cycle,
+        # even when Kalshi's paginated API returns a different set of popular markets.
+        # Skip backfill in subscribe-all mode — the background enrichment handles it.
+        if self._settings.stream_priority_tickers and not subscribe_all_active:
+            summaries = await self._backfill_priority_tickers_into_summaries(summaries)
+
+        # In subscribe-all mode, skip orderbook fetches — the stream provides
+        # real-time bid/ask from ticker messages.  This avoids hundreds of
+        # concurrent HTTP calls that would time out the poll-refresh.
+        if self._settings.use_orderbook_quotes and not subscribe_all_active:
             quotes = await self._fetch_quotes_from_market_summaries(summaries)
         else:
             quotes = []
@@ -128,23 +156,39 @@ class KalshiAdapter(ExchangeAdapter):
         if not self.supports_streaming():
             return
 
-        bootstrap_timeout_seconds = max(2.0, self._timeout_seconds * 0.8)
+        self._stream_active = True
+
+        # Use subscribe-all mode when enabled -- skips REST bootstrap entirely.
+        if self._settings.stream_subscribe_all:
+            async for quote in self._stream_quotes_subscribe_all():
+                yield quote
+            return
+
+        bootstrap_timeout_seconds = max(5.0, self._timeout_seconds * 2.0)
         try:
             market_cache = await asyncio.wait_for(
                 self._build_stream_market_cache(),
                 timeout=bootstrap_timeout_seconds,
             )
         except asyncio.TimeoutError:
+            # Use any partial results that were collected before timeout.
+            partial = getattr(self, "_stream_bootstrap_partial_cache", None) or {}
             LOGGER.warning(
-                "kalshi stream bootstrap cache timed out after %.1fs; continuing with empty cache",
+                "kalshi stream bootstrap cache timed out after %.1fs; using %d partial results",
                 bootstrap_timeout_seconds,
+                len(partial),
             )
-            market_cache = {}
+            market_cache = partial
         except Exception as exc:
             # Discovery endpoints can be rate-limited; websocket streaming should
             # still proceed so we can recover from live ticker flow.
-            LOGGER.warning("kalshi stream bootstrap cache failed; continuing with empty cache: %s", exc)
-            market_cache = {}
+            partial = getattr(self, "_stream_bootstrap_partial_cache", None) or {}
+            LOGGER.warning(
+                "kalshi stream bootstrap cache failed; using %d partial results: %s",
+                len(partial),
+                exc,
+            )
+            market_cache = partial
         market_lookup = self._build_stream_market_lookup(market_cache)
         subscription_tickers = self._stream_subscription_tickers(market_cache)
         shards = self._build_stream_subscription_shards(subscription_tickers)
@@ -184,6 +228,190 @@ class KalshiAdapter(ExchangeAdapter):
             for task in shard_tasks:
                 task.cancel()
             await asyncio.gather(*shard_tasks, return_exceptions=True)
+
+    async def _stream_quotes_subscribe_all(self) -> AsyncIterator[BinaryQuote]:
+        """Stream ALL Kalshi ticker updates without pre-filtering.
+
+        Subscribes to the ``ticker`` channel with no ``market_tickers`` filter,
+        receiving updates for every active market.  Market metadata is built
+        lazily from incoming messages plus a background REST enrichment pass.
+
+        Note on intra-venue arbitrage
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Intra-venue arbitrage (``yes_buy + no_buy < 1.0``) is structurally
+        impossible on Kalshi.  Kalshi uses a single matching engine where YES
+        and NO sides are complements of the same order book.  A YES bid at
+        price *p* is economically equivalent to a NO offer at *1-p*; the
+        exchange enforces ``yes_best_bid + no_best_bid <= 1.0`` as an
+        invariant, so ``yes_ask + no_ask >= 1.0`` always holds.
+
+        Intra-venue arb is only possible on venues with independent token
+        order books (e.g. Polymarket CLOB where YES and NO tokens trade on
+        separate books and prices can temporarily diverge).
+
+        However, the ticker channel only reports ``yes_bid`` / ``yes_ask``;
+        ``no_bid`` and ``no_ask`` are absent.  Background REST enrichment
+        populates the market cache with real ``no_bid`` / ``no_ask`` values
+        from the ``/markets`` endpoint.  When a subsequent ticker message
+        arrives, these REST-sourced NO-side prices are preserved in the cache
+        (the ticker field-mapping loop only overwrites keys present in the
+        message), giving ``choose_effective_buy_price`` both the direct-ask
+        and opposite-bid paths for accurate quote construction.
+        """
+        market_cache: dict[str, dict[str, Any]] = {}
+        market_lookup: dict[str, str] = {}
+        queue: asyncio.Queue[BinaryQuote] = asyncio.Queue()
+        reconnect_delay = max(0.5, self._settings.stream_reconnect_delay_seconds)
+        ping_interval = max(5.0, self._settings.stream_ping_interval_seconds)
+
+        enrich_task: asyncio.Task[None] | None = None
+
+        async def _background_enrich() -> None:
+            """Fetch market summaries via REST and push as quotes.
+
+            This serves two purposes:
+            1. Populates ``market_cache`` with metadata (event_ticker, title)
+               needed for cross-venue matching.
+            2. Converts REST summaries into ``BinaryQuote`` objects and pushes
+               them to the output queue, providing the paper sim with a full
+               initial snapshot of Kalshi quotes.  Without this, the engine
+               only sees the handful of tickers that have had stream updates
+               (event-driven), which is far too few for cross-venue coverage.
+            """
+            try:
+                await asyncio.sleep(2.0)
+                all_summaries: list[dict[str, Any]] = []
+                summaries = await self._fetch_market_summaries_paged()
+                if summaries:
+                    for market in summaries:
+                        ticker = str(market.get("ticker") or market.get("market_ticker") or "").strip()
+                        if ticker and ticker not in market_cache:
+                            market_cache[ticker] = dict(market)
+                    all_summaries.extend(summaries)
+                    LOGGER.info(
+                        "kalshi subscribe-all background enrichment loaded %d market summaries",
+                        len(summaries),
+                    )
+                if self._settings.stream_priority_tickers:
+                    summaries = await self._backfill_priority_tickers_into_summaries(all_summaries)
+                    for market in summaries:
+                        ticker = str(market.get("ticker") or market.get("market_ticker") or "").strip()
+                        if ticker and ticker not in market_cache:
+                            market_cache[ticker] = dict(market)
+                    all_summaries = summaries  # backfill returns merged list
+                LOGGER.info(
+                    "kalshi subscribe-all background enrichment total cache: %d markets",
+                    len(market_cache),
+                )
+
+                # Convert REST summaries to BinaryQuotes and push to stream.
+                pushed = 0
+                for market in all_summaries:
+                    quote = self._quote_from_market_summary(market)
+                    if quote is not None and self._quote_passes_filters(quote, market):
+                        await queue.put(quote)
+                        pushed += 1
+                LOGGER.info(
+                    "kalshi subscribe-all background enrichment pushed %d quotes to stream",
+                    pushed,
+                )
+
+                # Report how many cached markets have real (REST-sourced) no_bid
+                # values vs derived-only.  Real no_bid enables both direct-ask
+                # and opposite-bid-transform paths in choose_effective_buy_price.
+                real_no_bid = sum(
+                    1 for m in market_cache.values()
+                    if m.get("no_bid") is not None
+                )
+                LOGGER.info(
+                    "kalshi subscribe-all enrichment: %d/%d markets have real no_bid "
+                    "(REST-sourced, enables opposite-bid pricing path)",
+                    real_no_bid,
+                    len(market_cache),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.warning("kalshi subscribe-all background enrichment failed: %s", exc)
+
+        async def _ws_loop() -> None:
+            nonlocal enrich_task
+            while True:
+                ws_url = self._active_ws_url()
+                try:
+                    ws_headers = self._ws_auth_headers(ws_url)
+                    connect_kwargs: dict[str, Any] = {
+                        "uri": ws_url,
+                        "ping_interval": ping_interval,
+                        "ping_timeout": ping_interval,
+                        "max_size": None,
+                    }
+                    if ws_headers:
+                        connect_kwargs["additional_headers"] = ws_headers
+
+                    try:
+                        socket_ctx = websockets.connect(**connect_kwargs)
+                    except TypeError:
+                        connect_kwargs.pop("additional_headers", None)
+                        if ws_headers:
+                            connect_kwargs["extra_headers"] = ws_headers
+                        socket_ctx = websockets.connect(**connect_kwargs)
+
+                    async with socket_ctx as socket:
+                        request_id = self._next_stream_request_id()
+                        subscribe_payload = json.dumps({
+                            "id": request_id,
+                            "cmd": "subscribe",
+                            "params": {"channels": ["ticker"]},
+                        })
+                        await socket.send(subscribe_payload)
+                        LOGGER.info(
+                            "kalshi subscribe-all connected and subscribed to ALL tickers ws_url=%s",
+                            ws_url,
+                        )
+
+                        if enrich_task is None or enrich_task.done():
+                            enrich_task = asyncio.create_task(_background_enrich())
+
+                        while True:
+                            raw = await socket.recv()
+                            if isinstance(raw, bytes):
+                                raw = raw.decode("utf-8")
+                            if raw == "PING":
+                                await socket.send("PONG")
+                                continue
+
+                            frames = self._parse_stream_frames(raw)
+                            await self._emit_quotes_from_frames(
+                                frames=frames,
+                                market_cache=market_cache,
+                                market_lookup=market_lookup,
+                                output_queue=queue,
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    LOGGER.warning(
+                        "kalshi subscribe-all connection failed ws_url=%s: %s",
+                        ws_url,
+                        exc,
+                    )
+                    await self._rotate_ws_url_if_needed(exc)
+                    await asyncio.sleep(reconnect_delay)
+
+        ws_task = asyncio.create_task(_ws_loop())
+
+        try:
+            while True:
+                quote = await queue.get()
+                yield quote
+        finally:
+            ws_task.cancel()
+            if enrich_task is not None:
+                enrich_task.cancel()
+            await asyncio.gather(ws_task, return_exceptions=True)
+            if enrich_task is not None:
+                await asyncio.gather(enrich_task, return_exceptions=True)
 
     async def _run_stream_shard(
         self,
@@ -450,8 +678,13 @@ class KalshiAdapter(ExchangeAdapter):
         return bool(self._private_key is not None and self._settings.key_id)
 
     async def _build_stream_market_cache(self) -> dict[str, dict[str, Any]]:
+        # Track partial results so caller can recover on timeout.
+        self._stream_bootstrap_partial_cache: dict[str, dict[str, Any]] = {}
+
         if self._settings.market_tickers:
-            return await self._fetch_market_details_for_tickers(self._settings.market_tickers)
+            result = await self._fetch_market_details_for_tickers(self._settings.market_tickers)
+            self._stream_bootstrap_partial_cache = result
+            return result
 
         summaries: list[dict[str, Any]] = []
         try:
@@ -473,6 +706,8 @@ class KalshiAdapter(ExchangeAdapter):
             if not ticker:
                 continue
             cache[ticker] = dict(market)
+        # Save partial results incrementally for timeout recovery.
+        self._stream_bootstrap_partial_cache = dict(cache)
 
         enrich_limit = max(0, int(self._settings.stream_bootstrap_enrich_limit))
         if enrich_limit > 0:
@@ -485,6 +720,7 @@ class KalshiAdapter(ExchangeAdapter):
                 details = await self._fetch_market_details_for_tickers(missing_priority[:enrich_limit])
                 if details:
                     cache.update(details)
+                    self._stream_bootstrap_partial_cache = dict(cache)
         return cache
 
     async def _fetch_market_details_for_tickers(self, tickers: Sequence[str]) -> dict[str, dict[str, Any]]:
@@ -782,6 +1018,29 @@ class KalshiAdapter(ExchangeAdapter):
                 return candidate
         return None
 
+    @staticmethod
+    def _derive_event_ticker(market_ticker: str) -> str:
+        """Derive event ticker from market ticker.
+
+        Kalshi tickers follow the pattern ``EVENT-DATE-CONTRACT`` where the
+        event ticker is the prefix up to the last two hyphen-separated tokens.
+        Examples:
+        - ``KXFED-26FEB-T4.50``  → ``KXFED``
+        - ``KXBTC-25MAR15-B100000`` → ``KXBTC``
+        - ``INXD-26FEB13``       → ``INXD``
+        - ``CPI-25JAN-B3.5``     → ``CPI``
+
+        Heuristic: strip trailing segments that contain a digit.
+        """
+        if not market_ticker:
+            return ""
+        parts = market_ticker.split("-")
+        # Walk backwards, stripping segments with digits until we have only
+        # the event ticker prefix.
+        while len(parts) > 1 and any(c.isdigit() for c in parts[-1]):
+            parts.pop()
+        return "-".join(parts)
+
     def _quote_from_ticker_message(
         self,
         message: dict[str, Any],
@@ -829,22 +1088,36 @@ class KalshiAdapter(ExchangeAdapter):
             ("yesBidSize", "yes_bid_size"),
             ("yes_bid_quantity", "yes_bid_size"),
             ("yesBidQuantity", "yes_bid_size"),
+            ("yes_bid_size_fp", "yes_bid_size"),
+            ("yesBidSizeFp", "yes_bid_size"),
             ("yes_ask_size", "yes_ask_size"),
             ("yesAskSize", "yes_ask_size"),
             ("yes_ask_quantity", "yes_ask_size"),
             ("yesAskQuantity", "yes_ask_size"),
+            ("yes_ask_size_fp", "yes_ask_size"),
+            ("yesAskSizeFp", "yes_ask_size"),
             ("no_bid_size", "no_bid_size"),
             ("noBidSize", "no_bid_size"),
             ("no_bid_quantity", "no_bid_size"),
             ("noBidQuantity", "no_bid_size"),
+            ("no_bid_size_fp", "no_bid_size"),
+            ("noBidSizeFp", "no_bid_size"),
             ("no_ask_size", "no_ask_size"),
             ("noAskSize", "no_ask_size"),
             ("no_ask_quantity", "no_ask_size"),
             ("noAskQuantity", "no_ask_size"),
+            ("no_ask_size_fp", "no_ask_size"),
+            ("noAskSizeFp", "no_ask_size"),
+            ("last_trade_size_fp", "last_trade_size"),
+            ("lastTradeSizeFp", "last_trade_size"),
             ("volume", "volume"),
+            ("volume_fp", "volume"),
+            ("volumeFp", "volume"),
             ("volume_24h", "volume_24h"),
             ("liquidity", "liquidity"),
             ("liquidity_dollars", "liquidity_dollars"),
+            ("open_interest_fp", "open_interest"),
+            ("openInterestFp", "open_interest"),
             ("open_interest", "open_interest"),
             ("event_ticker", "event_ticker"),
             ("title", "title"),
@@ -855,11 +1128,32 @@ class KalshiAdapter(ExchangeAdapter):
             value = message.get(src_key)
             if value is not None:
                 if src_key.endswith("_fp") or src_key.endswith("Fp"):
-                    normalized = self._normalize_stream_price(value)
-                    if normalized is not None:
-                        market[dst_key] = normalized
+                    # Quantity fields (size/volume/open_interest) are already
+                    # in contracts; parse as plain float.  Price fields
+                    # (*_bid_fp, *_ask_fp) need scale normalization.
+                    _sk = src_key.lower()
+                    is_size_field = (
+                        "size" in _sk or "trade" in _sk
+                        or "volume" in _sk or "interest" in _sk
+                    )
+                    if is_size_field:
+                        try:
+                            market[dst_key] = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                    else:
+                        normalized = self._normalize_stream_price(value)
+                        if normalized is not None:
+                            market[dst_key] = normalized
                     continue
                 market[dst_key] = value
+
+        # Derive event_ticker from market_ticker if not provided.
+        # Kalshi ticker format: "EVENT_TICKER-CONTRACT_SUFFIX" (e.g. "KXFED-26FEB-T4.50")
+        # The event ticker is everything up to the last dash-delimited token that
+        # contains a digit, or just the first segment.
+        if "event_ticker" not in market or not market.get("event_ticker"):
+            market["event_ticker"] = self._derive_event_ticker(ticker)
 
         market_cache[ticker] = market
         self._register_market_lookup_entry(
@@ -1078,9 +1372,17 @@ class KalshiAdapter(ExchangeAdapter):
         if not isinstance(markets, list):
             return []
 
+        # Inject event-level `mutually_exclusive` flag into each nested
+        # market dict.  Kalshi only exposes this at the event level, not
+        # on individual markets.
+        me_raw = payload.get("mutually_exclusive")
+        me_flag: bool | None = me_raw if isinstance(me_raw, bool) else None
+
         parsed: list[dict[str, Any]] = []
         for market in markets:
             if isinstance(market, dict):
+                if me_flag is not None and "mutually_exclusive" not in market:
+                    market["mutually_exclusive"] = me_flag
                 parsed.append(market)
         return parsed
 
@@ -1131,6 +1433,107 @@ class KalshiAdapter(ExchangeAdapter):
 
         collected.sort(key=self._market_priority_score, reverse=True)
         return collected[: self._settings.market_limit]
+
+    async def _backfill_priority_tickers_into_summaries(
+        self,
+        summaries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Fetch missing cross-venue/structural priority tickers via event-level API.
+
+        In poll mode, the paged ``/markets`` scan may return different markets than
+        those referenced in the cross-venue mapping or structural rules.  This method
+        identifies which priority tickers are missing from the scan results, groups
+        them by event ticker, and fetches the missing events in bulk (one HTTP call
+        per event).  The results are merged into *summaries* so downstream quote
+        building covers the full cross-venue universe.
+
+        Phase 8B: Parity ticker priority pinning — ensures coverage stability
+        regardless of Kalshi page rotation.
+        """
+        priority_tickers = self._dedupe_tickers(self._settings.stream_priority_tickers)
+        if not priority_tickers:
+            return summaries
+
+        # Index tickers already present in the scan.
+        present: set[str] = set()
+        for market in summaries:
+            ticker = str(market.get("ticker") or market.get("market_ticker") or "").strip()
+            if ticker:
+                present.add(ticker)
+
+        # Determine which priority tickers are missing.
+        missing_tickers: list[str] = [t for t in priority_tickers if t not in present]
+        if not missing_tickers:
+            return summaries
+
+        # Group missing tickers by event ticker prefix.
+        # Convention: Kalshi market tickers are ``EVENT-OUTCOME`` or ``EVENT-PERIOD-OUTCOME``.
+        # The event ticker is the market ticker with the last hyphen-segment removed,
+        # but events typically use shorter prefixes.  We extract unique event prefixes
+        # by progressively stripping trailing segments.
+        missing_events: dict[str, list[str]] = {}
+        for ticker in missing_tickers:
+            parts = ticker.split("-")
+            # Try event prefix: strip last segment first (most common).
+            # E.g., KXATPGRANDSLAM-26-TFRI → event KXATPGRANDSLAM-26
+            # E.g., KXAZ5R-26-JFEE → event KXAZ5R-26
+            if len(parts) >= 3:
+                event_candidate = "-".join(parts[:-1])
+            elif len(parts) == 2:
+                event_candidate = parts[0]
+            else:
+                event_candidate = ticker
+            missing_events.setdefault(event_candidate, []).append(ticker)
+
+        # Cap the number of event fetches to avoid 429 storms.
+        max_event_fetches = max(10, min(100, self._settings.market_limit // 2))
+        events_to_fetch = list(missing_events.keys())[:max_event_fetches]
+
+        if not events_to_fetch:
+            return summaries
+
+        LOGGER.info(
+            "kalshi priority backfill: %d missing tickers across %d events (fetching %d events)",
+            len(missing_tickers),
+            len(missing_events),
+            len(events_to_fetch),
+        )
+
+        semaphore = asyncio.Semaphore(max(1, self._settings.max_orderbook_concurrency))
+
+        async def _run(event_ticker: str) -> list[dict[str, Any]]:
+            async with semaphore:
+                try:
+                    return await self._fetch_event_markets(event_ticker)
+                except Exception as exc:
+                    LOGGER.debug("kalshi priority backfill event fetch failed for %s: %s", event_ticker, exc)
+                    return []
+
+        tasks = [_run(event_ticker) for event_ticker in events_to_fetch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Merge backfilled markets into summaries (avoid duplicates).
+        backfilled_count = 0
+        for event_ticker, result in zip(events_to_fetch, results):
+            if isinstance(result, Exception):
+                continue
+            for market in result:
+                ticker = str(market.get("ticker") or market.get("market_ticker") or "").strip()
+                if not ticker or ticker in present:
+                    continue
+                present.add(ticker)
+                summaries.append(market)
+                backfilled_count += 1
+
+        if backfilled_count > 0:
+            LOGGER.info(
+                "kalshi priority backfill added %d markets from %d event fetches (total now %d)",
+                backfilled_count,
+                len(events_to_fetch),
+                len(summaries),
+            )
+
+        return summaries
 
     async def _get_markets_page(self, cursor: str | None) -> dict[str, Any]:
         params: dict[str, Any] = {"status": "open", "limit": self._settings.market_page_size}

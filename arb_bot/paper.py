@@ -155,6 +155,17 @@ async def run_paper_session(
         "leg2_side",
         "leg2_price",
         "leg2_size",
+        "mc_enabled",
+        "mc_all_legs_filled",
+        "mc_filled_leg_count",
+        "mc_simulated_pnl",
+        "mc_gross_edge_pnl",
+        "mc_slippage_cost",
+        "mc_adverse_selection_cost",
+        "mc_legging_loss",
+        "mc_edge_decay_cost",
+        "mc_adverse_selection_hit",
+        "mc_simulated_latency_ms",
     ]
 
     checkpoint_handle = output_path.open("w", encoding="utf-8", newline="")
@@ -476,6 +487,23 @@ async def _run_stream_cycles(
                         _STREAM_STATE_CONNECTED,
                     )
 
+                # Drain all remaining quotes without blocking so that bulk
+                # pushes (e.g. background enrichment) are absorbed quickly.
+                _drain_count = 0
+                while not queue.empty():
+                    try:
+                        extra = queue.get_nowait()
+                        quote_cache[(extra.venue, extra.market_id)] = extra
+                        last_stream_quote_ts_by_venue[extra.venue] = now_ts
+                        _drain_count += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if _drain_count > 0:
+                    LOGGER.info(
+                        "paper stream drained %d queued quotes in burst",
+                        _drain_count,
+                    )
+
                 now_ms = time.time() * 1000
                 if (
                     not poll_decision_clock
@@ -673,7 +701,7 @@ def _coverage_degraded(
 
 def _stream_fetch_timeout_seconds(poll_refresh_interval_seconds: float) -> float:
     interval = max(1.0, float(poll_refresh_interval_seconds))
-    return max(8.0, min(30.0, interval * 0.75))
+    return max(15.0, min(45.0, interval * 0.75))
 
 
 async def _fetch_all_quotes_compatible(
@@ -774,7 +802,12 @@ def _decision_row(decision: OpportunityDecision, cycle_started_at: datetime) -> 
     elif decision.action == "dry_run" and decision.reason == "paper_position_opened":
         row_sim_pnl = 0.0
     elif decision.action == "dry_run":
-        row_sim_pnl = float(metrics.get("expected_realized_profit") or 0.0)
+        # Use MC simulated PnL if available; otherwise fall back to EV.
+        mc_pnl = metrics.get("mc_simulated_pnl")
+        if mc_pnl is not None and metrics.get("monte_carlo_enabled"):
+            row_sim_pnl = float(mc_pnl)
+        else:
+            row_sim_pnl = float(metrics.get("expected_realized_profit") or 0.0)
     else:
         row_sim_pnl = 0.0
 
@@ -851,6 +884,17 @@ def _decision_row(decision: OpportunityDecision, cycle_started_at: datetime) -> 
         "leg2_side": leg_2.side.value,
         "leg2_price": round(leg_2.buy_price, 6),
         "leg2_size": round(leg_2.buy_size, 6),
+        "mc_enabled": bool(metrics.get("monte_carlo_enabled") or False),
+        "mc_all_legs_filled": bool(metrics.get("mc_all_legs_filled")) if metrics.get("mc_all_legs_filled") is not None else None,
+        "mc_filled_leg_count": int(metrics.get("mc_filled_leg_count") or 0) if metrics.get("mc_filled_leg_count") is not None else None,
+        "mc_simulated_pnl": _round_or_none(metrics.get("mc_simulated_pnl")),
+        "mc_gross_edge_pnl": _round_or_none(metrics.get("mc_gross_edge_pnl")),
+        "mc_slippage_cost": _round_or_none(metrics.get("mc_slippage_cost")),
+        "mc_adverse_selection_cost": _round_or_none(metrics.get("mc_adverse_selection_cost")),
+        "mc_legging_loss": _round_or_none(metrics.get("mc_legging_loss")),
+        "mc_edge_decay_cost": _round_or_none(metrics.get("mc_edge_decay_cost")),
+        "mc_adverse_selection_hit": bool(metrics.get("mc_adverse_selection_hit") or False),
+        "mc_simulated_latency_ms": _round_or_none(metrics.get("mc_simulated_latency_ms")),
     }
     return row, row_sim_pnl
 

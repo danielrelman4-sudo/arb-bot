@@ -27,6 +27,7 @@ class ExclusiveBucketRule:
     group_id: str
     legs: tuple[MarketLegRef, ...]
     payout_per_contract: float = 1.0
+    exclusivity_source: str = "heuristic"  # "exchange_api" or "heuristic"
 
 
 @dataclass(frozen=True)
@@ -105,11 +106,15 @@ def _parse_buckets(raw: Any) -> list[ExclusiveBucketRule]:
             continue
         seen_signatures.add(signature)
         payout = _to_float(item.get("payout_per_contract"), default=1.0)
+        exclusivity_source = str(item.get("exclusivity_source") or "heuristic").strip().lower()
+        if exclusivity_source not in {"exchange_api", "heuristic"}:
+            exclusivity_source = "heuristic"
         parsed.append(
             ExclusiveBucketRule(
                 group_id=group_id,
                 legs=tuple(legs),
                 payout_per_contract=max(0.0, payout),
+                exclusivity_source=exclusivity_source,
             )
         )
     return parsed

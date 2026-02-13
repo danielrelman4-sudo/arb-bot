@@ -36,6 +36,7 @@ class MarketSnapshot:
     liquidity: float
     parent_market_ids: tuple[str, ...] = ()
     child_market_ids: tuple[str, ...] = ()
+    exchange_mutually_exclusive: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -386,6 +387,14 @@ def snapshot_from_market(raw: dict[str, Any]) -> MarketSnapshot | None:
             or raw.get("volume")
             or 0.0
         )
+        # Kalshi's /events endpoint provides event-level `mutually_exclusive`
+        # boolean. When events are fetched with nested markets, callers
+        # inject this field into each market dict (see _append_kalshi_event_markets).
+        me_raw = raw.get("mutually_exclusive")
+        exchange_me: bool | None = None
+        if isinstance(me_raw, bool):
+            exchange_me = me_raw
+
         return MarketSnapshot(
             venue=venue,
             event_key=event_key,
@@ -396,6 +405,7 @@ def snapshot_from_market(raw: dict[str, Any]) -> MarketSnapshot | None:
             liquidity=liquidity,
             parent_market_ids=_extract_parent_market_ids(raw),
             child_market_ids=_extract_child_market_ids(raw),
+            exchange_mutually_exclusive=exchange_me,
         )
 
     if venue == "polymarket":
@@ -435,6 +445,25 @@ def snapshot_from_market(raw: dict[str, Any]) -> MarketSnapshot | None:
             or raw.get("volume")
             or 0.0
         )
+        # Polymarket's Gamma API provides `negRisk` on events, indicating
+        # that outcomes are structurally guaranteed mutually exclusive by
+        # the NegRisk smart contract adapter.
+        # Note: can't use `or` chain because False is a valid signal.
+        _sentinel = object()
+        neg_risk = _sentinel
+        for _nr_key in ("negRisk", "neg_risk", "enableNegRisk"):
+            val = raw.get(_nr_key, _sentinel)
+            if val is not _sentinel:
+                neg_risk = val
+                break
+        poly_me: bool | None = None
+        if neg_risk is not _sentinel:
+            if isinstance(neg_risk, bool):
+                poly_me = neg_risk
+            elif neg_risk is not None:
+                # Handle string "true"/"false" from some API responses
+                poly_me = str(neg_risk).lower() in {"true", "1", "yes"}
+
         return MarketSnapshot(
             venue=venue,
             event_key=event_key,
@@ -445,6 +474,7 @@ def snapshot_from_market(raw: dict[str, Any]) -> MarketSnapshot | None:
             liquidity=liquidity,
             parent_market_ids=_extract_parent_market_ids(raw),
             child_market_ids=_extract_child_market_ids(raw),
+            exchange_mutually_exclusive=poly_me,
         )
 
     return None
@@ -487,6 +517,155 @@ def _dominant_title(markets: list[MarketSnapshot]) -> tuple[str, int]:
 
 def _bucket_group_id(group: EventGroup) -> str:
     return f"{group.venue}_{_slugify(group.event_key)}_exclusive"
+
+
+# ---------------------------------------------------------------------------
+# Market-type classifier: reject non-mutually-exclusive buckets
+# ---------------------------------------------------------------------------
+
+# Patterns indicating cumulative thresholds (multiple can resolve YES)
+_THRESHOLD_PATTERNS: list[re.Pattern[str]] = [
+    # "above/below/over/under X", "at least X", "or more", "or fewer"
+    re.compile(r"\b(above|below|over|under|at least|or more|or fewer|or less|or higher|or lower|no more than|no less than|no fewer than)\b", re.IGNORECASE),
+    # Dollar/price thresholds: "$5B", "$100M", "$1,000"
+    re.compile(r"\$[\d,]+\.?\d*\s*[bmkt]?\b", re.IGNORECASE),
+    # "higher than", "lower than", "greater than", "less than"
+    re.compile(r"\b(higher|lower|greater|less|more|fewer)\s+than\b", re.IGNORECASE),
+    # "+X%" or "-X%"
+    re.compile(r"[+-]\d+(\.\d+)?%"),
+]
+
+# Patterns indicating temporal cutoffs (nested — if true by March, also true by December)
+_TEMPORAL_PATTERNS: list[re.Pattern[str]] = [
+    # "by [date]", "before [date]", "by end of"
+    re.compile(r"\b(by|before)\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|q[1-4]|end of|year)", re.IGNORECASE),
+    # "by March 31", "by 2027", "by December"
+    re.compile(r"\bby\s+\d{4}\b", re.IGNORECASE),
+]
+
+# Patterns indicating independent per-entity markets (multiple can be true)
+_INDEPENDENT_ENTITY_PATTERNS: list[re.Pattern[str]] = [
+    # "Will [Company/Country] X?" where each entity is independent
+    re.compile(r"\bwhich\s+(countries|companies|teams|players|states|cities)\b", re.IGNORECASE),
+]
+
+
+def _looks_like_numeric_thresholds(outcomes: list[str]) -> bool:
+    """Detect if outcomes are numeric values suggesting threshold/range brackets.
+
+    Outcomes may arrive in any order (e.g. sorted by market_id, not numerically),
+    so we sort them numerically first before checking for threshold patterns.
+
+    Examples that should return True:
+    - ["5", "10", "20", "30", "50", "100", "200"]  (KXAGENCIES)
+    - ["3.80", "3.90", "4.00", "4.10", "4.50"]  (gas price brackets)
+    - ["10", "100", "20", "200", "30", "5", "50"]  (same as above, unsorted)
+
+    Examples that should return False:
+    - ["alice", "bob", "carol"]  (named candidates)
+    """
+    if len(outcomes) < 3:
+        return False
+
+    numeric_values: list[float] = []
+    for outcome in outcomes:
+        # Strip common prefixes/suffixes
+        cleaned = re.sub(r"[,$%+]", "", outcome.strip())
+        try:
+            numeric_values.append(float(cleaned))
+        except ValueError:
+            return False
+
+    if len(numeric_values) != len(outcomes):
+        return False
+
+    # Sort numerically — outcomes often arrive in market_id sort order
+    numeric_values.sort()
+
+    # All values must be distinct
+    if len(set(numeric_values)) != len(numeric_values):
+        return False
+
+    # Check spacing pattern
+    diffs = [numeric_values[i + 1] - numeric_values[i] for i in range(len(numeric_values) - 1)]
+
+    # Check for non-uniform spacing (strong signal for thresholds like 5,10,20,50,100,200)
+    # Uniform spacing might be legitimate partitioned ranges ("0-5", "5-10", "10-15")
+    if len(set(round(d, 6) for d in diffs)) == 1:
+        # Uniformly spaced — might be partitioned ranges (legit exclusive bucket)
+        return False
+
+    # Non-uniform spacing with all-numeric values = almost certainly thresholds
+    return True
+
+
+def _looks_like_temporal_suffixes(market_ids: list[str]) -> bool:
+    """Detect if market ID suffixes suggest temporal variants of the same question.
+
+    Examples that should return True:
+    - ["KXFOO-MAR26", "KXFOO-MAY26", "KXFOO-27"]
+    - ["KXFOO-26Q1", "KXFOO-26Q2", "KXFOO-26Q3"]
+    """
+    # Extract the varying suffix portion from market IDs
+    if len(market_ids) < 2:
+        return False
+
+    # Month abbreviation patterns in suffixes
+    month_pattern = re.compile(r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}", re.IGNORECASE)
+    quarter_pattern = re.compile(r"\d{2}Q[1-4]", re.IGNORECASE)
+
+    month_count = sum(1 for mid in market_ids if month_pattern.search(mid))
+    quarter_count = sum(1 for mid in market_ids if quarter_pattern.search(mid))
+
+    # If majority of IDs contain month or quarter patterns, likely temporal
+    total = len(market_ids)
+    if month_count >= total * 0.5:
+        return True
+    if quarter_count >= total * 0.5:
+        return True
+
+    return False
+
+
+def _classify_bucket_exclusivity(
+    candidate: list[MarketSnapshot],
+    outcomes: list[str],
+) -> str | None:
+    """Return a rejection reason if the candidate set is NOT mutually exclusive.
+
+    Returns None if the bucket looks legitimate (truly mutually exclusive).
+    Returns a string description of why it was rejected.
+    """
+    market_ids = [item.market_id for item in candidate]
+    titles = [item.title for item in candidate]
+
+    # Check 1: Temporal suffix detection on market IDs
+    if _looks_like_temporal_suffixes(market_ids):
+        return "temporal_variant_markets"
+
+    # Check 2: Numeric threshold detection on outcomes
+    if _looks_like_numeric_thresholds(outcomes):
+        return "numeric_threshold_markets"
+
+    # Check 3: Pattern matching on outcome text
+    for outcome in outcomes:
+        for pattern in _THRESHOLD_PATTERNS:
+            if pattern.search(outcome):
+                return f"threshold_language_in_outcome"
+
+    # Check 4: Pattern matching on title text for temporal cutoffs
+    for title in titles:
+        for pattern in _TEMPORAL_PATTERNS:
+            if pattern.search(title):
+                return "temporal_language_in_title"
+
+    # Check 5: Pattern matching on title for independent entities
+    for title in titles:
+        for pattern in _INDEPENDENT_ENTITY_PATTERNS:
+            if pattern.search(title):
+                return "independent_entity_language_in_title"
+
+    return None
 
 
 def _event_tree_group_id_from_parent(parent: MarketSnapshot) -> str:
@@ -658,13 +837,26 @@ def build_generation_diagnostics(
                     elif unique_outcomes != candidate_markets:
                         skip_reason = "duplicate_outcomes"
                     else:
-                        bucket_emitted = True
-                        selector = _event_selector_key(group.venue, group.event_key)
-                        event_tree_emitted = selector in emitted_event_tree_events
-                        if cfg.create_event_trees and not event_tree_emitted:
-                            event_tree_skip_reason = "no_explicit_parent_child_structure"
-                        elif not cfg.create_event_trees:
-                            event_tree_skip_reason = "event_tree_generation_disabled"
+                        # Tiered exclusivity check (mirrors generate logic).
+                        exchange_flags = [m.exchange_mutually_exclusive for m in candidate]
+                        any_denied = any(f is False for f in exchange_flags)
+                        all_confirmed = all(f is True for f in exchange_flags)
+
+                        if any_denied:
+                            skip_reason = "not_mutually_exclusive:exchange_denied"
+                        elif not all_confirmed:
+                            rejection = _classify_bucket_exclusivity(candidate, outcomes)
+                            if rejection is not None:
+                                skip_reason = f"not_mutually_exclusive:{rejection}"
+
+                        if skip_reason is None:
+                            bucket_emitted = True
+                            selector = _event_selector_key(group.venue, group.event_key)
+                            event_tree_emitted = selector in emitted_event_tree_events
+                            if cfg.create_event_trees and not event_tree_emitted:
+                                event_tree_skip_reason = "no_explicit_parent_child_structure"
+                            elif not cfg.create_event_trees:
+                                event_tree_skip_reason = "event_tree_generation_disabled"
 
         diagnostics.append(
             GroupGenerationDiagnostics(
@@ -747,10 +939,31 @@ def generate_structural_rules_payload(
         if len(set(outcomes)) != len(outcomes):
             continue
 
+        # --- Tiered mutual exclusivity check ---
+        # Priority 1: exchange-authoritative flag (Kalshi mutually_exclusive,
+        # Polymarket negRisk).  If any market explicitly denies exclusivity,
+        # hard reject.  If all confirm, skip heuristics entirely.
+        exchange_flags = [m.exchange_mutually_exclusive for m in candidate]
+        any_denied = any(f is False for f in exchange_flags)
+        all_confirmed = all(f is True for f in exchange_flags)
+
+        if any_denied:
+            continue
+
+        exclusivity_source = "exchange_api" if all_confirmed else "heuristic"
+
+        # Priority 2: heuristic text-pattern checks (only when no exchange
+        # confirmation is available).
+        if not all_confirmed:
+            rejection = _classify_bucket_exclusivity(candidate, outcomes)
+            if rejection is not None:
+                continue
+
         candidate.sort(key=lambda item: item.market_id)
         bucket = {
             "group_id": _bucket_group_id(group),
             "payout_per_contract": 1.0,
+            "exclusivity_source": exclusivity_source,
             "legs": [
                 {
                     "venue": group.venue,
@@ -937,12 +1150,16 @@ async def fetch_kalshi_markets_for_events(
             event_markets = payload.get("markets")
             if not isinstance(event_markets, list):
                 continue
+            # Extract event-level mutually_exclusive flag from Kalshi response.
+            me_raw = payload.get("mutually_exclusive")
+            me_flag: bool | None = me_raw if isinstance(me_raw, bool) else None
             _append_kalshi_event_markets(
                 destination=markets,
                 seen_market_ids=seen_market_ids,
                 event_ticker=event_ticker,
                 event_title=event_title,
                 event_markets=event_markets,
+                mutually_exclusive=me_flag,
             )
     return markets
 
@@ -993,6 +1210,7 @@ def _append_kalshi_event_markets(
     event_ticker: str,
     event_title: str,
     event_markets: list[Any],
+    mutually_exclusive: bool | None = None,
 ) -> None:
     ticker = event_ticker.strip().upper()
     title = event_title.strip()
@@ -1019,6 +1237,11 @@ def _append_kalshi_event_markets(
             row.setdefault("event_ticker", ticker)
         if title:
             row.setdefault("event_title", title)
+        # Inject event-level mutual exclusivity flag into each market dict
+        # so snapshot_from_market() can read it.  Kalshi only exposes this
+        # at the event level, not on individual markets.
+        if mutually_exclusive is not None and "mutually_exclusive" not in row:
+            row["mutually_exclusive"] = mutually_exclusive
         destination.append(row)
 
 
@@ -1081,6 +1304,8 @@ async def fetch_kalshi_markets_all_events(
 
                 event_title = str(event.get("title") or event.get("name") or event.get("question") or "").strip()
                 event_markets = event.get("markets")
+                me_raw = event.get("mutually_exclusive")
+                me_flag: bool | None = me_raw if isinstance(me_raw, bool) else None
                 if isinstance(event_markets, list) and event_markets:
                     _append_kalshi_event_markets(
                         destination=markets,
@@ -1088,6 +1313,7 @@ async def fetch_kalshi_markets_all_events(
                         event_ticker=event_ticker,
                         event_title=event_title,
                         event_markets=event_markets,
+                        mutually_exclusive=me_flag,
                     )
                 else:
                     events_to_expand.append(event_ticker)
@@ -1098,29 +1324,32 @@ async def fetch_kalshi_markets_all_events(
         if events_to_expand:
             semaphore = asyncio.Semaphore(max(1, event_fetch_concurrency))
 
-            async def _fetch_event_detail(event_ticker: str) -> tuple[str, str, list[Any]]:
+            async def _fetch_event_detail(event_ticker: str) -> tuple[str, str, list[Any], bool | None]:
                 async with semaphore:
                     payload = await _fetch_json_with_retry(client, f"/events/{event_ticker}")
                     if not isinstance(payload, dict):
-                        return event_ticker, "", []
+                        return event_ticker, "", [], None
                     event_title = str(payload.get("title") or payload.get("name") or payload.get("question") or "").strip()
+                    me_raw = payload.get("mutually_exclusive")
+                    me_flag: bool | None = me_raw if isinstance(me_raw, bool) else None
                     event_markets = payload.get("markets")
                     if not isinstance(event_markets, list):
-                        return event_ticker, event_title, []
-                    return event_ticker, event_title, event_markets
+                        return event_ticker, event_title, [], me_flag
+                    return event_ticker, event_title, event_markets, me_flag
 
             tasks = [_fetch_event_detail(event_ticker) for event_ticker in events_to_expand]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for event_ticker, result in zip(events_to_expand, results):
                 if isinstance(result, Exception):
                     continue
-                _, event_title, event_markets = result
+                _, event_title, event_markets, me_flag = result
                 _append_kalshi_event_markets(
                     destination=markets,
                     seen_market_ids=seen_market_ids,
                     event_ticker=event_ticker,
                     event_title=event_title,
                     event_markets=event_markets,
+                    mutually_exclusive=me_flag,
                 )
 
     return markets
@@ -1205,6 +1434,8 @@ async def fetch_polymarket_markets_for_events(
     for slug in sorted(found_events.keys()):
         event = found_events[slug]
         event_title = str(event.get("title") or event.get("question") or "").strip()
+        # Polymarket event-level negRisk flag — inject into each market dict.
+        neg_risk = event.get("negRisk") or event.get("neg_risk") or event.get("enableNegRisk")
         event_markets = event.get("markets")
         if not isinstance(event_markets, list):
             continue
@@ -1219,6 +1450,8 @@ async def fetch_polymarket_markets_for_events(
                 row.setdefault("venue", "polymarket")
                 row.setdefault("event_slug", slug)
                 row.setdefault("event_title", event_title)
+                if neg_risk is not None and "negRisk" not in row and "neg_risk" not in row:
+                    row["negRisk"] = neg_risk
                 markets.append(row)
     return markets
 
@@ -1267,6 +1500,7 @@ async def fetch_polymarket_markets_all_events(
             for event in events:
                 slug = str(event.get("slug") or "").strip().lower()
                 title = str(event.get("title") or event.get("question") or "").strip()
+                neg_risk = event.get("negRisk") or event.get("neg_risk") or event.get("enableNegRisk")
                 event_markets = event.get("markets")
                 if not isinstance(event_markets, list):
                     continue
@@ -1284,6 +1518,8 @@ async def fetch_polymarket_markets_all_events(
                         row.setdefault("event_slug", slug)
                     if title:
                         row.setdefault("event_title", title)
+                    if neg_risk is not None and "negRisk" not in row and "neg_risk" not in row:
+                        row["negRisk"] = neg_risk
                     markets.append(row)
 
             if len(events) < max(1, page_size):
