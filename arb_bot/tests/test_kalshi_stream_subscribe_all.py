@@ -372,3 +372,213 @@ def test_fetch_quotes_uses_paged_scan_when_subscribe_all_active():
     # Should use paged scan, NOT individual ticker fetches
     assert len(paged_called) == 1, "Expected paged scan to be called"
     assert len(ticker_called) == 0, "Individual ticker fetch should NOT be called in subscribe-all mode"
+
+
+def test_ticker_message_preserves_rest_cached_no_bid():
+    """Ticker messages lacking no_bid/no_ask should preserve REST-cached values.
+
+    Background REST enrichment populates market_cache with real no_bid/no_ask
+    from the /markets endpoint.  When a subsequent ticker message arrives (which
+    only contains yes_bid/yes_ask), the REST-sourced NO-side prices must survive
+    in the merged market dict, giving choose_effective_buy_price both the
+    direct-ask and opposite-bid-transform paths.
+
+    This test uses a delayed FakeWebSocket that delivers the ticker message
+    AFTER background enrichment has populated the cache (enrichment sleeps 2s,
+    ticker arrives at ~3s), ensuring the correct ordering.
+    """
+    adapter = _make_adapter(_make_settings(
+        stream_subscribe_all=True,
+        stream_priority_tickers=["KXPRES-26-YES"],
+    ))
+
+    # REST enrichment returns a market with real no_bid / no_ask.
+    rest_summaries = [
+        {
+            "ticker": "KXPRES-26-YES",
+            "event_ticker": "KXPRES",
+            "title": "Presidential Test",
+            "yes_bid": 0.50,
+            "yes_ask": 0.55,
+            "no_bid": 0.42,
+            "no_ask": 0.50,
+            "open_interest": 200,
+        },
+    ]
+
+    async def _fake_fetch_paged(*args, **kwargs):
+        return rest_summaries
+
+    async def _fake_backfill(summaries):
+        return summaries
+
+    adapter._fetch_market_summaries_paged = _fake_fetch_paged
+    adapter._backfill_priority_tickers_into_summaries = _fake_backfill
+
+    # Ticker message only has yes_bid/yes_ask (no no_bid/no_ask), matching
+    # real Kalshi ticker channel behaviour.
+    ack = json.dumps({"id": 1, "type": "subscribed", "msg": {}})
+    ticker_msg = json.dumps({
+        "type": "ticker",
+        "msg": {
+            "market_ticker": "KXPRES-26-YES",
+            "yes_bid": 0.52,
+            "yes_ask": 0.57,
+            "open_interest": 210,
+        },
+    })
+
+    class DelayedWebSocket(FakeWebSocket):
+        """Delivers ack immediately, then delays ticker message until after enrichment."""
+        def __init__(self):
+            super().__init__([ack])
+            self._ticker_delivered = False
+        async def recv(self):
+            if self._recv_index < len(self._messages):
+                # Deliver ack immediately.
+                return await super().recv()
+            if not self._ticker_delivered:
+                # Wait long enough for background enrichment to complete.
+                # Enrichment sleeps 2s then processes; we wait 3s to be safe.
+                await asyncio.sleep(3.0)
+                self._ticker_delivered = True
+                return ticker_msg
+            # Block indefinitely after ticker delivered.
+            await asyncio.sleep(999)
+            return ""
+
+    ws = DelayedWebSocket()
+    quotes: list[BinaryQuote] = []
+
+    async def _run():
+        with patch("arb_bot.exchanges.kalshi.websockets") as mock_ws:
+            mock_ws.connect.return_value = ws
+            async def _collect():
+                async for quote in adapter._stream_quotes_subscribe_all():
+                    quotes.append(quote)
+                    # Wait for the REST enrichment quote(s) plus the ticker quote.
+                    # REST enrichment emits 1 quote, then ticker emits 1 more.
+                    if len(quotes) >= 2:
+                        break
+            await asyncio.wait_for(_collect(), timeout=10.0)
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    # We expect at least 2 quotes: one from REST enrichment, one from ticker.
+    assert len(quotes) >= 2, f"Expected >=2 quotes, got {len(quotes)}"
+
+    # The first quote should be from REST enrichment (yes_bid=0.50).
+    rest_quote = quotes[0]
+    assert rest_quote.market_id == "KXPRES-26-YES"
+    assert abs(rest_quote.yes_bid_price - 0.50) < 0.01
+
+    # The second (last) quote should be from the ticker message, with:
+    # - yes_bid updated to 0.52 (from ticker)
+    # - no_bid preserved at 0.42 (from REST cache, since ticker didn't include it)
+    ticker_quote = quotes[-1]
+    assert ticker_quote.market_id == "KXPRES-26-YES"
+
+    assert ticker_quote.no_bid_price is not None, (
+        "no_bid_price should be preserved from REST cache, not None"
+    )
+    assert abs(ticker_quote.no_bid_price - 0.42) < 0.01, (
+        f"Expected no_bid_price ~0.42 from REST cache, got {ticker_quote.no_bid_price}"
+    )
+
+    # Verify yes_bid was updated by the ticker message (not stale REST value).
+    assert ticker_quote.yes_bid_price is not None
+    assert abs(ticker_quote.yes_bid_price - 0.52) < 0.01, (
+        f"Expected yes_bid_price ~0.52 from ticker update, got {ticker_quote.yes_bid_price}"
+    )
+
+
+def test_kalshi_single_book_invariant_yes_ask_plus_no_ask_gte_one():
+    """On Kalshi (single matching engine), yes_ask + no_ask >= 1.0 always.
+
+    Kalshi's matching engine treats YES and NO as complements of the same
+    order book, enforcing yes_best_bid + no_best_bid <= 1.0.  Since:
+
+        yes_ask = 1.0 - no_best_bid
+        no_ask  = 1.0 - yes_best_bid
+
+    then: yes_ask + no_ask = 2.0 - (yes_best_bid + no_best_bid) >= 1.0.
+
+    This means intra-venue arb (total < 1.0) is structurally impossible.
+    This test verifies the invariant using _quote_from_market_summary directly.
+    """
+    adapter = _make_adapter()
+
+    # Test a range of valid Kalshi orderbook states where
+    # yes_best_bid + no_best_bid <= 1.0 (exchange invariant).
+    test_cases = [
+        # (yes_bid, yes_ask, no_bid, no_ask, description)
+        (0.50, 0.55, 0.42, 0.50, "typical spread market"),
+        (0.01, 0.05, 0.01, 0.99, "extreme low YES"),
+        (0.95, 0.99, 0.01, 0.05, "extreme high YES"),
+        (0.50, 0.52, 0.48, 0.50, "tight spread"),
+        (0.30, 0.40, 0.55, 0.70, "wide spread low YES"),
+        (0.10, 0.20, 0.10, 0.90, "low liquidity both sides"),
+        (0.50, 0.51, 0.49, 0.50, "near-balanced penny spread"),
+    ]
+
+    for yes_bid, yes_ask, no_bid, no_ask, desc in test_cases:
+        # Verify exchange invariant holds in test data.
+        assert yes_bid + no_bid <= 1.0 + 1e-9, (
+            f"Test data violates exchange invariant: {desc}"
+        )
+
+        market = {
+            "ticker": f"KXTEST-INV-{desc.replace(' ', '_').upper()[:10]}",
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "open_interest": 100,
+        }
+        quote = adapter._quote_from_market_summary(market)
+        assert quote is not None, f"Quote should not be None for: {desc}"
+
+        total = quote.yes_buy_price + quote.no_buy_price
+        assert total >= 1.0 - 1e-9, (
+            f"Kalshi invariant violated for {desc}: "
+            f"yes_buy={quote.yes_buy_price:.4f} + no_buy={quote.no_buy_price:.4f} "
+            f"= {total:.4f} < 1.0"
+        )
+
+
+def test_kalshi_single_book_derived_prices_also_satisfy_invariant():
+    """Even with derived (complement) prices, yes_ask + no_ask >= 1.0.
+
+    When no_bid and no_ask are absent (as in ticker-only data before REST
+    enrichment), prices are derived as complements:
+        no_ask = 1.0 - yes_bid
+    This also guarantees the invariant: yes_ask + (1 - yes_bid) = yes_ask - yes_bid + 1.0 >= 1.0
+    since yes_ask >= yes_bid (ask >= bid by definition).
+    """
+    adapter = _make_adapter()
+
+    test_cases = [
+        (0.30, 0.40, "wide spread"),
+        (0.50, 0.51, "penny spread"),
+        (0.01, 0.99, "maximum spread"),
+        (0.50, 0.50, "zero spread"),
+        (0.75, 0.80, "high YES"),
+    ]
+
+    for yes_bid, yes_ask, desc in test_cases:
+        market = {
+            "ticker": f"KXTEST-DER-{desc.replace(' ', '_').upper()[:10]}",
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            # no_bid and no_ask intentionally absent — will be derived.
+            "open_interest": 100,
+        }
+        quote = adapter._quote_from_market_summary(market)
+        assert quote is not None, f"Quote should not be None for: {desc}"
+
+        total = quote.yes_buy_price + quote.no_buy_price
+        assert total >= 1.0 - 1e-9, (
+            f"Derived-price invariant violated for {desc}: "
+            f"yes_buy={quote.yes_buy_price:.4f} + no_buy={quote.no_buy_price:.4f} "
+            f"= {total:.4f} < 1.0"
+        )

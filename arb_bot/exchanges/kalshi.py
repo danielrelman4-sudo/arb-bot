@@ -235,6 +235,28 @@ class KalshiAdapter(ExchangeAdapter):
         Subscribes to the ``ticker`` channel with no ``market_tickers`` filter,
         receiving updates for every active market.  Market metadata is built
         lazily from incoming messages plus a background REST enrichment pass.
+
+        Note on intra-venue arbitrage
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Intra-venue arbitrage (``yes_buy + no_buy < 1.0``) is structurally
+        impossible on Kalshi.  Kalshi uses a single matching engine where YES
+        and NO sides are complements of the same order book.  A YES bid at
+        price *p* is economically equivalent to a NO offer at *1-p*; the
+        exchange enforces ``yes_best_bid + no_best_bid <= 1.0`` as an
+        invariant, so ``yes_ask + no_ask >= 1.0`` always holds.
+
+        Intra-venue arb is only possible on venues with independent token
+        order books (e.g. Polymarket CLOB where YES and NO tokens trade on
+        separate books and prices can temporarily diverge).
+
+        However, the ticker channel only reports ``yes_bid`` / ``yes_ask``;
+        ``no_bid`` and ``no_ask`` are absent.  Background REST enrichment
+        populates the market cache with real ``no_bid`` / ``no_ask`` values
+        from the ``/markets`` endpoint.  When a subsequent ticker message
+        arrives, these REST-sourced NO-side prices are preserved in the cache
+        (the ticker field-mapping loop only overwrites keys present in the
+        message), giving ``choose_effective_buy_price`` both the direct-ask
+        and opposite-bid paths for accurate quote construction.
         """
         market_cache: dict[str, dict[str, Any]] = {}
         market_lookup: dict[str, str] = {}
@@ -292,6 +314,20 @@ class KalshiAdapter(ExchangeAdapter):
                 LOGGER.info(
                     "kalshi subscribe-all background enrichment pushed %d quotes to stream",
                     pushed,
+                )
+
+                # Report how many cached markets have real (REST-sourced) no_bid
+                # values vs derived-only.  Real no_bid enables both direct-ask
+                # and opposite-bid-transform paths in choose_effective_buy_price.
+                real_no_bid = sum(
+                    1 for m in market_cache.values()
+                    if m.get("no_bid") is not None
+                )
+                LOGGER.info(
+                    "kalshi subscribe-all enrichment: %d/%d markets have real no_bid "
+                    "(REST-sourced, enables opposite-bid pricing path)",
+                    real_no_bid,
+                    len(market_cache),
                 )
             except asyncio.CancelledError:
                 raise
