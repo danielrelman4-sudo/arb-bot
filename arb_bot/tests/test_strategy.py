@@ -267,3 +267,84 @@ def test_find_by_kind_filters_requested_lane_only() -> None:
     cross_only = finder.find_by_kind(quotes, kinds={OpportunityKind.CROSS_VENUE})
     assert cross_only
     assert all(opp.kind is OpportunityKind.CROSS_VENUE for opp in cross_only)
+
+
+def test_tighter_price_sum_for_heuristic_buckets(tmp_path: Path) -> None:
+    """Heuristic bucket with price_sum=0.82 is rejected, but exchange-confirmed is accepted.
+
+    _BUCKET_PRICE_SUM_MIN_HEURISTIC is 0.85, so 0.82 fails for heuristic.
+    _BUCKET_PRICE_SUM_MIN_EXCHANGE is 0.70, so 0.82 passes for exchange_api.
+    """
+    # Setup: three legs summing to 0.82 total (0.24 + 0.28 + 0.30 = 0.82)
+    # Net edge = 1.0 - 0.82 = 0.18 per contract
+
+    # Case 1: heuristic-only bucket -> rejected by tighter band (0.85 min)
+    heuristic_rules = {
+        "mutually_exclusive_buckets": [
+            {
+                "group_id": "heuristic_bucket",
+                "payout_per_contract": 1.0,
+                "exclusivity_source": "heuristic",
+                "legs": [
+                    {"venue": "kalshi", "market_id": "H1", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "H2", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "H3", "side": "yes"},
+                ],
+            }
+        ],
+        "event_trees": [],
+        "cross_market_parity_checks": [],
+    }
+    rules_path_h = tmp_path / "heuristic.json"
+    rules_path_h.write_text(json.dumps(heuristic_rules), encoding="utf-8")
+
+    finder_h = ArbitrageFinder(
+        min_net_edge_per_contract=0.01,
+        enable_cross_venue=False,
+        enable_structural_arb=True,
+        structural_rules_path=str(rules_path_h),
+        enable_maker_estimates=False,
+    )
+
+    quotes = [
+        BinaryQuote("kalshi", "H1", 0.24, 0.76, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "H2", 0.28, 0.72, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "H3", 0.30, 0.70, 100, 100, fee_per_contract=0.0),
+    ]
+
+    opps_h = finder_h.find(quotes)
+    bucket_opps_h = [o for o in opps_h if o.kind is OpportunityKind.STRUCTURAL_BUCKET]
+    assert len(bucket_opps_h) == 0, "heuristic bucket at price_sum=0.82 should be rejected"
+
+    # Case 2: exchange-confirmed bucket -> accepted by wider band (0.70 min)
+    exchange_rules = {
+        "mutually_exclusive_buckets": [
+            {
+                "group_id": "exchange_bucket",
+                "payout_per_contract": 1.0,
+                "exclusivity_source": "exchange_api",
+                "legs": [
+                    {"venue": "kalshi", "market_id": "H1", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "H2", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "H3", "side": "yes"},
+                ],
+            }
+        ],
+        "event_trees": [],
+        "cross_market_parity_checks": [],
+    }
+    rules_path_e = tmp_path / "exchange.json"
+    rules_path_e.write_text(json.dumps(exchange_rules), encoding="utf-8")
+
+    finder_e = ArbitrageFinder(
+        min_net_edge_per_contract=0.01,
+        enable_cross_venue=False,
+        enable_structural_arb=True,
+        structural_rules_path=str(rules_path_e),
+        enable_maker_estimates=False,
+    )
+
+    opps_e = finder_e.find(quotes)
+    bucket_opps_e = [o for o in opps_e if o.kind is OpportunityKind.STRUCTURAL_BUCKET]
+    assert len(bucket_opps_e) > 0, "exchange bucket at price_sum=0.82 should be accepted"
+    assert bucket_opps_e[0].metadata.get("exclusivity_source") == "exchange_api"

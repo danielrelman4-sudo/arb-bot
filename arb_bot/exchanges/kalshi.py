@@ -1372,9 +1372,17 @@ class KalshiAdapter(ExchangeAdapter):
         if not isinstance(markets, list):
             return []
 
+        # Inject event-level `mutually_exclusive` flag into each nested
+        # market dict.  Kalshi only exposes this at the event level, not
+        # on individual markets.
+        me_raw = payload.get("mutually_exclusive")
+        me_flag: bool | None = me_raw if isinstance(me_raw, bool) else None
+
         parsed: list[dict[str, Any]] = []
         for market in markets:
             if isinstance(market, dict):
+                if me_flag is not None and "mutually_exclusive" not in market:
+                    market["mutually_exclusive"] = me_flag
                 parsed.append(market)
         return parsed
 

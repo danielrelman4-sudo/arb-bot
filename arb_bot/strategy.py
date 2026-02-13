@@ -456,6 +456,19 @@ class ArbitrageFinder:
 
         return opportunities
 
+    # For truly mutually exclusive buckets, sum of YES prices should be near 1.0.
+    # If sum is far below 1.0, the markets are likely independent (not exclusive).
+    # If sum is far above 1.0, no arb exists. We reject if outside this band.
+    #
+    # Exchange-confirmed buckets (exclusivity_source="exchange_api") use wider
+    # bands because the exchange guarantees exclusivity — price deviation is
+    # real edge, not misclassification.
+    # Heuristic-only buckets use tighter bands as an extra safety guard.
+    _BUCKET_PRICE_SUM_MIN_EXCHANGE = 0.70  # Exchange-confirmed: wide band
+    _BUCKET_PRICE_SUM_MAX_EXCHANGE = 1.20
+    _BUCKET_PRICE_SUM_MIN_HEURISTIC = 0.85  # Heuristic-only: tighter band
+    _BUCKET_PRICE_SUM_MAX_HEURISTIC = 1.10
+
     def _find_structural_buckets(
         self,
         lookup: dict[tuple[str, str], BinaryQuote],
@@ -471,6 +484,28 @@ class ArbitrageFinder:
                 continue
 
             legs, source_quotes = resolved
+
+            # Runtime price-sum sanity check: for a truly exclusive bucket
+            # (exactly one outcome pays $1), sum of all YES prices ≈ 1.0.
+            # Independent markets will have sum << 1.0 or >> 1.0.
+            # Use wider bands for exchange-confirmed buckets, tighter for heuristic.
+            if bucket.exclusivity_source == "exchange_api":
+                price_sum_min = self._BUCKET_PRICE_SUM_MIN_EXCHANGE
+                price_sum_max = self._BUCKET_PRICE_SUM_MAX_EXCHANGE
+            else:
+                price_sum_min = self._BUCKET_PRICE_SUM_MIN_HEURISTIC
+                price_sum_max = self._BUCKET_PRICE_SUM_MAX_HEURISTIC
+
+            price_sum = sum(leg.buy_price for leg in legs)
+            if price_sum < price_sum_min:
+                LOGGER.debug(
+                    "bucket %s rejected: price_sum=%.3f < %.2f (source=%s)",
+                    bucket.group_id, price_sum, price_sum_min, bucket.exclusivity_source,
+                )
+                continue
+            if price_sum > price_sum_max:
+                continue
+
             quality_score = (
                 self._bucket_quality_model.score_for(bucket.group_id)
                 if self._bucket_quality_model is not None
@@ -479,6 +514,7 @@ class ArbitrageFinder:
             metadata: dict[str, Any] = {
                 "structural_class": "mutually_exclusive_bucket",
                 "bucket_group_id": bucket.group_id,
+                "exclusivity_source": bucket.exclusivity_source,
             }
             if quality_score is not None:
                 metadata["bucket_quality_score"] = quality_score

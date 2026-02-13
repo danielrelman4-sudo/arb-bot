@@ -4,6 +4,10 @@ import asyncio
 
 from arb_bot.structural_rule_generator import (
     GenerationSettings,
+    MarketSnapshot,
+    _classify_bucket_exclusivity,
+    _looks_like_numeric_thresholds,
+    _looks_like_temporal_suffixes,
     build_generation_diagnostics,
     fetch_kalshi_markets_all_events,
     fetch_polymarket_markets_all_events,
@@ -579,3 +583,431 @@ def test_fetch_kalshi_markets_all_events_falls_back_to_event_details(monkeypatch
     assert len(markets) == 2
     assert any(path == "/events/KX-2" for path, _ in calls)
     assert {market["ticker"] for market in markets} == {"KX-2-A", "KX-2-B"}
+
+
+# ---------------------------------------------------------------------------
+# Mutual-exclusivity classifier tests
+# ---------------------------------------------------------------------------
+
+
+def _make_snapshot(market_id: str, outcome: str, title: str = "Same title") -> MarketSnapshot:
+    return MarketSnapshot(
+        venue="kalshi",
+        event_key="KXTEST",
+        market_id=market_id,
+        title=title,
+        outcome=outcome,
+        status="open",
+        liquidity=100.0,
+    )
+
+
+class TestLooksLikeNumericThresholds:
+    def test_non_uniform_monotonic_values(self) -> None:
+        # KXAGENCIES pattern: 5, 10, 20, 30, 50, 100, 200
+        assert _looks_like_numeric_thresholds(["5", "10", "20", "30", "50", "100", "200"]) is True
+
+    def test_non_uniform_decimals(self) -> None:
+        # Gas price brackets: 3.80, 3.90, 4.00, 4.50, 5.00
+        assert _looks_like_numeric_thresholds(["3.80", "3.90", "4.00", "4.50", "5.00"]) is True
+
+    def test_uniform_spacing_returns_false(self) -> None:
+        # Could be legitimate partitioned ranges: 0-5, 5-10, 10-15
+        assert _looks_like_numeric_thresholds(["5", "10", "15", "20", "25"]) is False
+
+    def test_named_outcomes_returns_false(self) -> None:
+        assert _looks_like_numeric_thresholds(["alice", "bob", "carol"]) is False
+
+    def test_mixed_text_and_numbers_returns_false(self) -> None:
+        assert _looks_like_numeric_thresholds(["alice", "10", "carol"]) is False
+
+    def test_two_outcomes_returns_false(self) -> None:
+        # Too few to classify
+        assert _looks_like_numeric_thresholds(["5", "10"]) is False
+
+    def test_unsorted_non_uniform_detected(self) -> None:
+        # Even when outcomes arrive in non-numeric order, we sort and detect
+        assert _looks_like_numeric_thresholds(["10", "100", "20", "200", "30", "5", "50"]) is True
+
+    def test_decreasing_non_uniform(self) -> None:
+        # Reverse order — still detected after sorting
+        assert _looks_like_numeric_thresholds(["200", "100", "50", "20", "10"]) is True
+
+
+class TestLooksLikeTemporalSuffixes:
+    def test_month_suffixes(self) -> None:
+        # KXACAHSAFSA pattern: -27, -MAR26, -MAY26
+        assert _looks_like_temporal_suffixes([
+            "KXACAHSAFSA-MAR26", "KXACAHSAFSA-MAY26", "KXACAHSAFSA-JUL26"
+        ]) is True
+
+    def test_quarter_suffixes(self) -> None:
+        assert _looks_like_temporal_suffixes([
+            "KXFOO-26Q1", "KXFOO-26Q2", "KXFOO-26Q3", "KXFOO-26Q4"
+        ]) is True
+
+    def test_non_temporal_suffixes(self) -> None:
+        assert _looks_like_temporal_suffixes([
+            "KXEVENT-ALICE", "KXEVENT-BOB", "KXEVENT-CAROL"
+        ]) is False
+
+    def test_too_few_ids(self) -> None:
+        assert _looks_like_temporal_suffixes(["KXFOO-MAR26"]) is False
+
+
+class TestClassifyBucketExclusivity:
+    def test_legitimate_winner_bucket_passes(self) -> None:
+        """True mutually exclusive: Who will win the election?"""
+        candidates = [
+            _make_snapshot("KXEVENT-A", "Alice", "Who will win?"),
+            _make_snapshot("KXEVENT-B", "Bob", "Who will win?"),
+            _make_snapshot("KXEVENT-C", "Carol", "Who will win?"),
+        ]
+        outcomes = ["alice", "bob", "carol"]
+        assert _classify_bucket_exclusivity(candidates, outcomes) is None
+
+    def test_temporal_variant_rejected(self) -> None:
+        """KXACAHSAFSA: temporal variants — not mutually exclusive."""
+        candidates = [
+            _make_snapshot("KXACAHSAFSA-27", "2027"),
+            _make_snapshot("KXACAHSAFSA-MAR26", "March 2026"),
+            _make_snapshot("KXACAHSAFSA-MAY26", "May 2026"),
+        ]
+        outcomes = ["2027", "march 2026", "may 2026"]
+        result = _classify_bucket_exclusivity(candidates, outcomes)
+        assert result is not None
+        assert "temporal" in result
+
+    def test_numeric_threshold_rejected(self) -> None:
+        """KXAGENCIES: numeric thresholds — not mutually exclusive."""
+        candidates = [
+            _make_snapshot("KXAGENCIES-26-5", "5"),
+            _make_snapshot("KXAGENCIES-26-10", "10"),
+            _make_snapshot("KXAGENCIES-26-20", "20"),
+            _make_snapshot("KXAGENCIES-26-30", "30"),
+            _make_snapshot("KXAGENCIES-26-50", "50"),
+            _make_snapshot("KXAGENCIES-26-100", "100"),
+            _make_snapshot("KXAGENCIES-26-200", "200"),
+        ]
+        outcomes = ["5", "10", "20", "30", "50", "100", "200"]
+        result = _classify_bucket_exclusivity(candidates, outcomes)
+        assert result is not None
+        assert "numeric_threshold" in result
+
+    def test_independent_entity_rejected(self) -> None:
+        """Markets about which countries/companies will do X — not exclusive."""
+        candidates = [
+            _make_snapshot("KXFOO-AMAZ", "Amazon", "Which companies will report?"),
+            _make_snapshot("KXFOO-GOOG", "Google", "Which companies will report?"),
+            _make_snapshot("KXFOO-META", "Meta", "Which companies will report?"),
+        ]
+        outcomes = ["amazon", "google", "meta"]
+        result = _classify_bucket_exclusivity(candidates, outcomes)
+        assert result is not None
+        assert "independent" in result
+
+    def test_threshold_language_in_outcome_rejected(self) -> None:
+        """Outcomes containing 'above', 'below', etc."""
+        candidates = [
+            _make_snapshot("KXFOO-A", "Above $5B"),
+            _make_snapshot("KXFOO-B", "Above $10B"),
+            _make_snapshot("KXFOO-C", "Above $20B"),
+        ]
+        outcomes = ["above 5b", "above 10b", "above 20b"]
+        result = _classify_bucket_exclusivity(candidates, outcomes)
+        assert result is not None
+        assert "threshold" in result
+
+    def test_temporal_language_in_title_rejected(self) -> None:
+        """Titles containing 'by March', 'before Q2'."""
+        candidates = [
+            _make_snapshot("KXFOO-A", "March 2026", "Will X happen by March 2026?"),
+            _make_snapshot("KXFOO-B", "June 2026", "Will X happen by June 2026?"),
+            _make_snapshot("KXFOO-C", "Dec 2026", "Will X happen by December 2026?"),
+        ]
+        outcomes = ["march 2026", "june 2026", "dec 2026"]
+        result = _classify_bucket_exclusivity(candidates, outcomes)
+        assert result is not None
+        assert "temporal" in result
+
+    def test_dollar_threshold_in_outcome_rejected(self) -> None:
+        """Outcomes with dollar amounts like $100M."""
+        candidates = [
+            _make_snapshot("KXFOO-A", "$100M"),
+            _make_snapshot("KXFOO-B", "$500M"),
+            _make_snapshot("KXFOO-C", "$1B"),
+        ]
+        outcomes = ["$100m", "$500m", "$1b"]
+        result = _classify_bucket_exclusivity(candidates, outcomes)
+        assert result is not None
+
+
+class TestGenerateRejectsNonExclusiveBuckets:
+    """Integration tests: verify generate_structural_rules_payload skips bad buckets."""
+
+    def test_numeric_thresholds_not_emitted(self) -> None:
+        """An event with numeric threshold outcomes should NOT produce a bucket."""
+        markets = [
+            _kalshi_market("KXAGENCIES", "26-5", "5"),
+            _kalshi_market("KXAGENCIES", "26-10", "10"),
+            _kalshi_market("KXAGENCIES", "26-20", "20"),
+            _kalshi_market("KXAGENCIES", "26-30", "30"),
+            _kalshi_market("KXAGENCIES", "26-50", "50"),
+            _kalshi_market("KXAGENCIES", "26-100", "100"),
+            _kalshi_market("KXAGENCIES", "26-200", "200"),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        assert len(payload["mutually_exclusive_buckets"]) == 0
+
+    def test_temporal_variants_not_emitted(self) -> None:
+        """An event with temporal market IDs should NOT produce a bucket."""
+        markets = [
+            _kalshi_market("KXACAHSAFSA", "27", "2027"),
+            _kalshi_market("KXACAHSAFSA", "MAR26", "March 2026"),
+            _kalshi_market("KXACAHSAFSA", "MAY26", "May 2026"),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        assert len(payload["mutually_exclusive_buckets"]) == 0
+
+    def test_legitimate_winner_still_emitted(self) -> None:
+        """A true who-will-win event should still produce a bucket."""
+        markets = [
+            _kalshi_market("KXELECTION", "ALICE", "Alice"),
+            _kalshi_market("KXELECTION", "BOB", "Bob"),
+            _kalshi_market("KXELECTION", "CAROL", "Carol"),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        assert len(payload["mutually_exclusive_buckets"]) == 1
+
+    def test_diagnostics_reports_exclusivity_rejection(self) -> None:
+        """Diagnostics should report the exclusivity rejection reason."""
+        markets = [
+            _kalshi_market("KXAGENCIES", "26-5", "5"),
+            _kalshi_market("KXAGENCIES", "26-10", "10"),
+            _kalshi_market("KXAGENCIES", "26-20", "20"),
+            _kalshi_market("KXAGENCIES", "26-30", "30"),
+            _kalshi_market("KXAGENCIES", "26-50", "50"),
+            _kalshi_market("KXAGENCIES", "26-100", "100"),
+            _kalshi_market("KXAGENCIES", "26-200", "200"),
+        ]
+        diagnostics = build_generation_diagnostics(markets)
+        assert len(diagnostics) == 1
+        assert diagnostics[0].bucket_emitted is False
+        assert diagnostics[0].skip_reason is not None
+        assert "not_mutually_exclusive" in diagnostics[0].skip_reason
+
+
+# ---------------------------------------------------------------------------
+# Exchange-authoritative mutual exclusivity tests
+# ---------------------------------------------------------------------------
+
+
+class TestExchangeMutuallyExclusiveField:
+    """Tests for the exchange_mutually_exclusive field on MarketSnapshot."""
+
+    def test_snapshot_kalshi_with_mutually_exclusive_true(self) -> None:
+        """Kalshi market with mutually_exclusive=True populates field."""
+        raw = {
+            "venue": "kalshi",
+            "event_ticker": "KXNEWPOPE",
+            "ticker": "KXNEWPOPE-70-YES",
+            "title": "Who will be the next pope?",
+            "subtitle": "Cardinal A",
+            "status": "open",
+            "liquidity": 100.0,
+            "mutually_exclusive": True,
+        }
+        snapshot = snapshot_from_market(raw)
+        assert snapshot is not None
+        assert snapshot.exchange_mutually_exclusive is True
+
+    def test_snapshot_kalshi_with_mutually_exclusive_false(self) -> None:
+        """Kalshi market with mutually_exclusive=False populates field."""
+        raw = {
+            "venue": "kalshi",
+            "event_ticker": "KXAGENCIES",
+            "ticker": "KXAGENCIES-26-5",
+            "title": "How many agencies?",
+            "subtitle": "5",
+            "status": "open",
+            "liquidity": 100.0,
+            "mutually_exclusive": False,
+        }
+        snapshot = snapshot_from_market(raw)
+        assert snapshot is not None
+        assert snapshot.exchange_mutually_exclusive is False
+
+    def test_snapshot_kalshi_without_mutually_exclusive(self) -> None:
+        """Kalshi market without the field defaults to None."""
+        raw = {
+            "venue": "kalshi",
+            "event_ticker": "KXFOO",
+            "ticker": "KXFOO-A",
+            "title": "Test",
+            "subtitle": "A",
+            "status": "open",
+            "liquidity": 100.0,
+        }
+        snapshot = snapshot_from_market(raw)
+        assert snapshot is not None
+        assert snapshot.exchange_mutually_exclusive is None
+
+    def test_snapshot_polymarket_with_neg_risk_true(self) -> None:
+        """Polymarket market with negRisk=True populates field."""
+        raw = {
+            "venue": "polymarket",
+            "event_slug": "next-pope",
+            "id": "0xabc",
+            "title": "Cardinal A",
+            "outcome": "Cardinal A",
+            "active": True,
+            "closed": False,
+            "negRisk": True,
+        }
+        snapshot = snapshot_from_market(raw)
+        assert snapshot is not None
+        assert snapshot.exchange_mutually_exclusive is True
+
+    def test_snapshot_polymarket_with_neg_risk_false(self) -> None:
+        """Polymarket market with negRisk=False populates field."""
+        raw = {
+            "venue": "polymarket",
+            "event_slug": "some-event",
+            "id": "0xdef",
+            "title": "Will X happen?",
+            "outcome": "Yes",
+            "active": True,
+            "closed": False,
+            "negRisk": False,
+        }
+        snapshot = snapshot_from_market(raw)
+        assert snapshot is not None
+        assert snapshot.exchange_mutually_exclusive is False
+
+    def test_snapshot_polymarket_without_neg_risk(self) -> None:
+        """Polymarket market without negRisk defaults to None."""
+        raw = {
+            "venue": "polymarket",
+            "event_slug": "some-event",
+            "id": "0xghi",
+            "title": "Will X happen?",
+            "outcome": "Yes",
+            "active": True,
+            "closed": False,
+        }
+        snapshot = snapshot_from_market(raw)
+        assert snapshot is not None
+        assert snapshot.exchange_mutually_exclusive is None
+
+
+def _kalshi_market_with_me(
+    event_ticker: str,
+    suffix: str,
+    outcome: str,
+    *,
+    mutually_exclusive: bool | None = None,
+    liquidity: float = 100.0,
+) -> dict:
+    """Helper: Kalshi market dict with optional mutually_exclusive field."""
+    row = {
+        "venue": "kalshi",
+        "event_ticker": event_ticker,
+        "ticker": f"{event_ticker}-{suffix}",
+        "title": "Who will win the election?",
+        "subtitle": outcome,
+        "status": "open",
+        "liquidity": liquidity,
+    }
+    if mutually_exclusive is not None:
+        row["mutually_exclusive"] = mutually_exclusive
+    return row
+
+
+class TestExchangeAuthorityInGeneration:
+    """Tests for tiered exclusivity check in generate_structural_rules_payload."""
+
+    def test_exchange_confirmed_bucket_bypasses_heuristics(self) -> None:
+        """ME=True bucket that would fail numeric threshold check still generates.
+
+        Without exchange confirmation, these numeric outcomes would be
+        rejected by _looks_like_numeric_thresholds().  With ME=True, the
+        heuristic is skipped.
+        """
+        markets = [
+            _kalshi_market_with_me("KXTEST", "5", "5", mutually_exclusive=True),
+            _kalshi_market_with_me("KXTEST", "10", "10", mutually_exclusive=True),
+            _kalshi_market_with_me("KXTEST", "20", "20", mutually_exclusive=True),
+            _kalshi_market_with_me("KXTEST", "50", "50", mutually_exclusive=True),
+            _kalshi_market_with_me("KXTEST", "100", "100", mutually_exclusive=True),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        buckets = payload["mutually_exclusive_buckets"]
+        assert len(buckets) == 1
+        assert buckets[0]["exclusivity_source"] == "exchange_api"
+
+    def test_exchange_denied_bucket_rejected(self) -> None:
+        """ME=False bucket is rejected regardless of heuristic outcome.
+
+        Even though Alice/Bob/Carol looks like a legit winner bucket,
+        the exchange explicitly says NOT mutually exclusive — hard reject.
+        """
+        markets = [
+            _kalshi_market_with_me("KXEVENT", "A", "Alice", mutually_exclusive=False),
+            _kalshi_market_with_me("KXEVENT", "B", "Bob", mutually_exclusive=False),
+            _kalshi_market_with_me("KXEVENT", "C", "Carol", mutually_exclusive=False),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        assert len(payload["mutually_exclusive_buckets"]) == 0
+
+    def test_heuristic_fallback_when_no_exchange_field(self) -> None:
+        """None field falls through to existing heuristic checks.
+
+        Alice/Bob/Carol with no exchange field passes heuristics and emits.
+        """
+        markets = [
+            _kalshi_market_with_me("KXEVENT", "A", "Alice", mutually_exclusive=None),
+            _kalshi_market_with_me("KXEVENT", "B", "Bob", mutually_exclusive=None),
+            _kalshi_market_with_me("KXEVENT", "C", "Carol", mutually_exclusive=None),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        buckets = payload["mutually_exclusive_buckets"]
+        assert len(buckets) == 1
+        assert buckets[0]["exclusivity_source"] == "heuristic"
+
+    def test_heuristic_still_rejects_when_no_exchange_field(self) -> None:
+        """Numeric thresholds without exchange flag still rejected by heuristic."""
+        markets = [
+            _kalshi_market_with_me("KXTEST", "5", "5"),
+            _kalshi_market_with_me("KXTEST", "10", "10"),
+            _kalshi_market_with_me("KXTEST", "20", "20"),
+            _kalshi_market_with_me("KXTEST", "50", "50"),
+            _kalshi_market_with_me("KXTEST", "100", "100"),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        assert len(payload["mutually_exclusive_buckets"]) == 0
+
+    def test_exclusivity_source_in_generated_payload(self) -> None:
+        """Verify exclusivity_source field is present in emitted bucket JSON."""
+        markets = [
+            _kalshi_market_with_me("KXEVENT", "A", "Alice", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEVENT", "B", "Bob", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEVENT", "C", "Carol", mutually_exclusive=True),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        buckets = payload["mutually_exclusive_buckets"]
+        assert len(buckets) == 1
+        assert "exclusivity_source" in buckets[0]
+        assert buckets[0]["exclusivity_source"] == "exchange_api"
+
+    def test_diagnostics_exchange_denied_reports_reason(self) -> None:
+        """Diagnostics should report exchange_denied for ME=False events."""
+        markets = [
+            _kalshi_market_with_me("KXEVENT", "A", "Alice", mutually_exclusive=False),
+            _kalshi_market_with_me("KXEVENT", "B", "Bob", mutually_exclusive=False),
+            _kalshi_market_with_me("KXEVENT", "C", "Carol", mutually_exclusive=False),
+        ]
+        diagnostics = build_generation_diagnostics(markets)
+        assert len(diagnostics) == 1
+        assert diagnostics[0].bucket_emitted is False
+        assert diagnostics[0].skip_reason is not None
+        assert "exchange_denied" in diagnostics[0].skip_reason
