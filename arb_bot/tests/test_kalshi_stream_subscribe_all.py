@@ -280,3 +280,56 @@ def test_stream_quotes_uses_legacy_when_flag_false():
 
     asyncio.get_event_loop().run_until_complete(_run())
     assert len(quotes) == 1
+
+
+def test_subscribe_all_background_enrichment_populates_cache():
+    """Background REST should enrich market_cache with event_ticker, title."""
+    adapter = _make_adapter(_make_settings(
+        stream_subscribe_all=True,
+        market_scan_pages=1,
+        market_page_size=100,
+        stream_priority_tickers=["KXENRICH-26-YES"],
+    ))
+
+    # Mock the REST paged fetcher to return market summaries
+    rest_summaries = [
+        {"ticker": "KXENRICH-26-YES", "event_ticker": "KXENRICH", "title": "Test Enriched", "yes_bid": 0.50, "yes_ask": 0.55},
+    ]
+
+    async def _fake_fetch_paged(*args, **kwargs):
+        return rest_summaries
+
+    adapter._fetch_market_summaries_paged = _fake_fetch_paged
+
+    async def _fake_backfill(summaries):
+        return summaries
+
+    adapter._backfill_priority_tickers_into_summaries = _fake_backfill
+
+    ack = json.dumps({"id": 1, "type": "subscribed", "msg": {}})
+    ticker_msg = json.dumps({
+        "type": "ticker",
+        "msg": {
+            "market_ticker": "KXENRICH-26-YES",
+            "yes_bid": 0.60,
+            "yes_ask": 0.65,
+            "no_bid": 0.30,
+            "no_ask": 0.40,
+            "open_interest": 100,
+        },
+    })
+    ws = FakeWebSocket([ack, ticker_msg])
+    quotes = []
+
+    async def _run():
+        with patch("arb_bot.exchanges.kalshi.websockets") as mock_ws:
+            mock_ws.connect.return_value = ws
+            async def _collect():
+                async for quote in adapter._stream_quotes_subscribe_all():
+                    quotes.append(quote)
+                    if len(quotes) >= 1:
+                        break
+            await asyncio.wait_for(_collect(), timeout=5.0)
+
+    asyncio.get_event_loop().run_until_complete(_run())
+    assert len(quotes) >= 1
