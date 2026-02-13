@@ -956,6 +956,29 @@ class KalshiAdapter(ExchangeAdapter):
                 return candidate
         return None
 
+    @staticmethod
+    def _derive_event_ticker(market_ticker: str) -> str:
+        """Derive event ticker from market ticker.
+
+        Kalshi tickers follow the pattern ``EVENT-DATE-CONTRACT`` where the
+        event ticker is the prefix up to the last two hyphen-separated tokens.
+        Examples:
+        - ``KXFED-26FEB-T4.50``  → ``KXFED``
+        - ``KXBTC-25MAR15-B100000`` → ``KXBTC``
+        - ``INXD-26FEB13``       → ``INXD``
+        - ``CPI-25JAN-B3.5``     → ``CPI``
+
+        Heuristic: strip trailing segments that contain a digit.
+        """
+        if not market_ticker:
+            return ""
+        parts = market_ticker.split("-")
+        # Walk backwards, stripping segments with digits until we have only
+        # the event ticker prefix.
+        while len(parts) > 1 and any(c.isdigit() for c in parts[-1]):
+            parts.pop()
+        return "-".join(parts)
+
     def _quote_from_ticker_message(
         self,
         message: dict[str, Any],
@@ -1003,22 +1026,36 @@ class KalshiAdapter(ExchangeAdapter):
             ("yesBidSize", "yes_bid_size"),
             ("yes_bid_quantity", "yes_bid_size"),
             ("yesBidQuantity", "yes_bid_size"),
+            ("yes_bid_size_fp", "yes_bid_size"),
+            ("yesBidSizeFp", "yes_bid_size"),
             ("yes_ask_size", "yes_ask_size"),
             ("yesAskSize", "yes_ask_size"),
             ("yes_ask_quantity", "yes_ask_size"),
             ("yesAskQuantity", "yes_ask_size"),
+            ("yes_ask_size_fp", "yes_ask_size"),
+            ("yesAskSizeFp", "yes_ask_size"),
             ("no_bid_size", "no_bid_size"),
             ("noBidSize", "no_bid_size"),
             ("no_bid_quantity", "no_bid_size"),
             ("noBidQuantity", "no_bid_size"),
+            ("no_bid_size_fp", "no_bid_size"),
+            ("noBidSizeFp", "no_bid_size"),
             ("no_ask_size", "no_ask_size"),
             ("noAskSize", "no_ask_size"),
             ("no_ask_quantity", "no_ask_size"),
             ("noAskQuantity", "no_ask_size"),
+            ("no_ask_size_fp", "no_ask_size"),
+            ("noAskSizeFp", "no_ask_size"),
+            ("last_trade_size_fp", "last_trade_size"),
+            ("lastTradeSizeFp", "last_trade_size"),
             ("volume", "volume"),
+            ("volume_fp", "volume"),
+            ("volumeFp", "volume"),
             ("volume_24h", "volume_24h"),
             ("liquidity", "liquidity"),
             ("liquidity_dollars", "liquidity_dollars"),
+            ("open_interest_fp", "open_interest"),
+            ("openInterestFp", "open_interest"),
             ("open_interest", "open_interest"),
             ("event_ticker", "event_ticker"),
             ("title", "title"),
@@ -1029,11 +1066,32 @@ class KalshiAdapter(ExchangeAdapter):
             value = message.get(src_key)
             if value is not None:
                 if src_key.endswith("_fp") or src_key.endswith("Fp"):
-                    normalized = self._normalize_stream_price(value)
-                    if normalized is not None:
-                        market[dst_key] = normalized
+                    # Quantity fields (size/volume/open_interest) are already
+                    # in contracts; parse as plain float.  Price fields
+                    # (*_bid_fp, *_ask_fp) need scale normalization.
+                    _sk = src_key.lower()
+                    is_size_field = (
+                        "size" in _sk or "trade" in _sk
+                        or "volume" in _sk or "interest" in _sk
+                    )
+                    if is_size_field:
+                        try:
+                            market[dst_key] = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                    else:
+                        normalized = self._normalize_stream_price(value)
+                        if normalized is not None:
+                            market[dst_key] = normalized
                     continue
                 market[dst_key] = value
+
+        # Derive event_ticker from market_ticker if not provided.
+        # Kalshi ticker format: "EVENT_TICKER-CONTRACT_SUFFIX" (e.g. "KXFED-26FEB-T4.50")
+        # The event ticker is everything up to the last dash-delimited token that
+        # contains a digit, or just the first segment.
+        if "event_ticker" not in market or not market.get("event_ticker"):
+            market["event_ticker"] = self._derive_event_ticker(ticker)
 
         market_cache[ticker] = market
         self._register_market_lookup_entry(
