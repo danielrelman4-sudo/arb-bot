@@ -333,3 +333,42 @@ def test_subscribe_all_background_enrichment_populates_cache():
 
     asyncio.get_event_loop().run_until_complete(_run())
     assert len(quotes) >= 1
+
+
+def test_fetch_quotes_uses_paged_scan_when_subscribe_all_active():
+    """When subscribe_all=True and stream_active, fetch_quotes uses paged scan not individual tickers."""
+    adapter = _make_adapter(_make_settings(
+        stream_subscribe_all=True,
+        stream_priority_tickers=["KXTICKER-26-YES", "KXTICKER-26-NO"],
+    ))
+    adapter._stream_active = True  # Simulate active stream
+
+    paged_called = []
+    ticker_called = []
+
+    async def _fake_paged(*args, **kwargs):
+        paged_called.append(True)
+        return [
+            {"ticker": "KXTICKER-26-YES", "yes_bid": 0.50, "yes_ask": 0.55,
+             "no_bid": 0.40, "no_ask": 0.50, "open_interest": 100},
+        ]
+
+    async def _fake_ticker_quotes(tickers):
+        ticker_called.append(tickers)
+        return []
+
+    async def _fake_backfill(summaries):
+        return summaries
+
+    adapter._fetch_market_summaries_paged = _fake_paged
+    adapter._fetch_ticker_quotes = _fake_ticker_quotes
+    adapter._backfill_priority_tickers_into_summaries = _fake_backfill
+
+    async def _run():
+        return await adapter._fetch_quotes_impl(force_full_scan=False)
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    # Should use paged scan, NOT individual ticker fetches
+    assert len(paged_called) == 1, "Expected paged scan to be called"
+    assert len(ticker_called) == 0, "Individual ticker fetch should NOT be called in subscribe-all mode"

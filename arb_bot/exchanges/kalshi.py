@@ -95,12 +95,15 @@ class KalshiAdapter(ExchangeAdapter):
         if (
             not force_full_scan
             and self._stream_active
+            and not self._settings.stream_subscribe_all
             and self._settings.stream_priority_tickers
         ):
-            # When the WebSocket stream is actively running, use individual ticker
-            # fetches for priority tickers (supplements real-time stream data).
-            # When stream is NOT active (poll-only mode), skip this and use the
-            # much more API-efficient paged scan + priority backfill below.
+            # When the legacy sharded WebSocket stream is actively running, use
+            # individual ticker fetches for priority tickers (supplements real-time
+            # stream data).  In subscribe-all mode the stream already covers all
+            # tickers, so fall through to the paged scan + backfill path instead.
+            # When stream is NOT active (poll-only mode), also skip this and use
+            # the much more API-efficient paged scan + priority backfill below.
             priority_limit = max(
                 1,
                 min(self._dynamic_priority_refresh_limit, max(1, self._settings.market_limit)),
