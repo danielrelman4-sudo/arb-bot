@@ -377,6 +377,9 @@ class StrategySettings:
     cross_venue_min_match_score: float = 0.62
     cross_venue_mapping_path: str | None = None
     cross_venue_mapping_required: bool = False
+    # B1: Max edge sanity gate — reject cross-venue edges above this
+    # threshold as likely mapping errors (e.g., run vs win mismatch).
+    cross_venue_max_edge_sanity: float = 0.30
     enable_fuzzy_cross_venue_fallback: bool = True
     enable_maker_estimates: bool = True
     discovery_mode: bool = False
@@ -501,10 +504,10 @@ class UniverseRankingSettings:
 @dataclass(frozen=True)
 class FillModelSettings:
     enabled: bool = True
-    min_fill_probability: float = 0.50
-    queue_depth_factor: float = 1.5
-    stale_quote_half_life_seconds: float = 20.0
-    spread_penalty_weight: float = 1.5
+    min_fill_probability: float = 0.30
+    queue_depth_factor: float = 1.0
+    stale_quote_half_life_seconds: float = 120.0
+    spread_penalty_weight: float = 1.0
     transform_source_penalty: float = 0.05
     partial_fill_penalty_per_contract: float = 0.0003
     min_fill_quality_score: float = -0.5
@@ -538,6 +541,7 @@ class KalshiSettings:
     stream_allow_rest_topup: bool = False
     stream_bootstrap_scan_pages: int = 3
     stream_bootstrap_enrich_limit: int = 0
+    stream_subscribe_all: bool = False
     market_tickers: List[str] = field(default_factory=list)
     market_limit: int = 40
     use_orderbook_quotes: bool = True
@@ -667,6 +671,17 @@ class AppSettings:
     # exceed min_hold time, freeing capital for new opportunities.
     paper_rolling_settlement_enabled: bool = False
     paper_rolling_settlement_min_hold_seconds: int = 120
+    # B2: Monte Carlo execution simulation for paper runs.
+    paper_monte_carlo_enabled: bool = True
+    paper_monte_carlo_legging_loss_fraction: float = 0.03
+    paper_monte_carlo_adverse_selection_probability: float = 0.15
+    paper_monte_carlo_adverse_selection_edge_loss: float = 0.5
+    paper_monte_carlo_slippage_std_cents: float = 0.5
+    paper_monte_carlo_slippage_max_cents: float = 2.0
+    paper_monte_carlo_expected_latency_seconds: float = 1.5
+    paper_monte_carlo_edge_decay_half_life_seconds: float = 30.0
+    paper_monte_carlo_resolution_success_rate: float = 0.95
+    paper_monte_carlo_seed: int | None = None
 
 
 
@@ -815,6 +830,46 @@ def load_settings() -> AppSettings:
             os.getenv("ARB_PAPER_ROLLING_SETTLEMENT_MIN_HOLD_SECONDS"),
             120,
         ),
+        paper_monte_carlo_enabled=_as_bool(
+            os.getenv("ARB_PAPER_MONTE_CARLO_ENABLED"),
+            True,
+        ),
+        paper_monte_carlo_legging_loss_fraction=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_LEGGING_LOSS_FRACTION"),
+            0.03,
+        ),
+        paper_monte_carlo_adverse_selection_probability=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_ADVERSE_SELECTION_PROBABILITY"),
+            0.15,
+        ),
+        paper_monte_carlo_adverse_selection_edge_loss=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_ADVERSE_SELECTION_EDGE_LOSS"),
+            0.5,
+        ),
+        paper_monte_carlo_slippage_std_cents=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_SLIPPAGE_STD_CENTS"),
+            0.5,
+        ),
+        paper_monte_carlo_slippage_max_cents=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_SLIPPAGE_MAX_CENTS"),
+            2.0,
+        ),
+        paper_monte_carlo_expected_latency_seconds=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_EXPECTED_LATENCY_SECONDS"),
+            1.5,
+        ),
+        paper_monte_carlo_edge_decay_half_life_seconds=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_EDGE_DECAY_HALF_LIFE_SECONDS"),
+            30.0,
+        ),
+        paper_monte_carlo_resolution_success_rate=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_RESOLUTION_SUCCESS_RATE"),
+            0.95,
+        ),
+        paper_monte_carlo_seed=_as_int(
+            os.getenv("ARB_PAPER_MONTE_CARLO_SEED"),
+            0,
+        ) or None,
         stream_mode=_as_bool(os.getenv("ARB_STREAM_MODE"), False),
         stream_recompute_cooldown_ms=_as_int(os.getenv("ARB_STREAM_RECOMPUTE_COOLDOWN_MS"), 400),
         stream_poll_decision_clock=_as_bool(os.getenv("ARB_STREAM_POLL_DECISION_CLOCK"), True),
@@ -864,6 +919,7 @@ def load_settings() -> AppSettings:
             cross_venue_min_match_score=_as_float(os.getenv("ARB_CROSS_VENUE_MIN_MATCH_SCORE"), 0.62),
             cross_venue_mapping_path=cross_map_path,
             cross_venue_mapping_required=_as_bool(os.getenv("ARB_CROSS_VENUE_MAPPING_REQUIRED"), False),
+            cross_venue_max_edge_sanity=_as_float(os.getenv("ARB_CROSS_VENUE_MAX_EDGE_SANITY"), 0.30),
             enable_fuzzy_cross_venue_fallback=_as_bool(os.getenv("ARB_ENABLE_FUZZY_CROSS_VENUE_FALLBACK"), True),
             enable_maker_estimates=_as_bool(os.getenv("ARB_ENABLE_MAKER_ESTIMATES"), True),
             discovery_mode=_as_bool(os.getenv("ARB_DISCOVERY_MODE"), False),
@@ -1051,10 +1107,10 @@ def load_settings() -> AppSettings:
         ),
         fill_model=FillModelSettings(
             enabled=_as_bool(os.getenv("ARB_FILL_MODEL_ENABLED"), True),
-            min_fill_probability=_as_float(os.getenv("ARB_FILL_MIN_PROBABILITY"), 0.50),
-            queue_depth_factor=_as_float(os.getenv("ARB_FILL_QUEUE_DEPTH_FACTOR"), 1.5),
-            stale_quote_half_life_seconds=_as_float(os.getenv("ARB_FILL_STALE_HALF_LIFE_SECONDS"), 20.0),
-            spread_penalty_weight=_as_float(os.getenv("ARB_FILL_SPREAD_PENALTY_WEIGHT"), 1.5),
+            min_fill_probability=_as_float(os.getenv("ARB_FILL_MIN_PROBABILITY"), 0.30),
+            queue_depth_factor=_as_float(os.getenv("ARB_FILL_QUEUE_DEPTH_FACTOR"), 1.0),
+            stale_quote_half_life_seconds=_as_float(os.getenv("ARB_FILL_STALE_HALF_LIFE_SECONDS"), 120.0),
+            spread_penalty_weight=_as_float(os.getenv("ARB_FILL_SPREAD_PENALTY_WEIGHT"), 1.0),
             transform_source_penalty=_as_float(os.getenv("ARB_FILL_TRANSFORM_SOURCE_PENALTY"), 0.05),
             partial_fill_penalty_per_contract=_as_float(os.getenv("ARB_FILL_PARTIAL_PENALTY_PER_CONTRACT"), 0.0003),
             min_fill_quality_score=_as_float(os.getenv("ARB_FILL_MIN_QUALITY_SCORE"), -0.5),
@@ -1115,6 +1171,7 @@ def load_settings() -> AppSettings:
             stream_allow_rest_topup=_as_bool(os.getenv("KALSHI_STREAM_ALLOW_REST_TOPUP"), False),
             stream_bootstrap_scan_pages=_as_int(os.getenv("KALSHI_STREAM_BOOTSTRAP_SCAN_PAGES"), 3),
             stream_bootstrap_enrich_limit=_as_int(os.getenv("KALSHI_STREAM_BOOTSTRAP_ENRICH_LIMIT"), 0),
+            stream_subscribe_all=_as_bool(os.getenv("KALSHI_STREAM_SUBSCRIBE_ALL"), False),
             market_tickers=_as_csv(os.getenv("KALSHI_MARKET_TICKERS")),
             market_limit=_as_int(os.getenv("KALSHI_MARKET_LIMIT"), 40),
             use_orderbook_quotes=_as_bool(os.getenv("KALSHI_USE_ORDERBOOK_QUOTES"), True),
