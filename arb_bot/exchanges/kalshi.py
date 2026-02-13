@@ -113,7 +113,16 @@ class KalshiAdapter(ExchangeAdapter):
             if priority_tickers:
                 return await self._fetch_ticker_quotes(priority_tickers)
 
-        summaries = await self._fetch_market_summaries_paged()
+        # In subscribe-all mode the stream provides real-time updates for ALL
+        # tickers.  The poll-refresh only needs a lightweight snapshot (3 pages,
+        # no orderbook, no backfill) to seed markets that haven't had stream
+        # activity yet.  The full 18-page scan + orderbook is too slow (>15s).
+        subscribe_all_active = self._stream_active and self._settings.stream_subscribe_all
+
+        if subscribe_all_active:
+            summaries = await self._fetch_market_summaries_paged(max_pages_override=3)
+        else:
+            summaries = await self._fetch_market_summaries_paged()
         if not summaries:
             summaries = await self._fetch_market_summaries_from_events_cached()
         if not summaries:
@@ -122,10 +131,14 @@ class KalshiAdapter(ExchangeAdapter):
         # Phase 8B: In poll mode, backfill priority tickers that the paged scan missed.
         # This ensures cross-venue and structural rule tickers get refreshed every cycle,
         # even when Kalshi's paginated API returns a different set of popular markets.
-        if self._settings.stream_priority_tickers:
+        # Skip backfill in subscribe-all mode — the background enrichment handles it.
+        if self._settings.stream_priority_tickers and not subscribe_all_active:
             summaries = await self._backfill_priority_tickers_into_summaries(summaries)
 
-        if self._settings.use_orderbook_quotes:
+        # In subscribe-all mode, skip orderbook fetches — the stream provides
+        # real-time bid/ask from ticker messages.  This avoids hundreds of
+        # concurrent HTTP calls that would time out the poll-refresh.
+        if self._settings.use_orderbook_quotes and not subscribe_all_active:
             quotes = await self._fetch_quotes_from_market_summaries(summaries)
         else:
             quotes = []
