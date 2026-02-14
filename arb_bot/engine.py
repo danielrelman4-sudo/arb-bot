@@ -226,7 +226,8 @@ class ArbEngine:
         venues = {adapter.venue for adapter in self._exchanges.values()}
         cash_map = {venue: self._settings.default_bankroll_usd for venue in venues}
         for venue, value in self._settings.bankroll_by_venue.items():
-            cash_map[venue] = value
+            if venue in venues:
+                cash_map[venue] = value
         return cash_map
 
     def _build_exchanges(self) -> dict[str, ExchangeAdapter]:
