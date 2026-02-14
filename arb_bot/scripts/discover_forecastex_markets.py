@@ -297,6 +297,134 @@ async def discover_via_tws(
 # Output
 # ---------------------------------------------------------------------------
 
+async def build_conid_catalog(
+    host: str = "127.0.0.1",
+    port: int = 4001,
+    client_id: int = 52,
+    output_path: str = "arb_bot/config/forecastex_conid_catalog.json",
+    search_terms: Optional[List[str]] = None,
+) -> int:
+    """Build a conId catalog using the reliable discovery path.
+
+    Strategy:
+      1. ``reqMatchingSymbols`` to find underlying ForecastEx symbols
+      2. ``reqContractDetailsAsync`` per symbol (with generous pacing)
+      3. Save all resolved contracts to JSON catalog
+
+    This avoids the blank-query pattern that triggers IBKR's penalty box.
+    Run once when IBKR pacing limits have cooled off.  The adapter will
+    use the catalog on subsequent startups.
+    """
+    if ibasync is None:
+        print("ERROR: ib_insync/ib_async not installed.")
+        return 1
+
+    print("\n" + "=" * 60)
+    print("BUILDING conId CATALOG")
+    print("=" * 60)
+
+    ib = ibasync.IB()
+    print("Connecting to %s:%d ..." % (host, port))
+    try:
+        await ib.connectAsync(host, port, clientId=client_id, timeout=30)
+    except Exception as exc:
+        print("ERROR: %s" % exc)
+        return 1
+    print("Connected. Account: %s" % ib.managedAccounts())
+    await asyncio.sleep(2)
+
+    # Phase 1: symbol discovery
+    if search_terms is None:
+        search_terms = [
+            "fed", "cpi", "gdp", "bitcoin", "election", "trump", "tariff",
+            "unemployment", "inflation", "gold", "oil", "treasury", "yield",
+            "housing", "rate", "senate", "president", "governor", "ethereum",
+            "debt", "deficit", "jobs", "payroll", "consumer", "temperature",
+            "climate", "energy", "crypto", "manufacturing", "congress",
+            "mayor", "vote", "party", "democrat", "republican",
+            "sp500", "nasdaq", "commodity", "copper", "silver",
+        ]
+
+    fx_symbols: Dict[str, int] = {}
+    for term in search_terms:
+        try:
+            matches = await asyncio.wait_for(
+                ib.reqMatchingSymbolsAsync(term), timeout=5,
+            )
+            if matches:
+                for m in matches:
+                    if "EC" in (m.derivativeSecTypes or []):
+                        sym = m.contract.symbol
+                        if sym not in fx_symbols:
+                            fx_symbols[sym] = m.contract.conId
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+    print("\nFound %d underlying symbols" % len(fx_symbols))
+
+    # Phase 2: fetch contract details per symbol
+    catalog = []
+    successes = 0
+    timeouts = 0
+
+    for i, (sym, _) in enumerate(sorted(fx_symbols.items())):
+        c = ibasync.Contract(
+            symbol=sym, secType="OPT",
+            exchange="FORECASTX", currency="USD",
+        )
+        try:
+            details = await asyncio.wait_for(
+                ib.reqContractDetailsAsync(c), timeout=15,
+            )
+            if details:
+                successes += 1
+                for d in details:
+                    cc = d.contract
+                    catalog.append({
+                        "conid": cc.conId,
+                        "symbol": cc.symbol,
+                        "right": cc.right,
+                        "strike": cc.strike,
+                        "expiry": cc.lastTradeDateOrContractMonth,
+                        "trading_class": cc.tradingClass,
+                        "multiplier": cc.multiplier,
+                        "long_name": getattr(d, "longName", ""),
+                    })
+                sys.stdout.write(
+                    "  [%d/%d] %s: %d contracts\n" % (i + 1, len(fx_symbols), sym, len(details))
+                )
+            else:
+                sys.stdout.write("  [%d/%d] %s: 0\n" % (i + 1, len(fx_symbols), sym))
+            sys.stdout.flush()
+        except asyncio.TimeoutError:
+            timeouts += 1
+            sys.stdout.write("  [%d/%d] %s: timeout\n" % (i + 1, len(fx_symbols), sym))
+            sys.stdout.flush()
+            await asyncio.sleep(2)  # extra backoff
+            if timeouts >= 3:
+                print("\n  3 consecutive timeouts — likely in penalty box.")
+                print("  Wait 10 min and retry. Saving %d contracts found so far." % len(catalog))
+                break
+        except Exception as exc:
+            sys.stdout.write("  [%d/%d] %s: %s\n" % (i + 1, len(fx_symbols), sym, exc))
+            sys.stdout.flush()
+
+        await asyncio.sleep(1.5)  # generous pacing
+
+    ib.disconnect()
+
+    # Save
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(catalog, f, indent=2)
+    print("\nSaved %d contracts to %s (%d symbols succeeded, %d timed out)" % (
+        len(catalog), out, successes, timeouts,
+    ))
+    return 0
+
+
 def save_markets_csv(markets: List[ForecastMarket], path: Path) -> None:
     """Save discovered markets to CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -343,7 +471,25 @@ def main() -> int:
         default="arb_bot/config",
         help="Directory to save output CSVs"
     )
+    parser.add_argument(
+        "--build-catalog", action="store_true",
+        help="Build conId catalog JSON using reqMatchingSymbols + reqContractDetails"
+    )
+    parser.add_argument(
+        "--catalog-output", type=str,
+        default="arb_bot/config/forecastex_conid_catalog.json",
+        help="Output path for conId catalog JSON"
+    )
     args = parser.parse_args()
+
+    # Build-catalog mode: standalone path
+    if args.build_catalog:
+        return asyncio.run(build_conid_catalog(
+            host=args.tws_host,
+            port=args.tws_port,
+            client_id=args.client_id,
+            output_path=args.catalog_output,
+        ))
 
     output_dir = Path(args.output_dir)
     markets: List[ForecastMarket] = []

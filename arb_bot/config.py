@@ -633,6 +633,8 @@ class ForecastExSettings:
     priority_symbols: List[str] = field(default_factory=list)
     # Symbols to exclude from discovery
     exclude_symbols: List[str] = field(default_factory=list)
+    # Path to pre-built conId catalog JSON (speeds up startup, avoids penalty box)
+    conid_catalog_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -1270,5 +1272,6 @@ def load_settings() -> AppSettings:
             payout_per_contract=_as_float(os.getenv("FORECASTEX_PAYOUT_PER_CONTRACT"), 1.0),
             priority_symbols=_as_csv(os.getenv("FORECASTEX_PRIORITY_SYMBOLS")),
             exclude_symbols=_as_csv(os.getenv("FORECASTEX_EXCLUDE_SYMBOLS")),
+            conid_catalog_path=os.getenv("FORECASTEX_CONID_CATALOG_PATH", ""),
         ),
     )
