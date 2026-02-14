@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from arb_bot.config import AppSettings, LaneTuningSettings
+from arb_bot.control_socket import ControlSocket
 from arb_bot.correlation import CorrelationAssessment, CorrelationConstraintModel
 from arb_bot.fill_model import CorrelationMode, FillEstimate, FillModel
 from arb_bot.monte_carlo_sim import MonteCarloResult, MonteCarloSettings, MonteCarloSimulator
@@ -217,6 +218,9 @@ class ArbEngine:
         self._lane_dynamic_fill_probability_delta: dict[OpportunityKind, float] = {
             kind: 0.0 for kind in OpportunityKind
         }
+        self._control_socket: ControlSocket | None = None
+        self._cycle_count: int = 0
+        self._engine_started_at: float = time.time()
 
     def _initial_cash_map(self) -> dict[str, float]:
         venues = {adapter.venue for adapter in self._exchanges.values()}
@@ -248,6 +252,14 @@ class ArbEngine:
     async def run_forever(self, run_once: bool | None = None) -> None:
         single = self._settings.run_once if run_once is None else run_once
 
+        if self._settings.control_socket_port > 0:
+            self._control_socket = ControlSocket(
+                port=self._settings.control_socket_port,
+                on_config_update=self._handle_config_update,
+                kill_switch_path=self._settings.risk.kill_switch_file,
+            )
+            await self._control_socket.start()
+
         try:
             if self._settings.stream_mode and not single:
                 await self._run_stream_loop()
@@ -265,6 +277,8 @@ class ArbEngine:
                 if sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
         finally:
+            if self._control_socket is not None:
+                await self._control_socket.stop()
             await self.aclose()
 
     async def run_once(self) -> CycleReport:
@@ -273,7 +287,100 @@ class ArbEngine:
             await self._refresh_venue_balances()
 
         quotes = await self._fetch_all_quotes()
-        return await self._evaluate_quotes(quotes, started_at)
+        report = await self._evaluate_quotes(quotes, started_at)
+        self._cycle_count += 1
+
+        if self._control_socket is not None and self._control_socket.client_count > 0:
+            try:
+                await self._control_socket.push_state(self._build_state_snapshot(report))
+            except Exception:
+                LOGGER.debug("control socket push failed", exc_info=True)
+
+        return report
+
+    def _build_state_snapshot(self, report: CycleReport) -> dict:
+        """Build a JSON-serialisable state dict for the dashboard."""
+        state = self._state
+        return {
+            "type": "state",
+            "ts": time.time(),
+            "cycle": self._cycle_count,
+            "mode": "live" if self._settings.live_mode else "paper",
+            "uptime_seconds": time.time() - self._engine_started_at,
+            "cash_by_venue": dict(state.cash_by_venue),
+            "locked_capital_by_venue": dict(state.locked_capital_by_venue),
+            "open_positions": [
+                {"market_id": m, "venue": v}
+                for v, markets in state.open_markets_by_venue.items()
+                for m in markets
+            ],
+            "last_cycle": {
+                "duration_ms": int(
+                    (report.ended_at - report.started_at).total_seconds() * 1000
+                ),
+                "quotes_count": report.quotes_count,
+                "opportunities_found": report.opportunities_count,
+                "near_opportunities": report.near_opportunities_count,
+                "decisions": [
+                    {
+                        "action": d.action,
+                        "kind": str(d.opportunity.kind.value) if d.opportunity else "",
+                        "match_key": getattr(d.opportunity, "match_key", ""),
+                        "reason": d.reason,
+                        "edge": d.metrics.get("detected_edge_per_contract", 0),
+                        "fill_prob": d.metrics.get("fill_probability", 0),
+                    }
+                    for d in report.decisions
+                ],
+            },
+            "stream_status": {},
+            "daily_pnl": 0.0,
+            "daily_trades": 0,
+            "daily_loss_cap_remaining": 0.0,
+            "consecutive_failures": 0,
+            "config_snapshot": self._config_snapshot(),
+        }
+
+    def _config_snapshot(self) -> dict[str, object]:
+        """Extract key tunable settings for the dashboard."""
+        s = self._settings
+        return {
+            "ARB_LIVE_MODE": s.live_mode,
+            "ARB_DAILY_LOSS_CAP_USD": getattr(s.risk, "daily_loss_cap_usd", 0),
+            "ARB_MAX_DOLLARS_PER_TRADE": s.sizing.max_dollars_per_trade,
+            "ARB_MAX_CONTRACTS_PER_TRADE": s.sizing.max_contracts_per_trade,
+            "ARB_MAX_BANKROLL_FRACTION_PER_TRADE": s.sizing.max_bankroll_fraction_per_trade,
+            "ARB_MARKET_COOLDOWN_SECONDS": s.risk.market_cooldown_seconds,
+            "ARB_LANE_STRUCTURAL_BUCKET_ENABLED": s.lanes.structural_bucket.enabled,
+            "ARB_LANE_CROSS_ENABLED": s.lanes.cross_venue.enabled,
+            "ARB_LANE_STRUCTURAL_PARITY_ENABLED": s.lanes.structural_parity.enabled,
+            "ARB_MAX_BUCKET_LEGS": s.strategy.max_bucket_legs,
+            "ARB_MAX_BUCKET_CONSECUTIVE_FAILURES": s.strategy.max_consecutive_bucket_failures,
+        }
+
+    async def _handle_config_update(self, key: str, value: object) -> dict:
+        """Handle a config update from the dashboard."""
+        import os as _os
+        NOT_HOT_RELOADABLE = {
+            "KALSHI_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_PRIVATE_KEY_PEM",
+            "ARB_STRUCTURAL_RULES_PATH", "ARB_CONTROL_SOCKET_PORT",
+        }
+        if key in NOT_HOT_RELOADABLE:
+            return {"ok": False, "error": "requires_restart"}
+
+        snapshot = self._config_snapshot()
+        if key not in snapshot:
+            return {"ok": False, "error": f"unknown key: {key}"}
+
+        old = snapshot[key]
+        _os.environ[key] = str(value)
+        try:
+            from arb_bot.config import load_settings
+            new_settings = load_settings()
+            self._settings = new_settings
+            return {"ok": True, "old": old, "new": value}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     async def _run_stream_loop(self) -> None:
         quote_cache: dict[tuple[str, str], object] = {}
