@@ -105,6 +105,7 @@ class ArbitrageFinder:
         bucket_quality_thompson_prior_alpha: float = 1.0,
         bucket_quality_thompson_prior_beta: float = 1.0,
         max_bucket_legs: int = 0,
+        max_consecutive_bucket_failures: int = 3,
     ) -> None:
         self._min_net_edge_per_contract = min_net_edge_per_contract
         self._max_bucket_legs = max_bucket_legs
@@ -145,6 +146,7 @@ class ArbitrageFinder:
                 use_thompson_sampling=bucket_quality_use_thompson_sampling,
                 thompson_prior_alpha=bucket_quality_thompson_prior_alpha,
                 thompson_prior_beta=bucket_quality_thompson_prior_beta,
+                max_consecutive_bucket_failures=max_consecutive_bucket_failures,
             )
             LOGGER.info(self._bucket_quality_model.summary())
 

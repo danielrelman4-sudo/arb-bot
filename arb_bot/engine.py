@@ -175,6 +175,7 @@ class ArbEngine:
             bucket_quality_leg_count_penalty=settings.strategy.bucket_quality_leg_count_penalty,
             bucket_quality_live_update_interval=settings.strategy.bucket_quality_live_update_interval,
             max_bucket_legs=settings.strategy.max_bucket_legs,
+            max_consecutive_bucket_failures=settings.strategy.max_consecutive_bucket_failures,
         )
         self._lanes: tuple[OpportunityLane, ...] = (
             OpportunityLane(OpportunityKind.INTRA_VENUE, settings.lanes.intra_venue),

@@ -421,6 +421,9 @@ class StrategySettings:
     # are filtered at detection time because multi-leg fill probability
     # decays exponentially, making them untradeable.
     max_bucket_legs: int = 0  # 0 = unlimited (no filter)
+    # Maximum consecutive execution failures per bucket before disabling it
+    # for the session. Prevents bleeding on illiquid buckets. 0 = unlimited.
+    max_consecutive_bucket_failures: int = 3
 
 
 @dataclass(frozen=True)
@@ -1026,6 +1029,10 @@ def load_settings() -> AppSettings:
             max_bucket_legs=_as_int(
                 os.getenv("ARB_MAX_BUCKET_LEGS"),
                 0,
+            ),
+            max_consecutive_bucket_failures=_as_int(
+                os.getenv("ARB_MAX_BUCKET_CONSECUTIVE_FAILURES"),
+                3,
             ),
         ),
         lanes=OpportunityLaneSettings(

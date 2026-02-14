@@ -177,3 +177,167 @@ def test_bucket_quality_without_history_keeps_full_universe_active() -> None:
         live_update_interval=1000,
     )
     assert model.active_bucket_ids == {"B1", "B2", "B3"}
+
+
+# ── consecutive failure limit tests ──────────────────────────────
+
+
+def _observe(model: BucketQualityModel, group_id: str, action: str) -> None:
+    """Helper to record an observation with minimal required fields."""
+    model.observe_decision(
+        group_id=group_id,
+        action=action,
+        detected_edge_per_contract=0.02,
+        fill_probability=0.8,
+        expected_realized_profit=0.01,
+        realized_profit=0.01 if action == "filled" else None,
+        expected_slippage_per_contract=0.001,
+        execution_latency_ms=100.0,
+    )
+
+
+def test_consecutive_failures_disable_bucket() -> None:
+    """After max_consecutive_bucket_failures execution failures, bucket is disabled."""
+    model = BucketQualityModel(
+        bucket_leg_counts={"B1": 3, "B2": 3},
+        enabled=True,
+        history_glob="",
+        max_consecutive_bucket_failures=3,
+        live_update_interval=10000,
+    )
+    assert model.should_enable_bucket("B1") is True
+
+    _observe(model, "B1", "execution_failed")
+    _observe(model, "B1", "execution_failed")
+    assert model.should_enable_bucket("B1") is True  # 2 < 3
+
+    _observe(model, "B1", "execution_failed")
+    assert model.should_enable_bucket("B1") is False  # 3 >= 3
+
+    # B2 should be unaffected
+    assert model.should_enable_bucket("B2") is True
+
+
+def test_consecutive_failures_reset_on_fill() -> None:
+    """A successful fill resets the consecutive failure counter."""
+    model = BucketQualityModel(
+        bucket_leg_counts={"B1": 3},
+        enabled=True,
+        history_glob="",
+        max_consecutive_bucket_failures=3,
+        live_update_interval=10000,
+    )
+    _observe(model, "B1", "execution_failed")
+    _observe(model, "B1", "execution_failed")
+    assert model.should_enable_bucket("B1") is True  # 2 < 3
+
+    _observe(model, "B1", "filled")
+    assert model.should_enable_bucket("B1") is True  # reset to 0
+
+    # Can fail again up to limit
+    _observe(model, "B1", "execution_failed")
+    _observe(model, "B1", "execution_failed")
+    _observe(model, "B1", "execution_failed")
+    assert model.should_enable_bucket("B1") is False
+
+
+def test_consecutive_failures_skips_dont_count() -> None:
+    """Skipped opportunities should not increment the failure counter."""
+    model = BucketQualityModel(
+        bucket_leg_counts={"B1": 3},
+        enabled=True,
+        history_glob="",
+        max_consecutive_bucket_failures=2,
+        live_update_interval=10000,
+    )
+    _observe(model, "B1", "execution_failed")
+    _observe(model, "B1", "skipped")  # should not increment
+    assert model.should_enable_bucket("B1") is True  # still at 1
+
+    _observe(model, "B1", "execution_failed")
+    assert model.should_enable_bucket("B1") is False  # now at 2
+
+
+def test_consecutive_failures_zero_means_unlimited() -> None:
+    """max_consecutive_bucket_failures=0 means no limit."""
+    model = BucketQualityModel(
+        bucket_leg_counts={"B1": 3},
+        enabled=True,
+        history_glob="",
+        max_consecutive_bucket_failures=0,
+        live_update_interval=10000,
+    )
+    for _ in range(20):
+        _observe(model, "B1", "execution_failed")
+    assert model.should_enable_bucket("B1") is True
+
+
+def test_consecutive_failures_excluded_from_thompson_select() -> None:
+    """Failure-limited buckets should not appear in Thompson sampling active set."""
+    model = BucketQualityModel(
+        bucket_leg_counts={"B1": 3, "B2": 3},
+        enabled=True,
+        history_glob="",
+        max_consecutive_bucket_failures=2,
+        max_active_buckets=0,  # unlimited capacity
+        live_update_interval=10000,
+        use_thompson_sampling=True,
+    )
+    # Give B1 some history so it has an accumulator
+    _observe(model, "B1", "execution_failed")
+    _observe(model, "B1", "execution_failed")
+
+    # Force recompute
+    model._recompute_active_set()
+
+    # B1 should not be in active set
+    assert "B1" not in model.active_bucket_ids
+    assert "B2" in model.active_bucket_ids
+
+
+def test_consecutive_failures_excluded_from_deterministic_select() -> None:
+    """Failure-limited buckets should not appear in deterministic selection."""
+    model = BucketQualityModel(
+        bucket_leg_counts={"B1": 3, "B2": 3},
+        enabled=True,
+        history_glob="",
+        max_consecutive_bucket_failures=2,
+        max_active_buckets=0,
+        live_update_interval=10000,
+        use_thompson_sampling=False,
+    )
+    _observe(model, "B1", "execution_failed")
+    _observe(model, "B1", "execution_failed")
+
+    model._recompute_active_set()
+
+    assert "B1" not in model.active_bucket_ids
+    assert "B2" in model.active_bucket_ids
+
+
+def test_consecutive_failures_settled_resets_counter() -> None:
+    """A settled action (positive outcome) should also reset failures."""
+    model = BucketQualityModel(
+        bucket_leg_counts={"B1": 3},
+        enabled=True,
+        history_glob="",
+        max_consecutive_bucket_failures=2,
+        live_update_interval=10000,
+    )
+    _observe(model, "B1", "execution_failed")
+
+    # Settled also resets (same as filled — successful trade)
+    model.observe_decision(
+        group_id="B1",
+        action="settled",
+        detected_edge_per_contract=0.02,
+        fill_probability=0.8,
+        expected_realized_profit=0.01,
+        realized_profit=0.01,
+        expected_slippage_per_contract=0.001,
+        execution_latency_ms=100.0,
+    )
+    assert model.should_enable_bucket("B1") is True
+
+    _observe(model, "B1", "execution_failed")
+    assert model.should_enable_bucket("B1") is True  # only 1 failure since reset
