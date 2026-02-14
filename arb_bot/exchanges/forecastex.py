@@ -14,15 +14,31 @@ adapter degrades gracefully and raises on any live call.
 
 Fee structure: $0.01 per YES/NO pair ($0.005 per individual contract).
 Order types: DAY, GTC, IOC only.
+
+Discovery strategy
+------------------
+IBKR's ``reqContractDetailsAsync`` is subject to aggressive pacing limits and
+a 10-minute penalty box on violation.  We therefore use a multi-tier approach:
+
+1. **Pre-built conId catalog** (fastest) — JSON file with conIds from a
+   previous discovery run.  Contracts are resolved via ``qualifyContractsAsync``
+   which is fast, reliable, and not subject to the penalty box.
+2. **Symbol search + per-symbol detail** — ``reqMatchingSymbols`` to find
+   ForecastEx underlying indices, then ``reqContractDetailsAsync`` one symbol
+   at a time with generous pacing.  Results are cached to the catalog file.
+3. **Fallback** — return whatever is in the cache from a previous run.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from arb_bot.models import (
@@ -178,6 +194,16 @@ class ForecastExAdapter(ExchangeAdapter):
 
     venue = "forecastex"
 
+    # Default search terms for symbol discovery via reqMatchingSymbols.
+    # Each yields ForecastEx underlyings with derivativeSecTypes=['EC'].
+    _DISCOVERY_SEARCH_TERMS: List[str] = [
+        "fed", "cpi", "gdp", "bitcoin", "election", "trump", "tariff",
+        "unemployment", "inflation", "gold", "oil", "treasury", "yield",
+        "housing", "rate", "senate", "president", "governor", "ethereum",
+        "debt", "deficit", "jobs", "payroll", "consumer", "temperature",
+        "climate", "energy", "crypto", "manufacturing", "congress",
+    ]
+
     def __init__(
         self,
         settings: ForecastExSettings,
@@ -197,13 +223,25 @@ class ForecastExAdapter(ExchangeAdapter):
             burst_size=8,
         )
 
-        # Contract cache: symbol -> contract details
+        # Contract cache: key -> contract detail (or qualified contract)
         self._contract_cache: Dict[str, Any] = {}
         self._contract_cache_ts: float = 0.0
         self._contract_cache_ttl_seconds: float = 300.0
 
+        # Resolved contracts: conId -> qualified Contract object
+        self._qualified_contracts: Dict[int, Any] = {}
+
         # Quote cache for deduplication during streaming
         self._last_quotes: Dict[str, BinaryQuote] = {}
+
+        # Path to conId catalog file (JSON).  Populated from settings or
+        # default location next to the config directory.
+        self._catalog_path: str = getattr(
+            settings, "conid_catalog_path", ""
+        ) or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "config", "forecastex_conid_catalog.json",
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -322,9 +360,13 @@ class ForecastExAdapter(ExchangeAdapter):
     async def _discover_contracts(self) -> List[Any]:
         """Discover available ForecastEx event contracts.
 
-        Uses reqContractDetails with a partial Contract specification to
-        enumerate available events.  Results are cached for
-        ``_contract_cache_ttl_seconds``.
+        Multi-tier discovery strategy (see module docstring):
+
+        1. If a conId catalog JSON exists, load conIds and resolve via
+           ``qualifyContractsAsync`` (fast, penalty-box-safe).
+        2. Otherwise, use ``reqMatchingSymbols`` → ``reqContractDetailsAsync``
+           per symbol.  Results are saved to the catalog for future runs.
+        3. If all else fails, return whatever is in the in-memory cache.
         """
         if not self._ib or not self._connected:
             LOGGER.warning("ForecastEx: not connected, cannot discover contracts")
@@ -337,32 +379,233 @@ class ForecastExAdapter(ExchangeAdapter):
         ):
             return list(self._contract_cache.values())
 
-        try:
-            # Rate-limit the discovery request
-            await self._rate_limiter.acquire()
-
-            # Request all available ForecastEx option contracts
-            partial = ibasync.Contract(
-                secType="OPT",
-                exchange="FORECASTX",
-                currency="USD",
-            )
-            details_list = await self._ib.reqContractDetailsAsync(partial)
-            contracts = []
-            for detail in (details_list or []):
-                contract = detail.contract
-                key = f"{contract.symbol}_{contract.right}_{contract.lastTradeDateOrContractMonth}"
-                self._contract_cache[key] = detail
-                contracts.append(detail)
-
+        # --- Tier 1: conId catalog ----------------------------------------
+        contracts = await self._discover_from_catalog()
+        if contracts:
             self._contract_cache_ts = now
-            LOGGER.info(
-                "ForecastEx: discovered %d contract details", len(contracts)
-            )
             return contracts
+
+        # --- Tier 2: live symbol search + per-symbol detail ----------------
+        contracts = await self._discover_from_search()
+        if contracts:
+            self._contract_cache_ts = now
+            # Persist for next startup
+            self._save_catalog()
+            return contracts
+
+        # --- Tier 3: stale cache fallback ----------------------------------
+        LOGGER.warning("ForecastEx: all discovery tiers failed, using stale cache")
+        return list(self._contract_cache.values())
+
+    # ------------------------------------------------------------------
+    # Tier 1: conId catalog
+    # ------------------------------------------------------------------
+
+    async def _discover_from_catalog(self) -> List[Any]:
+        """Load contracts from a pre-built conId catalog JSON and qualify."""
+        if not os.path.exists(self._catalog_path):
+            LOGGER.info("ForecastEx: no catalog at %s, skipping tier 1", self._catalog_path)
+            return []
+
+        try:
+            with open(self._catalog_path) as f:
+                entries = json.load(f)
         except Exception as exc:
-            LOGGER.error("ForecastEx: contract discovery failed: %s", exc)
-            return list(self._contract_cache.values())
+            LOGGER.warning("ForecastEx: failed to load catalog: %s", exc)
+            return []
+
+        if not entries:
+            return []
+
+        LOGGER.info("ForecastEx: catalog has %d entries, qualifying...", len(entries))
+
+        # Build Contract objects from conIds and qualify in batches
+        batch_size = 40  # IBKR allows ~50 concurrent qualifications safely
+        qualified_details: List[Any] = []
+
+        for i in range(0, len(entries), batch_size):
+            batch = entries[i : i + batch_size]
+            contracts_to_qualify = []
+            for entry in batch:
+                conid = entry.get("conid")
+                if conid and conid not in self._qualified_contracts:
+                    c = ibasync.Contract(conId=int(conid))
+                    contracts_to_qualify.append(c)
+
+            if contracts_to_qualify:
+                try:
+                    await self._rate_limiter.acquire()
+                    resolved = await asyncio.wait_for(
+                        self._ib.qualifyContractsAsync(*contracts_to_qualify),
+                        timeout=min(15.0, 5.0 + len(contracts_to_qualify) * 0.2),
+                    )
+                    for c in resolved:
+                        if c.conId:
+                            self._qualified_contracts[c.conId] = c
+                except asyncio.TimeoutError:
+                    LOGGER.warning(
+                        "ForecastEx: catalog qualify timeout batch %d-%d",
+                        i, i + len(batch),
+                    )
+                except Exception as exc:
+                    LOGGER.warning("ForecastEx: catalog qualify error: %s", exc)
+
+                await asyncio.sleep(0.3)
+
+        # Build detail-like wrappers from qualified contracts so the rest
+        # of the pipeline can work uniformly.  We also pair the metadata
+        # from the catalog (long_name etc.).
+        entry_by_conid = {e.get("conid"): e for e in entries if e.get("conid")}
+
+        for conid, contract in self._qualified_contracts.items():
+            if getattr(contract, "exchange", "") != "FORECASTX":
+                continue
+            key = (
+                f"{contract.symbol}_{contract.right}"
+                f"_{contract.lastTradeDateOrContractMonth}"
+            )
+            meta = entry_by_conid.get(conid, {})
+            wrapper = _ContractDetailWrapper(contract, meta.get("long_name", ""))
+            self._contract_cache[key] = wrapper
+            qualified_details.append(wrapper)
+
+        LOGGER.info(
+            "ForecastEx: catalog resolved %d contracts (%d qualified)",
+            len(qualified_details),
+            len(self._qualified_contracts),
+        )
+        return qualified_details
+
+    # ------------------------------------------------------------------
+    # Tier 2: live symbol search
+    # ------------------------------------------------------------------
+
+    async def _discover_from_search(self) -> List[Any]:
+        """Discover contracts via reqMatchingSymbols → reqContractDetails.
+
+        Searches for ForecastEx underlying symbols, then fetches contract
+        details one symbol at a time with generous pacing to avoid the
+        penalty box.
+        """
+        if not self._ib:
+            return []
+
+        # Phase 1: find underlying symbols
+        fx_symbols: Dict[str, int] = {}  # symbol -> underlying conId
+        for term in self._DISCOVERY_SEARCH_TERMS:
+            try:
+                await self._rate_limiter.acquire()
+                matches = await asyncio.wait_for(
+                    self._ib.reqMatchingSymbolsAsync(term), timeout=5.0,
+                )
+                if matches:
+                    for m in matches:
+                        derivs = m.derivativeSecTypes or []
+                        if "EC" in derivs:
+                            sym = m.contract.symbol
+                            if sym not in fx_symbols:
+                                fx_symbols[sym] = m.contract.conId
+                await asyncio.sleep(0.3)
+            except (asyncio.TimeoutError, Exception):
+                continue
+
+        if not fx_symbols:
+            LOGGER.warning("ForecastEx: symbol search found 0 underlyings")
+            return []
+
+        LOGGER.info(
+            "ForecastEx: symbol search found %d underlyings", len(fx_symbols)
+        )
+
+        # Apply priority / exclude filters
+        if self._settings.priority_symbols:
+            priority = set(self._settings.priority_symbols)
+            ordered = [s for s in fx_symbols if s in priority]
+            ordered += [s for s in fx_symbols if s not in priority]
+        else:
+            ordered = sorted(fx_symbols.keys())
+
+        exclude = set(self._settings.exclude_symbols)
+        ordered = [s for s in ordered if s not in exclude]
+
+        # Phase 2: fetch contract details per symbol
+        all_details: List[Any] = []
+        for sym in ordered:
+            c = ibasync.Contract(
+                symbol=sym, secType="OPT",
+                exchange="FORECASTX", currency="USD",
+            )
+            try:
+                await self._rate_limiter.acquire()
+                details = await asyncio.wait_for(
+                    self._ib.reqContractDetailsAsync(c),
+                    timeout=15.0,
+                )
+                if details:
+                    for d in details:
+                        contract = d.contract
+                        key = (
+                            f"{contract.symbol}_{contract.right}"
+                            f"_{contract.lastTradeDateOrContractMonth}"
+                        )
+                        self._contract_cache[key] = d
+                        self._qualified_contracts[contract.conId] = contract
+                        all_details.append(d)
+                await asyncio.sleep(1.0)  # generous pacing
+            except asyncio.TimeoutError:
+                LOGGER.debug("ForecastEx: reqContractDetails timeout for %s", sym)
+                await asyncio.sleep(2.0)  # extra backoff on timeout
+            except Exception as exc:
+                LOGGER.debug("ForecastEx: reqContractDetails error for %s: %s", sym, exc)
+
+        LOGGER.info(
+            "ForecastEx: search discovered %d contracts from %d symbols",
+            len(all_details), len(ordered),
+        )
+        return all_details
+
+    # ------------------------------------------------------------------
+    # Catalog persistence
+    # ------------------------------------------------------------------
+
+    def _save_catalog(self) -> None:
+        """Persist the current qualified contracts to the catalog JSON."""
+        entries = []
+        for conid, contract in self._qualified_contracts.items():
+            if getattr(contract, "exchange", "") != "FORECASTX":
+                continue
+            # Try to find long_name from cache
+            key = (
+                f"{contract.symbol}_{contract.right}"
+                f"_{contract.lastTradeDateOrContractMonth}"
+            )
+            cached = self._contract_cache.get(key)
+            long_name = ""
+            if cached:
+                long_name = getattr(cached, "longName", "") or getattr(
+                    cached, "long_name", ""
+                )
+            entries.append({
+                "conid": conid,
+                "symbol": contract.symbol,
+                "right": contract.right,
+                "strike": contract.strike,
+                "expiry": contract.lastTradeDateOrContractMonth,
+                "trading_class": getattr(contract, "tradingClass", ""),
+                "multiplier": getattr(contract, "multiplier", "1"),
+                "long_name": long_name,
+            })
+
+        try:
+            Path(self._catalog_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(self._catalog_path, "w") as f:
+                json.dump(entries, f, indent=2)
+            LOGGER.info(
+                "ForecastEx: saved %d entries to catalog %s",
+                len(entries), self._catalog_path,
+            )
+        except Exception as exc:
+            LOGGER.warning("ForecastEx: failed to save catalog: %s", exc)
 
     def _normalize_quote(
         self,
@@ -837,6 +1080,25 @@ class ForecastExAdapter(ExchangeAdapter):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _ContractDetailWrapper:
+    """Lightweight stand-in for ``ib_async.ContractDetails``.
+
+    When contracts are loaded from the conId catalog and qualified via
+    ``qualifyContractsAsync``, we don't get full ``ContractDetails``
+    objects — just ``Contract`` objects.  This wrapper provides the
+    ``.contract`` and ``.longName`` attributes that the rest of the
+    adapter expects so the code can treat catalog-loaded contracts
+    identically to those from ``reqContractDetailsAsync``.
+    """
+
+    __slots__ = ("contract", "longName", "long_name")
+
+    def __init__(self, contract: Any, long_name: str = "") -> None:
+        self.contract = contract
+        self.longName = long_name
+        self.long_name = long_name
 
 
 def _safe_float(value: Any) -> float:

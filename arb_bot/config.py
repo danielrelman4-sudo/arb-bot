@@ -417,6 +417,13 @@ class StrategySettings:
     strict_mapping_temporal_join_seconds: float = 600.0
     cross_lane_min_covered_pairs: int = 0
     parity_lane_min_covered_rules: int = 0
+    # Maximum number of legs in a structural bucket. Buckets with more legs
+    # are filtered at detection time because multi-leg fill probability
+    # decays exponentially, making them untradeable.
+    max_bucket_legs: int = 0  # 0 = unlimited (no filter)
+    # Maximum consecutive execution failures per bucket before disabling it
+    # for the session. Prevents bleeding on illiquid buckets. 0 = unlimited.
+    max_consecutive_bucket_failures: int = 3
 
 
 @dataclass(frozen=True)
@@ -626,6 +633,8 @@ class ForecastExSettings:
     priority_symbols: List[str] = field(default_factory=list)
     # Symbols to exclude from discovery
     exclude_symbols: List[str] = field(default_factory=list)
+    # Path to pre-built conId catalog JSON (speeds up startup, avoids penalty box)
+    conid_catalog_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -674,6 +683,10 @@ class AppSettings:
     # B2: Monte Carlo execution simulation for paper runs.
     paper_monte_carlo_enabled: bool = True
     paper_monte_carlo_legging_loss_fraction: float = 0.03
+    # Spread-based legging loss: cost in cents to unwind one filled leg by
+    # crossing the spread. When > 0, replaces the flat legging_loss_fraction
+    # model with a per-contract spread-crossing cost.
+    paper_monte_carlo_legging_unwind_spread_cents: float = 0.0
     paper_monte_carlo_adverse_selection_probability: float = 0.15
     paper_monte_carlo_adverse_selection_edge_loss: float = 0.5
     paper_monte_carlo_slippage_std_cents: float = 0.5
@@ -682,6 +695,7 @@ class AppSettings:
     paper_monte_carlo_edge_decay_half_life_seconds: float = 30.0
     paper_monte_carlo_resolution_success_rate: float = 0.95
     paper_monte_carlo_seed: int | None = None
+    control_socket_port: int = 9120
 
 
 
@@ -838,6 +852,10 @@ def load_settings() -> AppSettings:
             os.getenv("ARB_PAPER_MONTE_CARLO_LEGGING_LOSS_FRACTION"),
             0.03,
         ),
+        paper_monte_carlo_legging_unwind_spread_cents=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_LEGGING_UNWIND_SPREAD_CENTS"),
+            0.0,
+        ),
         paper_monte_carlo_adverse_selection_probability=_as_float(
             os.getenv("ARB_PAPER_MONTE_CARLO_ADVERSE_SELECTION_PROBABILITY"),
             0.15,
@@ -870,6 +888,7 @@ def load_settings() -> AppSettings:
             os.getenv("ARB_PAPER_MONTE_CARLO_SEED"),
             0,
         ) or None,
+        control_socket_port=_as_int(os.getenv("ARB_CONTROL_SOCKET_PORT"), 9120),
         stream_mode=_as_bool(os.getenv("ARB_STREAM_MODE"), False),
         stream_recompute_cooldown_ms=_as_int(os.getenv("ARB_STREAM_RECOMPUTE_COOLDOWN_MS"), 400),
         stream_poll_decision_clock=_as_bool(os.getenv("ARB_STREAM_POLL_DECISION_CLOCK"), True),
@@ -1010,6 +1029,14 @@ def load_settings() -> AppSettings:
             parity_lane_min_covered_rules=_as_int(
                 os.getenv("ARB_PARITY_LANE_MIN_COVERED_RULES"),
                 0,
+            ),
+            max_bucket_legs=_as_int(
+                os.getenv("ARB_MAX_BUCKET_LEGS"),
+                0,
+            ),
+            max_consecutive_bucket_failures=_as_int(
+                os.getenv("ARB_MAX_BUCKET_CONSECUTIVE_FAILURES"),
+                3,
             ),
         ),
         lanes=OpportunityLaneSettings(
@@ -1245,5 +1272,6 @@ def load_settings() -> AppSettings:
             payout_per_contract=_as_float(os.getenv("FORECASTEX_PAYOUT_PER_CONTRACT"), 1.0),
             priority_symbols=_as_csv(os.getenv("FORECASTEX_PRIORITY_SYMBOLS")),
             exclude_symbols=_as_csv(os.getenv("FORECASTEX_EXCLUDE_SYMBOLS")),
+            conid_catalog_path=os.getenv("FORECASTEX_CONID_CATALOG_PATH", ""),
         ),
     )

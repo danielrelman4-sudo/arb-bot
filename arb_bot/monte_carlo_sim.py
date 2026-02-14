@@ -31,7 +31,14 @@ class MonteCarloSettings:
     # --- Legging risk ---
     # When one leg fills and another doesn't, what fraction of capital is lost.
     # In real trading this is the cost of unwinding the filled leg at market.
-    legging_loss_fraction: float = 0.03  # 3% of leg capital lost on unwind
+    legging_loss_fraction: float = 0.03  # 3% of leg capital lost on unwind (legacy)
+
+    # --- Spread-based legging loss (preferred) ---
+    # When > 0, replaces legging_loss_fraction with a per-contract spread-
+    # crossing cost model.  Only filled legs need to be unwound; unfilled
+    # maker orders are cancelled at zero cost.  The unwind cost for each
+    # filled leg is ``legging_unwind_spread_cents / 100 * contracts_per_leg``.
+    legging_unwind_spread_cents: float = 0.0  # 0 = use legacy fraction model
 
     # --- Adverse selection ---
     # Probability that a filled trade experiences adverse selection
@@ -207,14 +214,26 @@ class MonteCarloSimulator:
         elif filled_count > 0:
             # Legging risk: some legs filled, some didn't.
             # The filled legs are now unhedged exposures.
-            # Estimate loss as fraction of capital committed to filled legs.
-            committed_total = sum(plan.capital_required_by_venue.values())
-            filled_fraction = filled_count / max(1, n_legs)
-            legging_loss = (
-                committed_total
-                * filled_fraction
-                * self._settings.legging_loss_fraction
-            )
+            if self._settings.legging_unwind_spread_cents > 0:
+                # Spread-based model: only filled legs need to be unwound.
+                # Unfilled maker orders can be cancelled at zero cost.
+                # Unwind cost = cross the spread for each filled leg.
+                unwind_cost_per_contract = (
+                    self._settings.legging_unwind_spread_cents / 100.0
+                )
+                for i, filled in enumerate(leg_fills):
+                    if filled:
+                        leg_contracts = max(1, plan.contracts // n_legs)
+                        legging_loss += unwind_cost_per_contract * leg_contracts
+            else:
+                # Legacy model: flat fraction of committed capital.
+                committed_total = sum(plan.capital_required_by_venue.values())
+                filled_fraction = filled_count / max(1, n_legs)
+                legging_loss = (
+                    committed_total
+                    * filled_fraction
+                    * self._settings.legging_loss_fraction
+                )
             # Reset contracts — no successful trade.
             simulated_contracts = 0
 

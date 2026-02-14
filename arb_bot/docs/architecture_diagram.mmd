@@ -1,0 +1,108 @@
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px'}}}%%
+graph TB
+    subgraph EXCHANGES["PREDICTION MARKET EXCHANGES"]
+        K["Kalshi<br/><small>REST + WebSocket</small>"]
+        P["Polymarket<br/><small>REST / Gamma API</small>"]
+        F["ForecastEx / IBKR<br/><small>TWS API + conId Catalog</small>"]
+    end
+
+    subgraph ADAPTERS["EXCHANGE ADAPTER LAYER"]
+        KA["KalshiAdapter<br/><small>RSA auth, WS subscribe,<br/>priority tickers, rate throttle</small>"]
+        PA["PolymarketAdapter<br/><small>CLOB orders,<br/>Gamma API</small>"]
+        FA["ForecastExAdapter<br/><small>Options model,<br/>buy-only, 3-tier discovery</small>"]
+    end
+
+    subgraph DQ["DATA QUALITY PIPELINE"]
+        SH["Stream Health<br/><small>Bounded queue,<br/>backpressure</small>"]
+        RC["Reconciliation<br/><small>Stream vs REST<br/>delta checks</small>"]
+        QF["Quote Firewall<br/><small>Anomaly detection,<br/>staleness guards</small>"]
+        DD["Dedupe<br/><small>Stable opp IDs,<br/>idempotency</small>"]
+    end
+
+    subgraph DETECT["ARBITRAGE DETECTION &mdash; 5 LANES"]
+        direction LR
+        L1["Lane 1: INTRA<br/><small>YES+NO pairs<br/>same venue</small>"]
+        L2["Lane 2: CROSS<br/><small>K&harr;P, K&harr;FX<br/>743 mappings</small>"]
+        L3["Lane 3: BUCKET<br/><small>Mutex groups<br/>Thompson sampling</small>"]
+        L4["Lane 4: PARITY<br/><small>Complement<br/>pairs</small>"]
+        L5["Lane 5: EVENT TREE<br/><small>Parent/child<br/>hierarchies</small>"]
+    end
+
+    subgraph SIZING["12-STEP SIZING PIPELINE"]
+        S1["Execution Model<br/><small>Queue decay, impact</small>"]
+        S2["Fill Model<br/><small>Correlated legs</small>"]
+        S3["Fee Model<br/><small>Maker/taker</small>"]
+        S4["Kelly Sizing<br/><small>Baker-McHale shrinkage</small>"]
+        S5["Monte Carlo<br/><small>PnL distribution</small>"]
+        S6["Capital Lock<br/><small>Time-to-resolution</small>"]
+        S7["Lane Allocator<br/><small>Sharpe-weighted</small>"]
+        S8["Drawdown Mgr<br/><small>Tiered de-risk</small>"]
+    end
+
+    subgraph RUST["RUST HOT-PATH (PyO3)"]
+        RB["binary_math.rs"]
+        RS["strategy.rs"]
+        RE["eval_pipeline.rs"]
+    end
+
+    subgraph RISK["RISK GATES"]
+        KS["Kill Switch<br/><small>Daily loss cap<br/>Canary mode</small>"]
+        CB["Circuit Breakers<br/><small>Per-endpoint<br/>CLOSED/OPEN/HALF</small>"]
+        CD["Cooldowns<br/><small>Market + opportunity<br/>throttling</small>"]
+        EX["Exposure Limits<br/><small>Per-venue, per-cluster<br/>concentration caps</small>"]
+    end
+
+    subgraph EXEC["SEQUENTIAL LEG EXECUTION"]
+        OI["Persist Intent<br/><small>SQLite order_store</small>"]
+        PO["Place Order<br/><small>On exchange</small>"]
+        PS["Poll Status<br/><small>10s timeout</small>"]
+        RF["Record Fill /<br/>Cancel+Unwind"]
+    end
+
+    subgraph POST["POST-EXECUTION & MONITORING"]
+        BR["Balance Refresh<br/><small>60s sync</small>"]
+        AN["Analytics<br/><small>SQLite/DuckDB</small>"]
+        DM["Drift Monitor<br/><small>Expected vs actual</small>"]
+        AT["Auto-Tuner<br/><small>KPI-driven</small>"]
+        DB["Dashboard<br/><small>React + Python</small>"]
+        CR["Crash Recovery<br/><small>Startup reconcile</small>"]
+    end
+
+    K --> KA
+    P --> PA
+    F --> FA
+    KA --> SH
+    PA --> RC
+    FA --> QF
+    SH --> DD
+    RC --> DD
+    QF --> DD
+    DD --> DETECT
+    DETECT --> SIZING
+    RUST -.->|"dispatch if enabled"| DETECT
+    RUST -.->|"dispatch if enabled"| SIZING
+    SIZING --> RISK
+    RISK -->|"Pass"| EXEC
+    RISK -->|"Reject"| REJECT(("Skip<br/>+ Log"))
+    OI --> PO --> PS --> RF
+    RF --> POST
+
+    classDef exchange fill:#1a5276,stroke:#5dade2,color:white
+    classDef adapter fill:#1b4f72,stroke:#3498db,color:white
+    classDef quality fill:#145a32,stroke:#27ae60,color:white
+    classDef detect fill:#7d3c98,stroke:#a569bd,color:white
+    classDef sizing fill:#b7950b,stroke:#f1c40f,color:white
+    classDef rust fill:#922b21,stroke:#e74c3c,color:white
+    classDef risk fill:#7b241c,stroke:#cb4335,color:white
+    classDef exec fill:#1a5276,stroke:#2e86c1,color:white
+    classDef post fill:#1c2833,stroke:#566573,color:white
+
+    class K,P,F exchange
+    class KA,PA,FA adapter
+    class SH,RC,QF,DD quality
+    class L1,L2,L3,L4,L5 detect
+    class S1,S2,S3,S4,S5,S6,S7,S8 sizing
+    class RB,RS,RE rust
+    class KS,CB,CD,EX risk
+    class OI,PO,PS,RF exec
+    class BR,AN,DM,AT,DB,CR post

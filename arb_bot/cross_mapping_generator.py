@@ -8,6 +8,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -237,6 +238,89 @@ def _build_forecastex_text(market: dict[str, Any]) -> str:
     if description and symbol:
         return f"{description} {symbol}"
     return description or symbol
+
+
+def load_forecastex_markets_from_catalog(
+    catalog_path: str,
+    symbols_csv_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load ForecastEx markets from a conId catalog JSON, enriched with symbol descriptions.
+
+    Reads the conId catalog and optionally a symbols CSV for description text.
+    De-duplicates by symbol, keeping one representative entry per symbol (the one
+    with the nearest unexpired expiry) so cross-venue matching operates on unique
+    market concepts rather than thousands of individual strike/expiry contracts.
+
+    Returns a list of dicts suitable for ``_build_candidates()``.
+    """
+    catalog_file = Path(catalog_path)
+    if not catalog_file.exists():
+        _LOG.warning("ForecastEx catalog not found: %s", catalog_path)
+        return []
+
+    with catalog_file.open("r", encoding="utf-8") as fh:
+        catalog_entries: list[dict[str, Any]] = json.load(fh)
+
+    if not isinstance(catalog_entries, list):
+        _LOG.warning("ForecastEx catalog is not a JSON array: %s", catalog_path)
+        return []
+
+    # Build symbol -> description lookup from symbols CSV.
+    description_lookup: dict[str, str] = {}
+    if symbols_csv_path:
+        symbols_file = Path(symbols_csv_path)
+        if symbols_file.exists():
+            with symbols_file.open("r", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    sym = (row.get("symbol") or "").strip()
+                    desc = (row.get("description") or "").strip()
+                    if sym:
+                        description_lookup[sym] = desc
+        else:
+            _LOG.warning("ForecastEx symbols CSV not found: %s", symbols_csv_path)
+
+    # Group entries by symbol so we can pick one representative per symbol.
+    today_str = date.today().strftime("%Y%m%d")
+    symbol_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in catalog_entries:
+        sym = str(entry.get("symbol") or "").strip()
+        if not sym:
+            continue
+        symbol_groups[sym].append(entry)
+
+    results: list[dict[str, Any]] = []
+    for sym, entries in symbol_groups.items():
+        # Pick the entry with the nearest unexpired expiry, or just the first.
+        best: dict[str, Any] | None = None
+        best_expiry: str = ""
+        for entry in entries:
+            expiry = str(entry.get("expiry") or "").strip()
+            if expiry >= today_str:
+                if best is None or expiry < best_expiry:
+                    best = entry
+                    best_expiry = expiry
+        if best is None:
+            # All expired (or no expiry field); just take the first entry.
+            best = entries[0]
+
+        description = description_lookup.get(sym, "")
+        results.append({
+            "venue": "forecastex",
+            "conId": best.get("conid"),
+            "symbol": sym,
+            "description": description,
+            "right": best.get("right", ""),
+            "strike": best.get("strike"),
+            "expiry": best.get("expiry", ""),
+        })
+
+    _LOG.info(
+        "Loaded %d unique ForecastEx symbols from catalog (%d total entries)",
+        len(results),
+        len(catalog_entries),
+    )
+    return results
 
 
 def _forecastex_candidate(market: dict[str, Any]) -> CandidateMarket | None:
@@ -701,6 +785,18 @@ def parse_args() -> argparse.Namespace:
         default=0.55,
         help="Minimum cosine similarity for embedding-based matching (default: 0.55).",
     )
+    parser.add_argument(
+        "--forecastex-catalog",
+        type=str,
+        default=None,
+        help="Path to ForecastEx conId catalog JSON for cross-venue matching.",
+    )
+    parser.add_argument(
+        "--forecastex-symbols",
+        type=str,
+        default=None,
+        help="Path to ForecastEx symbols CSV for description enrichment.",
+    )
     return parser.parse_args()
 
 
@@ -760,6 +856,15 @@ async def _main() -> int:
         if wants_polymarket and not polymarket_markets:
             raise ValueError("polymarket fetch returned 0 markets")
         markets = [*kalshi_markets, *polymarket_markets]
+
+    # Load ForecastEx markets from catalog if provided.
+    if args.forecastex_catalog:
+        forecastex_markets = load_forecastex_markets_from_catalog(
+            catalog_path=args.forecastex_catalog,
+            symbols_csv_path=args.forecastex_symbols,
+        )
+        print("loaded forecastex markets: %d" % len(forecastex_markets))
+        markets.extend(forecastex_markets)
 
     rows, diagnostics = generate_cross_venue_mapping_rows(
         markets,

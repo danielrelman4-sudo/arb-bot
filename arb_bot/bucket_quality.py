@@ -35,6 +35,7 @@ class BucketAccumulator:
     realized_profit_sum: float = 0.0
     slippage_sum: float = 0.0
     latency_sum_ms: float = 0.0
+    consecutive_failures: int = 0
 
     def average_detected_edge(self) -> float:
         if self.detections <= 0:
@@ -122,6 +123,7 @@ class BucketQualityModel:
         thompson_prior_alpha: float = 1.0,
         thompson_prior_beta: float = 1.0,
         use_thompson_sampling: bool = True,
+        max_consecutive_bucket_failures: int = 3,
     ) -> None:
         self._enabled = enabled
         self._bucket_leg_counts = dict(bucket_leg_counts)
@@ -139,6 +141,7 @@ class BucketQualityModel:
         self._thompson_prior_alpha = max(0.01, thompson_prior_alpha)
         self._thompson_prior_beta = max(0.01, thompson_prior_beta)
         self._use_thompson_sampling = use_thompson_sampling
+        self._max_consecutive_bucket_failures = max(0, max_consecutive_bucket_failures)
 
         self._accumulators: dict[str, BucketAccumulator] = {}
         self._scores: dict[str, BucketScore] = {}
@@ -179,6 +182,11 @@ class BucketQualityModel:
     def should_enable_bucket(self, group_id: str) -> bool:
         if not self._enabled:
             return True
+        # Hard-disable buckets that have hit the consecutive failure limit.
+        if self._max_consecutive_bucket_failures > 0:
+            acc = self._accumulators.get(group_id)
+            if acc is not None and acc.consecutive_failures >= self._max_consecutive_bucket_failures:
+                return False
         if not self._active_bucket_ids:
             return True
         return group_id in self._active_bucket_ids
@@ -296,6 +304,10 @@ class BucketQualityModel:
             return
 
         acc.opened += 1
+        if action == "execution_failed":
+            acc.consecutive_failures += 1
+        elif action in ("filled", "settled"):
+            acc.consecutive_failures = 0
         if action == "settled":
             acc.settled += 1
 
@@ -370,6 +382,11 @@ class BucketQualityModel:
                 alpha = acc.positive_outcomes + self._thompson_prior_alpha
                 beta_param = (acc.opened - acc.positive_outcomes) + self._thompson_prior_beta
 
+            # Hard filter: skip buckets that hit the consecutive failure limit.
+            if self._max_consecutive_bucket_failures > 0:
+                if acc is not None and acc.consecutive_failures >= self._max_consecutive_bucket_failures:
+                    continue
+
             # Hard filter: if we have enough data and score is terrible, skip.
             score = self._scores.get(group_id)
             if score is not None and acc is not None and acc.detections >= self._min_observations:
@@ -393,6 +410,10 @@ class BucketQualityModel:
         uncertain: list[str] = []
         for group_id in all_ids:
             acc = self._accumulators.get(group_id)
+            # Skip buckets that hit the consecutive failure limit.
+            if self._max_consecutive_bucket_failures > 0:
+                if acc is not None and acc.consecutive_failures >= self._max_consecutive_bucket_failures:
+                    continue
             if acc is None or acc.detections < self._min_observations:
                 uncertain.append(group_id)
                 continue

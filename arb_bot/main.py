@@ -22,6 +22,8 @@ async def _refresh_cross_venue_mappings(
     *,
     kalshi_api_base_url: str = "https://api.elections.kalshi.com/trade-api/v2",
     polymarket_gamma_base_url: str = "https://gamma-api.polymarket.com",
+    forecastex_catalog_path: str = "",
+    forecastex_symbols_csv_path: str = "",
 ) -> str:
     """Regenerate cross-venue mappings from live Kalshi + Polymarket data.
 
@@ -45,16 +47,25 @@ async def _refresh_cross_venue_mappings(
         len(polymarket_markets),
     )
 
+    forecastex_markets: list[dict] = []
+    if forecastex_catalog_path:
+        from arb_bot.cross_mapping_generator import load_forecastex_markets_from_catalog
+        forecastex_markets = load_forecastex_markets_from_catalog(
+            catalog_path=forecastex_catalog_path,
+            symbols_csv_path=forecastex_symbols_csv_path or None,
+        )
+        LOGGER.info("loaded forecastex catalog markets: %d", len(forecastex_markets))
+
     if not kalshi_markets:
         raise RuntimeError("Kalshi market fetch returned 0 markets — cannot generate mappings")
     if not polymarket_markets:
-        raise RuntimeError("Polymarket market fetch returned 0 markets — cannot generate mappings")
+        LOGGER.warning("Polymarket market fetch returned 0 markets — cross-venue matching limited to Kalshi↔ForecastEx")
 
     import csv
     from pathlib import Path
 
     rows, diagnostics = generate_cross_venue_mapping_rows(
-        [*kalshi_markets, *polymarket_markets],
+        [*kalshi_markets, *polymarket_markets, *forecastex_markets],
     )
 
     out = Path(output_path)
@@ -160,6 +171,8 @@ async def _run() -> None:
             args.mapping_output,
             kalshi_api_base_url=settings.kalshi.api_base_url,
             polymarket_gamma_base_url=settings.polymarket.gamma_base_url,
+            forecastex_catalog_path=settings.forecastex.conid_catalog_path,
+            forecastex_symbols_csv_path="arb_bot/config/forecastex_symbols.csv" if settings.forecastex.enabled else "",
         )
         strategy = replace(settings.strategy, cross_venue_mapping_path=mapping_path)
         settings = replace(settings, strategy=strategy)

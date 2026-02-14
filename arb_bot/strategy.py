@@ -104,8 +104,11 @@ class ArbitrageFinder:
         bucket_quality_use_thompson_sampling: bool = True,
         bucket_quality_thompson_prior_alpha: float = 1.0,
         bucket_quality_thompson_prior_beta: float = 1.0,
+        max_bucket_legs: int = 0,
+        max_consecutive_bucket_failures: int = 3,
     ) -> None:
         self._min_net_edge_per_contract = min_net_edge_per_contract
+        self._max_bucket_legs = max_bucket_legs
         self._enable_cross_venue = enable_cross_venue
         self._cross_venue_min_match_score = cross_venue_min_match_score
         self._cross_venue_mapping_required = cross_venue_mapping_required
@@ -143,6 +146,7 @@ class ArbitrageFinder:
                 use_thompson_sampling=bucket_quality_use_thompson_sampling,
                 thompson_prior_alpha=bucket_quality_thompson_prior_alpha,
                 thompson_prior_beta=bucket_quality_thompson_prior_beta,
+                max_consecutive_bucket_failures=max_consecutive_bucket_failures,
             )
             LOGGER.info(self._bucket_quality_model.summary())
 
@@ -477,6 +481,14 @@ class ArbitrageFinder:
     ) -> list[ArbitrageOpportunity]:
         opportunities: list[ArbitrageOpportunity] = []
         for bucket in self._structural_rules.buckets:
+            # Filter buckets with too many legs — multi-leg fill probability
+            # decays exponentially, making them untradeable.
+            if self._max_bucket_legs > 0 and len(bucket.legs) > self._max_bucket_legs:
+                LOGGER.debug(
+                    "bucket %s skipped: %d legs > max %d",
+                    bucket.group_id, len(bucket.legs), self._max_bucket_legs,
+                )
+                continue
             if self._bucket_quality_model is not None and not self._bucket_quality_model.should_enable_bucket(bucket.group_id):
                 continue
             resolved = self._resolve_refs(bucket.legs, lookup, style)

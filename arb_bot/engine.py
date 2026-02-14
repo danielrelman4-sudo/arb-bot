@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from arb_bot.config import AppSettings, LaneTuningSettings
+from arb_bot.control_socket import ControlSocket
 from arb_bot.correlation import CorrelationAssessment, CorrelationConstraintModel
 from arb_bot.fill_model import CorrelationMode, FillEstimate, FillModel
 from arb_bot.monte_carlo_sim import MonteCarloResult, MonteCarloSettings, MonteCarloSimulator
@@ -174,6 +175,8 @@ class ArbEngine:
             bucket_quality_min_score=settings.strategy.bucket_quality_min_score,
             bucket_quality_leg_count_penalty=settings.strategy.bucket_quality_leg_count_penalty,
             bucket_quality_live_update_interval=settings.strategy.bucket_quality_live_update_interval,
+            max_bucket_legs=settings.strategy.max_bucket_legs,
+            max_consecutive_bucket_failures=settings.strategy.max_consecutive_bucket_failures,
         )
         self._lanes: tuple[OpportunityLane, ...] = (
             OpportunityLane(OpportunityKind.INTRA_VENUE, settings.lanes.intra_venue),
@@ -197,6 +200,7 @@ class ArbEngine:
         self._mc_sim = MonteCarloSimulator(MonteCarloSettings(
             enabled=settings.paper_monte_carlo_enabled,
             legging_loss_fraction=settings.paper_monte_carlo_legging_loss_fraction,
+            legging_unwind_spread_cents=settings.paper_monte_carlo_legging_unwind_spread_cents,
             adverse_selection_probability=settings.paper_monte_carlo_adverse_selection_probability,
             adverse_selection_edge_loss=settings.paper_monte_carlo_adverse_selection_edge_loss,
             slippage_std_cents=settings.paper_monte_carlo_slippage_std_cents,
@@ -214,12 +218,16 @@ class ArbEngine:
         self._lane_dynamic_fill_probability_delta: dict[OpportunityKind, float] = {
             kind: 0.0 for kind in OpportunityKind
         }
+        self._control_socket: ControlSocket | None = None
+        self._cycle_count: int = 0
+        self._engine_started_at: float = time.time()
 
     def _initial_cash_map(self) -> dict[str, float]:
         venues = {adapter.venue for adapter in self._exchanges.values()}
         cash_map = {venue: self._settings.default_bankroll_usd for venue in venues}
         for venue, value in self._settings.bankroll_by_venue.items():
-            cash_map[venue] = value
+            if venue in venues:
+                cash_map[venue] = value
         return cash_map
 
     def _build_exchanges(self) -> dict[str, ExchangeAdapter]:
@@ -245,6 +253,14 @@ class ArbEngine:
     async def run_forever(self, run_once: bool | None = None) -> None:
         single = self._settings.run_once if run_once is None else run_once
 
+        if self._settings.control_socket_port > 0:
+            self._control_socket = ControlSocket(
+                port=self._settings.control_socket_port,
+                on_config_update=self._handle_config_update,
+                kill_switch_path=self._settings.risk.kill_switch_file,
+            )
+            await self._control_socket.start()
+
         try:
             if self._settings.stream_mode and not single:
                 await self._run_stream_loop()
@@ -262,6 +278,8 @@ class ArbEngine:
                 if sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
         finally:
+            if self._control_socket is not None:
+                await self._control_socket.stop()
             await self.aclose()
 
     async def run_once(self) -> CycleReport:
@@ -271,6 +289,90 @@ class ArbEngine:
 
         quotes = await self._fetch_all_quotes()
         return await self._evaluate_quotes(quotes, started_at)
+
+    def _build_state_snapshot(self, report: CycleReport) -> dict:
+        """Build a JSON-serialisable state dict for the dashboard."""
+        state = self._state
+        return {
+            "type": "state",
+            "ts": time.time(),
+            "cycle": self._cycle_count,
+            "mode": "live" if self._settings.live_mode else "paper",
+            "uptime_seconds": time.time() - self._engine_started_at,
+            "cash_by_venue": dict(state.cash_by_venue),
+            "locked_capital_by_venue": dict(state.locked_capital_by_venue),
+            "open_positions": [
+                {"market_id": m, "venue": v}
+                for v, markets in state.open_markets_by_venue.items()
+                for m in markets
+            ],
+            "last_cycle": {
+                "duration_ms": int(
+                    (report.ended_at - report.started_at).total_seconds() * 1000
+                ),
+                "quotes_count": report.quotes_count,
+                "opportunities_found": report.opportunities_count,
+                "near_opportunities": report.near_opportunities_count,
+                "decisions": [
+                    {
+                        "action": d.action,
+                        "kind": str(d.opportunity.kind.value) if d.opportunity else "",
+                        "match_key": getattr(d.opportunity, "match_key", ""),
+                        "reason": d.reason,
+                        "edge": d.metrics.get("detected_edge_per_contract", 0),
+                        "fill_prob": d.metrics.get("fill_probability", 0),
+                    }
+                    for d in report.decisions
+                ],
+            },
+            "stream_status": {},
+            "daily_pnl": 0.0,
+            "daily_trades": 0,
+            "daily_loss_cap_remaining": 0.0,
+            "consecutive_failures": 0,
+            "config_snapshot": self._config_snapshot(),
+        }
+
+    def _config_snapshot(self) -> dict[str, object]:
+        """Extract key tunable settings for the dashboard."""
+        s = self._settings
+        return {
+            "ARB_LIVE_MODE": s.live_mode,
+            "ARB_DAILY_LOSS_CAP_USD": getattr(s.risk, "daily_loss_cap_usd", 0),
+            "ARB_MAX_DOLLARS_PER_TRADE": s.sizing.max_dollars_per_trade,
+            "ARB_MAX_CONTRACTS_PER_TRADE": s.sizing.max_contracts_per_trade,
+            "ARB_MAX_BANKROLL_FRACTION_PER_TRADE": s.sizing.max_bankroll_fraction_per_trade,
+            "ARB_MARKET_COOLDOWN_SECONDS": s.risk.market_cooldown_seconds,
+            "ARB_LANE_STRUCTURAL_BUCKET_ENABLED": s.lanes.structural_bucket.enabled,
+            "ARB_LANE_CROSS_ENABLED": s.lanes.cross_venue.enabled,
+            "ARB_LANE_STRUCTURAL_PARITY_ENABLED": s.lanes.structural_parity.enabled,
+            "ARB_MAX_BUCKET_LEGS": s.strategy.max_bucket_legs,
+            "ARB_MAX_BUCKET_CONSECUTIVE_FAILURES": s.strategy.max_consecutive_bucket_failures,
+        }
+
+    async def _handle_config_update(self, key: str, value: object) -> dict:
+        """Handle a config update from the dashboard."""
+        import os as _os
+        NOT_HOT_RELOADABLE = {
+            "KALSHI_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_PRIVATE_KEY_PEM",
+            "ARB_STRUCTURAL_RULES_PATH", "ARB_CONTROL_SOCKET_PORT",
+        }
+        if key in NOT_HOT_RELOADABLE:
+            return {"ok": False, "error": "requires_restart"}
+
+        snapshot = self._config_snapshot()
+        if key not in snapshot:
+            return {"ok": False, "error": f"unknown key: {key}"}
+
+        old = snapshot[key]
+        _os.environ[key] = str(value)
+        try:
+            from arb_bot.config import load_settings
+            new_settings = load_settings()
+            self._settings = new_settings
+            return {"ok": True, "old": old, "new": value}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     async def _run_stream_loop(self) -> None:
         quote_cache: dict[tuple[str, str], object] = {}
@@ -306,8 +408,13 @@ class ArbEngine:
 
         def _start_stream_task(adapter: ExchangeAdapter, *, reason: str) -> None:
             async def _consume(adapter_ref: ExchangeAdapter) -> None:
-                async for quote in adapter_ref.stream_quotes():
-                    await queue.put(quote)
+                try:
+                    async for quote in adapter_ref.stream_quotes():
+                        await queue.put(quote)
+                except asyncio.CancelledError:
+                    LOGGER.debug("stream consume task cancelled for %s", adapter_ref.venue)
+                except Exception as exc:
+                    LOGGER.warning("stream consume task error for %s: %s", adapter_ref.venue, exc)
 
             task = asyncio.create_task(_consume(adapter))
             stream_tasks[adapter.venue] = (adapter, task)
@@ -480,6 +587,10 @@ class ArbEngine:
                         last_eval_ts = now_ms
                 except asyncio.TimeoutError:
                     pass
+                except asyncio.CancelledError:
+                    # A stream task cancellation can propagate through queue.get()
+                    # on Python 3.9. Swallow it so the loop survives.
+                    LOGGER.debug("stream loop queue.get() cancelled, continuing")
 
                 now_ts = time.time()
                 if (now_ts - last_poll_refresh_ts) >= effective_poll_refresh_interval:
@@ -785,6 +896,21 @@ class ArbEngine:
             return []
 
     async def _evaluate_quotes(
+        self,
+        quotes: list,
+        started_at: datetime,
+        source: str = "poll",
+    ) -> CycleReport:
+        report = await self._evaluate_quotes_inner(quotes, started_at, source)
+        self._cycle_count += 1
+        if self._control_socket is not None and self._control_socket.client_count > 0:
+            try:
+                await self._control_socket.push_state(self._build_state_snapshot(report))
+            except Exception:
+                LOGGER.debug("control socket push failed", exc_info=True)
+        return report
+
+    async def _evaluate_quotes_inner(
         self,
         quotes: list,
         started_at: datetime,
@@ -1442,6 +1568,8 @@ class ArbEngine:
             if not execution.success:
                 reason = execution.error or "unknown execution error"
                 LOGGER.warning("Execution failed %s (%s)", plan.market_key, reason)
+                # Cancel any open (unfilled) orders from the partial execution.
+                await self._cleanup_partial_execution(execution)
                 decisions.append(
                     OpportunityDecision(
                         timestamp=datetime.now(timezone.utc),
@@ -2333,6 +2461,36 @@ class ArbEngine:
         elif any_failure:
             error = "one or more legs failed"
         return MultiLegExecutionResult(legs=tuple(merged), error=error)
+
+    async def _cleanup_partial_execution(
+        self, execution: MultiLegExecutionResult
+    ) -> None:
+        """Cancel unfilled orders from a partial multi-leg execution.
+
+        When a multi-leg trade partially fills, some legs may have open orders
+        sitting on the book.  This method cancels those orders to prevent
+        unintended fills after the trade has been abandoned.
+        """
+        for planned in execution.legs:
+            result = planned.result
+            # Only cancel legs that failed but have an order ID (submitted
+            # to the exchange but not filled).
+            if not result.success and result.order_id:
+                adapter = self._exchanges.get(planned.leg.venue)
+                if adapter is None:
+                    continue
+                try:
+                    cancelled = await adapter.cancel_order(result.order_id)
+                    LOGGER.info(
+                        "cleanup cancel %s/%s: %s",
+                        planned.leg.venue, result.order_id, cancelled,
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "cleanup cancel failed %s/%s",
+                        planned.leg.venue, result.order_id,
+                        exc_info=True,
+                    )
 
     async def _check_leg_quote_drift(self, leg: TradeLegPlan, tolerance: float) -> bool:
         """Fetch a fresh quote and check whether the price has moved beyond tolerance."""
