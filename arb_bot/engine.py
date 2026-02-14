@@ -287,16 +287,7 @@ class ArbEngine:
             await self._refresh_venue_balances()
 
         quotes = await self._fetch_all_quotes()
-        report = await self._evaluate_quotes(quotes, started_at)
-        self._cycle_count += 1
-
-        if self._control_socket is not None and self._control_socket.client_count > 0:
-            try:
-                await self._control_socket.push_state(self._build_state_snapshot(report))
-            except Exception:
-                LOGGER.debug("control socket push failed", exc_info=True)
-
-        return report
+        return await self._evaluate_quotes(quotes, started_at)
 
     def _build_state_snapshot(self, report: CycleReport) -> dict:
         """Build a JSON-serialisable state dict for the dashboard."""
@@ -904,6 +895,21 @@ class ArbEngine:
             return []
 
     async def _evaluate_quotes(
+        self,
+        quotes: list,
+        started_at: datetime,
+        source: str = "poll",
+    ) -> CycleReport:
+        report = await self._evaluate_quotes_inner(quotes, started_at, source)
+        self._cycle_count += 1
+        if self._control_socket is not None and self._control_socket.client_count > 0:
+            try:
+                await self._control_socket.push_state(self._build_state_snapshot(report))
+            except Exception:
+                LOGGER.debug("control socket push failed", exc_info=True)
+        return report
+
+    async def _evaluate_quotes_inner(
         self,
         quotes: list,
         started_at: datetime,
