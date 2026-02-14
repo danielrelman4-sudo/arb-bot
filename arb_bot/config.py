@@ -417,6 +417,10 @@ class StrategySettings:
     strict_mapping_temporal_join_seconds: float = 600.0
     cross_lane_min_covered_pairs: int = 0
     parity_lane_min_covered_rules: int = 0
+    # Maximum number of legs in a structural bucket. Buckets with more legs
+    # are filtered at detection time because multi-leg fill probability
+    # decays exponentially, making them untradeable.
+    max_bucket_legs: int = 0  # 0 = unlimited (no filter)
 
 
 @dataclass(frozen=True)
@@ -674,6 +678,10 @@ class AppSettings:
     # B2: Monte Carlo execution simulation for paper runs.
     paper_monte_carlo_enabled: bool = True
     paper_monte_carlo_legging_loss_fraction: float = 0.03
+    # Spread-based legging loss: cost in cents to unwind one filled leg by
+    # crossing the spread. When > 0, replaces the flat legging_loss_fraction
+    # model with a per-contract spread-crossing cost.
+    paper_monte_carlo_legging_unwind_spread_cents: float = 0.0
     paper_monte_carlo_adverse_selection_probability: float = 0.15
     paper_monte_carlo_adverse_selection_edge_loss: float = 0.5
     paper_monte_carlo_slippage_std_cents: float = 0.5
@@ -837,6 +845,10 @@ def load_settings() -> AppSettings:
         paper_monte_carlo_legging_loss_fraction=_as_float(
             os.getenv("ARB_PAPER_MONTE_CARLO_LEGGING_LOSS_FRACTION"),
             0.03,
+        ),
+        paper_monte_carlo_legging_unwind_spread_cents=_as_float(
+            os.getenv("ARB_PAPER_MONTE_CARLO_LEGGING_UNWIND_SPREAD_CENTS"),
+            0.0,
         ),
         paper_monte_carlo_adverse_selection_probability=_as_float(
             os.getenv("ARB_PAPER_MONTE_CARLO_ADVERSE_SELECTION_PROBABILITY"),
@@ -1009,6 +1021,10 @@ def load_settings() -> AppSettings:
             ),
             parity_lane_min_covered_rules=_as_int(
                 os.getenv("ARB_PARITY_LANE_MIN_COVERED_RULES"),
+                0,
+            ),
+            max_bucket_legs=_as_int(
+                os.getenv("ARB_MAX_BUCKET_LEGS"),
                 0,
             ),
         ),

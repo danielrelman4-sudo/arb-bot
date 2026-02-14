@@ -251,6 +251,121 @@ class TestLeggingRisk:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Spread-based legging loss model
+# ---------------------------------------------------------------------------
+
+class TestSpreadBasedLeggingLoss:
+    def test_spread_model_two_legs_one_fills(self):
+        """With spread model, 1 of 2 legs filling costs unwind_spread * contracts_per_leg."""
+        sim = MonteCarloSimulator(MonteCarloSettings(
+            seed=42,
+            legging_unwind_spread_cents=1.0,  # 1 cent per contract
+        ))
+        opp = _make_opportunity(n_legs=2)
+        plan = _make_plan(contracts=10)
+
+        r = sim.simulate_trade(
+            opp, plan,
+            leg_fill_probabilities=(1.0, 0.0),
+        )
+        assert r.filled_leg_count == 1
+        # 1 filled leg * 1 cent/100 * (10 // 2) contracts = 0.05
+        expected_loss = (1.0 / 100.0) * (10 // 2)
+        assert abs(r.legging_loss - expected_loss) < 1e-10
+
+    def test_spread_model_three_legs_two_fill(self):
+        """With 3 legs and 2 filling, loss = unwind_spread * 2 * contracts_per_leg."""
+        sim = MonteCarloSimulator(MonteCarloSettings(
+            seed=42,
+            legging_unwind_spread_cents=2.0,  # 2 cents per contract
+        ))
+        opp = _make_opportunity(
+            kind=OpportunityKind.STRUCTURAL_BUCKET,
+            n_legs=3,
+            edge=0.10,
+        )
+        plan = TradePlan(
+            kind=OpportunityKind.STRUCTURAL_BUCKET,
+            execution_style=ExecutionStyle.TAKER,
+            contracts=9,
+            edge_per_contract=0.10,
+            expected_profit=0.90,
+            capital_required=4.50,
+            capital_required_by_venue={"venue0": 1.50, "venue1": 1.50, "venue2": 1.50},
+            legs=(
+                TradeLegPlan(venue="venue0", market_id="market0", side=Side.YES, contracts=9, limit_price=0.50),
+                TradeLegPlan(venue="venue1", market_id="market1", side=Side.NO, contracts=9, limit_price=0.50),
+                TradeLegPlan(venue="venue2", market_id="market2", side=Side.YES, contracts=9, limit_price=0.50),
+            ),
+        )
+
+        r = sim.simulate_trade(
+            opp, plan,
+            leg_fill_probabilities=(1.0, 1.0, 0.0),  # 2 of 3 fill
+        )
+        assert r.filled_leg_count == 2
+        # 2 filled legs * 2 cents/100 * (9 // 3) contracts = 2 * 0.02 * 3 = 0.12
+        contracts_per_leg = 9 // 3
+        expected_loss = 2 * (2.0 / 100.0) * contracts_per_leg
+        assert abs(r.legging_loss - expected_loss) < 1e-10
+
+    def test_spread_model_overrides_fraction_model(self):
+        """When legging_unwind_spread_cents > 0, fraction model is not used."""
+        opp = _make_opportunity(n_legs=2)
+        plan = _make_plan(contracts=10)
+
+        # Fraction model: loss = total_capital * filled_fraction * fraction
+        sim_fraction = MonteCarloSimulator(MonteCarloSettings(
+            seed=42,
+            legging_loss_fraction=0.10,  # 10%
+            legging_unwind_spread_cents=0.0,  # use fraction model
+        ))
+        r_fraction = sim_fraction.simulate_trade(
+            opp, plan, leg_fill_probabilities=(1.0, 0.0),
+        )
+
+        # Spread model: loss = spread * contracts_per_leg per filled leg
+        sim_spread = MonteCarloSimulator(MonteCarloSettings(
+            seed=42,
+            legging_loss_fraction=0.10,  # ignored when spread > 0
+            legging_unwind_spread_cents=1.0,
+        ))
+        r_spread = sim_spread.simulate_trade(
+            opp, plan, leg_fill_probabilities=(1.0, 0.0),
+        )
+
+        # Losses should be different — the models compute differently
+        assert r_fraction.legging_loss != r_spread.legging_loss
+        # Spread model should be much smaller for typical parameters
+        assert r_spread.legging_loss < r_fraction.legging_loss
+
+    def test_spread_model_no_loss_when_all_fill(self):
+        """No legging loss even with spread model when all legs fill."""
+        sim = MonteCarloSimulator(MonteCarloSettings(
+            seed=42,
+            legging_unwind_spread_cents=5.0,  # High spread, but irrelevant
+        ))
+        opp = _make_opportunity()
+        plan = _make_plan()
+
+        r = sim.simulate_trade(opp, plan, all_fill_probability=1.0)
+        assert r.legging_loss == 0.0
+
+    def test_spread_model_no_loss_when_no_fills(self):
+        """No legging loss when no legs fill."""
+        sim = MonteCarloSimulator(MonteCarloSettings(
+            seed=42,
+            legging_unwind_spread_cents=5.0,
+        ))
+        opp = _make_opportunity()
+        plan = _make_plan()
+
+        r = sim.simulate_trade(opp, plan, all_fill_probability=0.0)
+        assert r.legging_loss == 0.0
+        assert r.simulated_pnl == 0.0
+
+
+# ---------------------------------------------------------------------------
 # Tests: Adverse selection
 # ---------------------------------------------------------------------------
 

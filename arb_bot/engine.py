@@ -174,6 +174,7 @@ class ArbEngine:
             bucket_quality_min_score=settings.strategy.bucket_quality_min_score,
             bucket_quality_leg_count_penalty=settings.strategy.bucket_quality_leg_count_penalty,
             bucket_quality_live_update_interval=settings.strategy.bucket_quality_live_update_interval,
+            max_bucket_legs=settings.strategy.max_bucket_legs,
         )
         self._lanes: tuple[OpportunityLane, ...] = (
             OpportunityLane(OpportunityKind.INTRA_VENUE, settings.lanes.intra_venue),
@@ -197,6 +198,7 @@ class ArbEngine:
         self._mc_sim = MonteCarloSimulator(MonteCarloSettings(
             enabled=settings.paper_monte_carlo_enabled,
             legging_loss_fraction=settings.paper_monte_carlo_legging_loss_fraction,
+            legging_unwind_spread_cents=settings.paper_monte_carlo_legging_unwind_spread_cents,
             adverse_selection_probability=settings.paper_monte_carlo_adverse_selection_probability,
             adverse_selection_edge_loss=settings.paper_monte_carlo_adverse_selection_edge_loss,
             slippage_std_cents=settings.paper_monte_carlo_slippage_std_cents,
@@ -1442,6 +1444,8 @@ class ArbEngine:
             if not execution.success:
                 reason = execution.error or "unknown execution error"
                 LOGGER.warning("Execution failed %s (%s)", plan.market_key, reason)
+                # Cancel any open (unfilled) orders from the partial execution.
+                await self._cleanup_partial_execution(execution)
                 decisions.append(
                     OpportunityDecision(
                         timestamp=datetime.now(timezone.utc),
@@ -2333,6 +2337,36 @@ class ArbEngine:
         elif any_failure:
             error = "one or more legs failed"
         return MultiLegExecutionResult(legs=tuple(merged), error=error)
+
+    async def _cleanup_partial_execution(
+        self, execution: MultiLegExecutionResult
+    ) -> None:
+        """Cancel unfilled orders from a partial multi-leg execution.
+
+        When a multi-leg trade partially fills, some legs may have open orders
+        sitting on the book.  This method cancels those orders to prevent
+        unintended fills after the trade has been abandoned.
+        """
+        for planned in execution.legs:
+            result = planned.result
+            # Only cancel legs that failed but have an order ID (submitted
+            # to the exchange but not filled).
+            if not result.success and result.order_id:
+                adapter = self._exchanges.get(planned.leg.venue)
+                if adapter is None:
+                    continue
+                try:
+                    cancelled = await adapter.cancel_order(result.order_id)
+                    LOGGER.info(
+                        "cleanup cancel %s/%s: %s",
+                        planned.leg.venue, result.order_id, cancelled,
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "cleanup cancel failed %s/%s",
+                        planned.leg.venue, result.order_id,
+                        exc_info=True,
+                    )
 
     async def _check_leg_quote_drift(self, leg: TradeLegPlan, tolerance: float) -> bool:
         """Fetch a fresh quote and check whether the price has moved beyond tolerance."""

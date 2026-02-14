@@ -348,3 +348,160 @@ def test_tighter_price_sum_for_heuristic_buckets(tmp_path: Path) -> None:
     bucket_opps_e = [o for o in opps_e if o.kind is OpportunityKind.STRUCTURAL_BUCKET]
     assert len(bucket_opps_e) > 0, "exchange bucket at price_sum=0.82 should be accepted"
     assert bucket_opps_e[0].metadata.get("exclusivity_source") == "exchange_api"
+
+
+# ---------------------------------------------------------------------------
+# Tests: max_bucket_legs filter
+# ---------------------------------------------------------------------------
+
+
+def test_max_bucket_legs_filters_large_buckets(tmp_path: Path) -> None:
+    """Buckets with more legs than max_bucket_legs are filtered out."""
+    rules = {
+        "mutually_exclusive_buckets": [
+            {
+                "group_id": "three_leg",
+                "payout_per_contract": 1.0,
+                "exclusivity_source": "exchange_api",
+                "legs": [
+                    {"venue": "kalshi", "market_id": "A", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "B", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "C", "side": "yes"},
+                ],
+            },
+            {
+                "group_id": "five_leg",
+                "payout_per_contract": 1.0,
+                "exclusivity_source": "exchange_api",
+                "legs": [
+                    {"venue": "kalshi", "market_id": "D", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "E", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "F", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "G", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "H", "side": "yes"},
+                ],
+            },
+        ],
+        "event_trees": [],
+        "cross_market_parity_checks": [],
+    }
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps(rules), encoding="utf-8")
+
+    # max_bucket_legs=4: 3-leg bucket passes, 5-leg bucket filtered
+    finder = ArbitrageFinder(
+        min_net_edge_per_contract=0.01,
+        enable_cross_venue=False,
+        enable_structural_arb=True,
+        structural_rules_path=str(rules_path),
+        enable_maker_estimates=False,
+        max_bucket_legs=4,
+    )
+
+    quotes = [
+        BinaryQuote("kalshi", "A", 0.30, 0.70, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "B", 0.30, 0.70, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "C", 0.30, 0.70, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "D", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "E", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "F", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "G", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "H", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+    ]
+
+    opps = finder.find(quotes)
+    bucket_opps = [o for o in opps if o.kind is OpportunityKind.STRUCTURAL_BUCKET]
+
+    # Only the 3-leg bucket should pass
+    assert len(bucket_opps) == 1
+    assert bucket_opps[0].metadata.get("bucket_group_id") == "three_leg"
+
+
+def test_max_bucket_legs_zero_means_unlimited(tmp_path: Path) -> None:
+    """max_bucket_legs=0 means no filtering (unlimited)."""
+    rules = {
+        "mutually_exclusive_buckets": [
+            {
+                "group_id": "five_leg",
+                "payout_per_contract": 1.0,
+                "exclusivity_source": "exchange_api",
+                "legs": [
+                    {"venue": "kalshi", "market_id": "A", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "B", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "C", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "D", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "E", "side": "yes"},
+                ],
+            },
+        ],
+        "event_trees": [],
+        "cross_market_parity_checks": [],
+    }
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps(rules), encoding="utf-8")
+
+    finder = ArbitrageFinder(
+        min_net_edge_per_contract=0.01,
+        enable_cross_venue=False,
+        enable_structural_arb=True,
+        structural_rules_path=str(rules_path),
+        enable_maker_estimates=False,
+        max_bucket_legs=0,  # unlimited
+    )
+
+    quotes = [
+        BinaryQuote("kalshi", "A", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "B", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "C", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "D", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "E", 0.18, 0.82, 100, 100, fee_per_contract=0.0),
+    ]
+
+    opps = finder.find(quotes)
+    bucket_opps = [o for o in opps if o.kind is OpportunityKind.STRUCTURAL_BUCKET]
+    # 5-leg bucket should pass with max_bucket_legs=0
+    assert len(bucket_opps) == 1
+
+
+def test_max_bucket_legs_exact_boundary(tmp_path: Path) -> None:
+    """Bucket with exactly max_bucket_legs legs should pass."""
+    rules = {
+        "mutually_exclusive_buckets": [
+            {
+                "group_id": "four_leg",
+                "payout_per_contract": 1.0,
+                "exclusivity_source": "exchange_api",
+                "legs": [
+                    {"venue": "kalshi", "market_id": "A", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "B", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "C", "side": "yes"},
+                    {"venue": "kalshi", "market_id": "D", "side": "yes"},
+                ],
+            },
+        ],
+        "event_trees": [],
+        "cross_market_parity_checks": [],
+    }
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps(rules), encoding="utf-8")
+
+    finder = ArbitrageFinder(
+        min_net_edge_per_contract=0.01,
+        enable_cross_venue=False,
+        enable_structural_arb=True,
+        structural_rules_path=str(rules_path),
+        enable_maker_estimates=False,
+        max_bucket_legs=4,
+    )
+
+    quotes = [
+        BinaryQuote("kalshi", "A", 0.23, 0.77, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "B", 0.23, 0.77, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "C", 0.23, 0.77, 100, 100, fee_per_contract=0.0),
+        BinaryQuote("kalshi", "D", 0.23, 0.77, 100, 100, fee_per_contract=0.0),
+    ]
+
+    opps = finder.find(quotes)
+    bucket_opps = [o for o in opps if o.kind is OpportunityKind.STRUCTURAL_BUCKET]
+    # 4-leg bucket with max=4 should pass (boundary)
+    assert len(bucket_opps) == 1
