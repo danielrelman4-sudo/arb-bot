@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from bot_bridge import BotBridge
+from routes.analytics import router as analytics_router
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Arb Bot Dashboard", lifespan=lifespan)
+app.include_router(analytics_router)
 
 
 async def _reconnect_loop() -> None:
