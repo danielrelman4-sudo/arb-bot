@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from arb_bot.config import AppSettings, LaneTuningSettings
 from arb_bot.correlation import CorrelationAssessment, CorrelationConstraintModel
 from arb_bot.fill_model import CorrelationMode, FillEstimate, FillModel
+from arb_bot.monte_carlo_sim import MonteCarloResult, MonteCarloSettings, MonteCarloSimulator
 from arb_bot.models import (
     ArbitrageOpportunity,
     EngineState,
@@ -83,6 +84,10 @@ class PaperSimPosition:
     filled_contracts: int
     committed_capital_by_venue: dict[str, float]
     expected_realized_profit: float
+    # B2: Monte Carlo simulated PnL (None = use expected_realized_profit).
+    monte_carlo_pnl: float | None = None
+    monte_carlo_all_legs_filled: bool = True
+    monte_carlo_legging_loss: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -189,6 +194,18 @@ class ArbEngine:
         )
         self._state = EngineState(cash_by_venue=self._initial_cash_map())
         self._paper_positions: list[PaperSimPosition] = []
+        self._mc_sim = MonteCarloSimulator(MonteCarloSettings(
+            enabled=settings.paper_monte_carlo_enabled,
+            legging_loss_fraction=settings.paper_monte_carlo_legging_loss_fraction,
+            adverse_selection_probability=settings.paper_monte_carlo_adverse_selection_probability,
+            adverse_selection_edge_loss=settings.paper_monte_carlo_adverse_selection_edge_loss,
+            slippage_std_cents=settings.paper_monte_carlo_slippage_std_cents,
+            slippage_max_cents=settings.paper_monte_carlo_slippage_max_cents,
+            expected_latency_seconds=settings.paper_monte_carlo_expected_latency_seconds,
+            edge_decay_half_life_seconds=settings.paper_monte_carlo_edge_decay_half_life_seconds,
+            resolution_success_rate=settings.paper_monte_carlo_resolution_success_rate,
+            seed=settings.paper_monte_carlo_seed,
+        ))
         window = max(1, self._settings.sizing.kelly_confidence_window)
         self._kelly_relative_error_window: deque[float] = deque(maxlen=window)
         self._lane_dynamic_kelly_floor: dict[OpportunityKind, float] = {
@@ -745,7 +762,7 @@ class ArbEngine:
         full_discovery_venues: set[str] | None = None,
     ) -> list:
         timeout_value = max(1.0, float(timeout_seconds))
-        per_adapter_timeout = max(3.0, min(20.0, timeout_value))
+        per_adapter_timeout = max(3.0, min(45.0, timeout_value))
         try:
             quotes = await self._fetch_all_quotes(
                 venues=venues,
@@ -1012,6 +1029,32 @@ class ArbEngine:
                         timestamp=datetime.now(timezone.utc),
                         action="skipped",
                         reason="cluster_open_position_cap_reached",
+                        opportunity=scored_opportunity,
+                        plan=None,
+                        metrics=metrics,
+                    )
+                )
+                continue
+
+            # B1: Edge sanity gate — reject cross-venue edges that are implausibly
+            # large (likely mapping errors, e.g., "will X run?" vs "will X win?").
+            max_edge_sanity = self._settings.strategy.cross_venue_max_edge_sanity
+            if (
+                max_edge_sanity > 0
+                and scored_opportunity.kind in {OpportunityKind.CROSS_VENUE, OpportunityKind.STRUCTURAL_PARITY}
+                and abs(scored_opportunity.net_edge_per_contract) > max_edge_sanity
+            ):
+                metrics = self._decision_metrics(
+                    opportunity=scored_opportunity,
+                    plan=None,
+                    fill_estimate=None,
+                )
+                metrics.update(context_metrics)
+                decisions.append(
+                    OpportunityDecision(
+                        timestamp=datetime.now(timezone.utc),
+                        action="skipped",
+                        reason="edge_exceeds_sanity_threshold",
                         opportunity=scored_opportunity,
                         plan=None,
                         metrics=metrics,
@@ -2353,6 +2396,37 @@ class ArbEngine:
         position_lifetime_seconds = self._paper_position_lifetime_seconds(opportunity=opportunity, now=now)
         release_at = now + timedelta(seconds=position_lifetime_seconds)
 
+        # B2: Monte Carlo simulation — simulate per-leg fills and realistic PnL.
+        mc_pnl: float | None = None
+        mc_all_legs_filled = True
+        mc_legging_loss = 0.0
+        mc_result: MonteCarloResult | None = None
+        if self._mc_sim.enabled and not self._settings.live_mode:
+            leg_fill_probs_raw = metrics.get("leg_fill_probabilities")
+            leg_fill_probs: tuple[float, ...] | None = None
+            if isinstance(leg_fill_probs_raw, (tuple, list)):
+                leg_fill_probs = tuple(float(p) for p in leg_fill_probs_raw)
+
+            mc_result = self._mc_sim.simulate_trade(
+                opportunity=opportunity,
+                plan=plan,
+                leg_fill_probabilities=leg_fill_probs,
+                all_fill_probability=fill_probability,
+                expected_realized_profit=expected_realized_profit,
+            )
+            mc_pnl = mc_result.simulated_pnl
+            mc_all_legs_filled = mc_result.all_legs_filled
+            mc_legging_loss = mc_result.legging_loss
+
+            # If MC says no legs filled at all, still record position
+            # (simulating that we attempted the trade but got no fills).
+            if mc_result.filled_leg_count == 0:
+                filled_contracts = 0
+                mc_pnl = 0.0
+            elif not mc_result.all_legs_filled:
+                # Legging risk — some legs filled, some didn't.
+                filled_contracts = mc_result.simulated_filled_contracts
+
         self._risk.record_fill(plan, self._state, filled_contracts)
         self._paper_positions.append(
             PaperSimPosition(
@@ -2363,17 +2437,32 @@ class ArbEngine:
                 filled_contracts=filled_contracts,
                 committed_capital_by_venue=committed_capital_by_venue,
                 expected_realized_profit=expected_realized_profit,
+                monte_carlo_pnl=mc_pnl,
+                monte_carlo_all_legs_filled=mc_all_legs_filled,
+                monte_carlo_legging_loss=mc_legging_loss,
             )
         )
 
         opened_metrics = dict(metrics)
         opened_metrics["filled_fraction"] = fill_ratio
-        opened_metrics["pending_settlement_profit"] = expected_realized_profit
+        opened_metrics["pending_settlement_profit"] = mc_pnl if mc_pnl is not None else expected_realized_profit
         opened_metrics["settlement_eta_seconds"] = position_lifetime_seconds
         opened_metrics["realized_edge_per_contract"] = None
         opened_metrics["realized_profit"] = 0.0
         opened_metrics["partial_fill"] = filled_contracts < plan.contracts
         opened_metrics["expected_realized_profit"] = expected_realized_profit
+        opened_metrics["monte_carlo_enabled"] = mc_result is not None
+        if mc_result is not None:
+            opened_metrics["mc_all_legs_filled"] = mc_result.all_legs_filled
+            opened_metrics["mc_filled_leg_count"] = mc_result.filled_leg_count
+            opened_metrics["mc_simulated_pnl"] = mc_result.simulated_pnl
+            opened_metrics["mc_gross_edge_pnl"] = mc_result.gross_edge_pnl
+            opened_metrics["mc_slippage_cost"] = mc_result.slippage_cost
+            opened_metrics["mc_adverse_selection_cost"] = mc_result.adverse_selection_cost
+            opened_metrics["mc_legging_loss"] = mc_result.legging_loss
+            opened_metrics["mc_edge_decay_cost"] = mc_result.edge_decay_cost
+            opened_metrics["mc_adverse_selection_hit"] = mc_result.adverse_selection_hit
+            opened_metrics["mc_simulated_latency_ms"] = mc_result.simulated_latency_ms
         if filled_contracts > 0:
             opened_metrics["expected_realized_edge_per_contract"] = expected_realized_profit / filled_contracts
         return filled_contracts, opened_metrics
@@ -2427,11 +2516,26 @@ class ArbEngine:
                 still_open.append(position)
                 continue
 
+            # B2: Use Monte Carlo PnL if available; otherwise fall back to EV.
+            mc_sim = getattr(self, "_mc_sim", None)
+            if position.monte_carlo_pnl is not None:
+                settlement_profit = position.monte_carlo_pnl
+            elif mc_sim is not None and mc_sim.enabled and not self._settings.live_mode:
+                # MC was enabled but position was opened before MC init —
+                # simulate settlement outcome.
+                settlement_profit = mc_sim.simulate_settlement(
+                    expected_realized_profit=position.expected_realized_profit,
+                    filled_contracts=position.filled_contracts,
+                    opportunity=position.opportunity,
+                )
+            else:
+                settlement_profit = position.expected_realized_profit
+
             committed_total = sum(position.committed_capital_by_venue.values())
             if committed_total > 0:
                 for venue, committed in position.committed_capital_by_venue.items():
                     share = committed / committed_total
-                    profit_share = position.expected_realized_profit * share
+                    profit_share = settlement_profit * share
                     self._state.cash_by_venue[venue] = self._state.cash_for(venue) + committed + profit_share
                     self._state.locked_capital_by_venue[venue] = max(0.0, self._state.locked_for(venue) - committed)
 
@@ -2440,7 +2544,7 @@ class ArbEngine:
 
             realized_edge = 0.0
             if position.filled_contracts > 0:
-                realized_edge = position.expected_realized_profit / position.filled_contracts
+                realized_edge = settlement_profit / position.filled_contracts
 
             metrics: dict[str, float | int | bool | str | None] = {
                 "detected_edge_per_contract": position.opportunity.net_edge_per_contract,
@@ -2449,19 +2553,25 @@ class ArbEngine:
                 "fill_probability": float(position.filled_contracts / max(1, position.plan.contracts)),
                 "partial_fill_probability": 1.0
                 - float(position.filled_contracts / max(1, position.plan.contracts)),
-                "expected_realized_edge_per_contract": realized_edge,
+                "expected_realized_edge_per_contract": (
+                    position.expected_realized_profit / max(1, position.filled_contracts)
+                    if position.filled_contracts > 0 else 0.0
+                ),
                 "expected_realized_profit": position.expected_realized_profit,
                 "expected_slippage_per_contract": 0.0,
                 "fill_quality_score": 0.0,
-                "adverse_selection_flag": False,
+                "adverse_selection_flag": not position.monte_carlo_all_legs_filled,
                 "realized_edge_per_contract": realized_edge,
-                "realized_profit": position.expected_realized_profit,
+                "realized_profit": settlement_profit,
                 "execution_latency_ms": None,
                 "partial_fill": position.filled_contracts < position.plan.contracts,
                 "settlement_lag_seconds": max(
                     0.0,
                     (position.release_at - position.opened_at).total_seconds(),
                 ),
+                "monte_carlo_enabled": position.monte_carlo_pnl is not None,
+                "mc_legging_loss": position.monte_carlo_legging_loss,
+                "mc_all_legs_filled": position.monte_carlo_all_legs_filled,
             }
             settled.append(
                 OpportunityDecision(
@@ -2476,7 +2586,7 @@ class ArbEngine:
             )
             self._record_kelly_calibration(
                 expected_profit=position.expected_realized_profit,
-                realized_profit=position.expected_realized_profit,
+                realized_profit=settlement_profit,
             )
 
         self._paper_positions = still_open
@@ -2534,6 +2644,7 @@ class ArbEngine:
             metrics["adverse_selection_flag"] = fill_estimate.adverse_selection_flag
             metrics["expected_realized_edge_per_contract"] = fill_estimate.expected_realized_edge_per_contract
             metrics["expected_realized_profit"] = fill_estimate.expected_realized_profit
+            metrics["leg_fill_probabilities"] = fill_estimate.leg_fill_probabilities
         return metrics
 
     def _decision_breakdown_summary(self, decisions: list[OpportunityDecision]) -> str:

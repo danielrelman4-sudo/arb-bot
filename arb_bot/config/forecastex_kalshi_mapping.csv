@@ -1,0 +1,122 @@
+group_id,forecastex_symbol,kalshi_series_ticker,category,confidence,comparability,forecastex_description,kalshi_description,notes
+# =============================================================================
+# ECONOMICS — Fed Funds / Interest Rates
+# =============================================================================
+fed_funds_rate,FF,KXFED,economics,high,direct,"US Fed Funds Target Rate","Fed funds rate after meeting",Both ask about the Fed Funds rate level at/after FOMC meetings. ForecastEx uses target rate brackets; Kalshi uses rate threshold contracts. Same underlying data source (FOMC announcement). Different contract structures require bracket-to-threshold alignment.
+fed_funds_decision,FFDEC,KXFED,economics,high,partial,"US Fed Funds Rate Decision (hold/cut/hike)","Fed funds rate after meeting",ForecastEx FFDEC is specifically about the decision action (hold vs cut vs hike by 25/50bps). Kalshi KXFED asks about the resulting rate level. Same event but different framing — need to derive decision from rate level changes.
+fed_rate_cut_count,FF,KXRATECUTCOUNT,economics,medium,indirect,"US Fed Funds Target Rate (series)","Number of rate cuts in 2026",ForecastEx FF series across multiple meetings can be combined to infer cumulative cuts. Kalshi KXRATECUTCOUNT is a single year-end count contract. Indirect mapping — requires aggregation logic.
+# =============================================================================
+# ECONOMICS — Inflation / CPI / PCE / PPI
+# =============================================================================
+cpi_yoy,CPIY,KXCPIYOY,economics,high,direct,"US Consumer Price Index YoY","Inflation (CPI YoY)",Both measure year-over-year CPI inflation. Same underlying BLS data release. Bracket structures may differ but the resolution source is identical.
+cpi_monthly,CPIY,KXCPI,economics,high,partial,"US CPI YoY (monthly release)","CPI monthly",ForecastEx CPIY tracks YoY rate reported monthly. Kalshi KXCPI tracks the monthly CPI level/change. Same BLS release but different metrics (YoY % vs monthly change).
+pce_yoy,PCEY,KXPCECORE,economics,medium,partial,"US PCE Price Index YoY","US Core PCE inflation",ForecastEx PCEY is headline PCE YoY. Kalshi KXPCECORE is core PCE (excluding food/energy). Same BEA release date but different measures — headline vs core. Partial overlap only.
+ppi_yoy,PPIY,,economics,low,none,"US Producer Price Index YoY","(no confirmed Kalshi PPI market)",ForecastEx has PPI YoY. Kalshi does not appear to have a confirmed PPI-specific market as of research date. Monitor Kalshi for new listings.
+# =============================================================================
+# ECONOMICS — Employment / Jobs
+# =============================================================================
+initial_jobless_claims,IJC,KXJOBLESSCLAIMS,economics,high,direct,"US Initial Jobless Claims","Weekly initial jobless claims",Both track weekly initial jobless claims from DOL. Same data source and timing. Contract bracket alignment needed.
+unemployment_rate,UNR,KXECONSTATU3,economics,high,direct,"US Unemployment Rate","Unemployment rate monthly",Both track the monthly unemployment rate from BLS Employment Situation report. Same data source.
+unemployment_level,UNR,KXU3,economics,high,direct,"US Unemployment Rate","Unemployment monthly",Same underlying data. KXU3 appears to be an alternate Kalshi series for unemployment level.
+payroll_employment,PREMP,KXPAYROLLS,economics,high,direct,"US Payroll Employment (Nonfarm)","Jobs numbers this month",Both track nonfarm payrolls from the BLS Employment Situation report. Same release and data source.
+job_openings_jolts,JOLT,,economics,low,none,"US Job Openings (JOLTS)","(no confirmed Kalshi JOLTS market)",ForecastEx has JOLTS. No confirmed Kalshi equivalent found.
+# =============================================================================
+# ECONOMICS — GDP / Growth / Recession
+# =============================================================================
+real_gdp,RGDP,KXGDP,economics,high,direct,"US Real GDP","US GDP predictions",Both track US real GDP growth. Same BEA data release. Bracket-to-threshold alignment needed.
+recession,MRT,KXRECSSNBER,economics,high,direct,"US Recession","Recession this year",Both ask about US recession occurrence. ForecastEx uses rolling quarterly windows; Kalshi KXRECSSNBER uses annual contracts based on NBER determination. Same concept but resolution timing may differ.
+# =============================================================================
+# ECONOMICS — Consumer / Retail / Housing
+# =============================================================================
+consumer_sentiment,CS,,economics,low,none,"US Consumer Sentiment (Michigan)","(no confirmed Kalshi consumer sentiment market)",ForecastEx has CS (Michigan Consumer Sentiment). No confirmed Kalshi equivalent found.
+retail_sales_monthly,RSM,,economics,low,none,"US Retail Sales Monthly","(no confirmed Kalshi retail sales market)",ForecastEx has RSM. No confirmed Kalshi equivalent found.
+building_permits,BPMI,,economics,low,none,"US Building Permits","(no confirmed Kalshi building permits market)",ForecastEx has BPMI. No confirmed Kalshi equivalent found.
+housing_starts,HS,,economics,low,none,"US Housing Starts","(no confirmed Kalshi housing starts market)",ForecastEx has HS. No confirmed Kalshi equivalent found.
+new_home_sales,NHS,,economics,low,none,"US New Home Sales","(no confirmed Kalshi new home sales market)",ForecastEx has NHS. No confirmed Kalshi equivalent found.
+corporate_profits,CP,,economics,low,none,"US Corporate Profits","(no confirmed Kalshi corporate profits market)",ForecastEx has CP. No confirmed Kalshi equivalent found.
+national_debt,ND,,economics,low,none,"US National Debt","(no confirmed Kalshi national debt market)",ForecastEx has ND. No confirmed Kalshi equivalent found.
+industrial_production,USIP,,economics,low,none,"US Industrial Production","(no confirmed Kalshi industrial production market)",ForecastEx has USIP. No confirmed Kalshi equivalent found.
+# =============================================================================
+# ECONOMICS — Mortgage Rates
+# =============================================================================
+mortgage_30yr,MORT1,KXMORTGAGERATE,economics,high,direct,"US 30-Year Mortgage Rate","How high will 30yr mortgage rate get this year",Both track the 30-year mortgage rate. ForecastEx MORT1 uses weekly rate brackets. Kalshi KXMORTGAGERATE is a year-end high/threshold contract. Same Freddie Mac data but different contract horizons.
+mortgage_15yr,MORT2,,economics,low,none,"US 15-Year Mortgage Rate","(no confirmed Kalshi 15yr mortgage market)",ForecastEx has MORT2 (15yr). No confirmed Kalshi 15yr equivalent.
+# =============================================================================
+# FINANCIALS — Stock Indices
+# =============================================================================
+sp500,FES,KXINX,financials,high,direct,"S&P 500 E-mini Futures","S&P 500 range",Both track S&P 500 price levels. ForecastEx uses E-mini futures contract levels; Kalshi uses daily/weekly range brackets on the index. Same underlying but different instruments (futures vs index).
+sp500_yearly,FES,KXINXY,financials,medium,partial,"S&P 500 E-mini Futures","S&P close price end of 2026",ForecastEx FES has multi-month expiries. Kalshi KXINXY is year-end close price. Partial alignment at year-end expiry.
+nasdaq100,FNQ,KXNASDAQ100,financials,high,direct,"Nasdaq 100 E-mini Futures","Nasdaq-100 price range",Both track Nasdaq 100 levels. Same index different instruments. ForecastEx uses E-mini futures; Kalshi uses index range brackets.
+russell2000,FRTY,,financials,low,none,"Russell 2000 Futures","(no confirmed Kalshi Russell 2000 market)",ForecastEx has FRTY. No confirmed Kalshi Russell 2000 equivalent found.
+# =============================================================================
+# FINANCIALS — Treasury Yields
+# =============================================================================
+treasury_10yr,10YRY,KXTNOTED,financials,high,direct,"10-Year Treasury Yield","Treasury 10-year yield daily",Both track 10-year Treasury yield levels. Same underlying data. ForecastEx uses quarterly expiry brackets; Kalshi uses daily yield brackets.
+treasury_10yr_weekly,10YRY,KXTNOTEW,financials,high,direct,"10-Year Treasury Yield","Treasury 10-year yield weekly",Same as above but Kalshi weekly series.
+treasury_2yr,2YRY,,financials,low,none,"2-Year Treasury Yield","(no confirmed Kalshi 2yr yield market)",ForecastEx has 2-30yr yield contracts. Kalshi confirmed only for 10yr.
+treasury_5yr,5YRY,,financials,low,none,"5-Year Treasury Yield","(no confirmed Kalshi 5yr yield market)",ForecastEx has 5yr yield. No confirmed Kalshi equivalent.
+treasury_30yr,30YRY,,financials,low,none,"30-Year Treasury Yield","(no confirmed Kalshi 30yr yield market)",ForecastEx has 30yr yield. No confirmed Kalshi equivalent.
+# =============================================================================
+# CRYPTO — Daily Prices
+# =============================================================================
+bitcoin_daily,CBBTC,,crypto,medium,partial,"Crypto Bitcoin Price Daily","(Kalshi has hourly/range BTC but daily format differs)",ForecastEx CBBTC has daily price brackets. Kalshi offers BTC price range and above/below contracts but with different timeframes and settlement sources. Needs detailed contract-level alignment.
+bitcoin_yearly_high,CBBTC,KXBTCMAXY,crypto,medium,partial,"Crypto Bitcoin Daily (year-end derivable)","How high will Bitcoin get this year",ForecastEx daily BTC series. Kalshi KXBTCMAXY is year-end high. Indirect — ForecastEx daily data could inform year-high views but contracts are not 1:1.
+bitcoin_yearly_low,CBBTC,KXBTCMINY,crypto,medium,partial,"Crypto Bitcoin Daily (year-end derivable)","How low will Bitcoin fall this year",Same logic as above for year-end low.
+ethereum_daily,CBETH,,crypto,medium,partial,"Crypto Ethereum Price Daily","(Kalshi has hourly ETH price markets)",ForecastEx CBETH has daily ETH brackets. Kalshi has hourly/range ETH contracts. Different timeframes.
+solana_daily,CFSOL,,crypto,low,none,"Crypto Solana Price Daily","(Kalshi has SOL range markets but ticker unconfirmed)",ForecastEx has daily SOL. Kalshi has SOL markets but exact ticker not confirmed in research.
+xrp_daily,CFXRP,,crypto,low,none,"Crypto XRP Price Daily","(Kalshi has XRP markets but ticker unconfirmed)",Same situation as SOL.
+dogecoin_daily,CFDOG,,crypto,low,none,"Crypto Dogecoin Futures","(no confirmed Kalshi DOGE market)",ForecastEx has DOGE futures. Kalshi DOGE status unconfirmed.
+cardano_daily,CBADA,,crypto,low,none,"Crypto Cardano Price Daily","(no confirmed Kalshi ADA market)",ForecastEx has ADA daily. Kalshi ADA status unconfirmed.
+# =============================================================================
+# COMMODITIES
+# =============================================================================
+crude_oil_wti,CRUDW,KXWTI,commodities,high,direct,"Crude Oil WTI","WTI oil price today",Both track WTI crude oil price. Same underlying commodity. ForecastEx uses futures-style brackets; Kalshi uses daily price range/threshold contracts.
+crude_oil_wti_weekly,CRUDW,KXWTIW,commodities,high,direct,"Crude Oil WTI","WTI oil price on Friday",Same WTI but Kalshi weekly series.
+crude_oil_wti_yearly,CRUDW,KXWTIMAX,commodities,medium,partial,"Crude Oil WTI","How high will WTI oil get by end of year",ForecastEx WTI multi-expiry. Kalshi yearly high. Partial alignment.
+crude_oil_brent,CRUDB,,commodities,low,none,"Crude Oil Brent","(no confirmed Kalshi Brent crude market)",ForecastEx has Brent. No confirmed Kalshi Brent equivalent.
+gold,METLG,KXGOLD,commodities,high,direct,"Metal Gold","Price of gold",Both track gold price. Same underlying commodity. Contract structure alignment needed.
+silver,METLS,,commodities,low,none,"Metal Silver","(no confirmed Kalshi silver market)",ForecastEx has silver. Kalshi silver ticker not confirmed.
+platinum,METLP,,commodities,low,none,"Metal Platinum","(no confirmed Kalshi platinum market)",ForecastEx has platinum. No confirmed Kalshi equivalent.
+copper,COMCO,,commodities,low,none,"Copper Price","(no confirmed Kalshi copper market)",ForecastEx has copper. No confirmed Kalshi equivalent.
+natural_gas,COMHH,,commodities,low,none,"Natural Gas Henry Hub","(no confirmed Kalshi nat gas market)",ForecastEx has Henry Hub nat gas. No confirmed Kalshi equivalent.
+# =============================================================================
+# CLIMATE / TEMPERATURE — Daily High Temps
+# =============================================================================
+temp_nyc,UHLGA,KXHIGHNY,temperature,high,direct,"New York City Daily High Temp","Highest temperature in NYC today",Both track daily high temp in NYC. Same NWS data source. Both use bracket/range contracts. Highest-confidence weather overlap.
+temp_chicago,UHMDW,KXHIGHCHI,temperature,high,direct,"Chicago Daily High Temp","Highest temperature in Chicago today",Both track daily high temp in Chicago. ForecastEx uses MDW (Midway). Kalshi uses KXHIGH prefix. Same NWS resolution. Station alignment needs verification.
+temp_miami,UHMIA,KXHIGHMI,temperature,high,direct,"Miami Daily High Temp","Highest temperature in Miami today",Both track daily high in Miami. Same NWS data. Station alignment needed.
+temp_los_angeles,UHLAX,KXHIGHLA,temperature,high,direct,"Los Angeles Daily High Temp","Highest temperature in LA today",Both track daily high in LA. Same NWS data.
+temp_austin,UHAUS,KXHIGHAUS,temperature,medium,partial,"Austin Daily High Temp","Highest temperature in Austin today",ForecastEx has Austin. Kalshi likely has Austin but exact ticker unconfirmed beyond known cities.
+temp_phoenix,UHPHX,KXHIGHPHX,temperature,medium,partial,"Phoenix Daily High Temp","Highest temperature in Phoenix today",ForecastEx has Phoenix. Kalshi has Phoenix daily high markets. Exact ticker format inferred from KXHIGH pattern.
+temp_minneapolis,UHMSP,KXHIGHMSP,temperature,medium,partial,"Minneapolis Daily High Temp","Highest temperature in Minneapolis today",ForecastEx has Minneapolis. Kalshi has Minneapolis. Exact ticker inferred.
+temp_philadelphia,UHPHL,KXHIGHPHL,temperature,medium,partial,"Philadelphia Daily High Temp","Lowest/highest temperature in Philadelphia today",ForecastEx has Philly high. Kalshi has Philly temp markets. Need to confirm Kalshi offers HIGH (not just LOW) for Philly.
+temp_dallas,UHDFW,KXHIGHDFW,temperature,medium,partial,"Dallas/Fort Worth Daily High Temp","Highest temperature in Dallas area",ForecastEx has DFW. Kalshi likely has Dallas.
+temp_houston,UHHOU,KXHIGHHOU,temperature,medium,partial,"Houston Daily High Temp","Highest temperature in Houston",ForecastEx has Houston. Kalshi coverage unconfirmed.
+temp_oklahoma_city,UHOKC,KXHIGHOKC,temperature,medium,partial,"Oklahoma City Daily High Temp","Highest temperature in Oklahoma City",ForecastEx has OKC. Kalshi has OKC markets visible in search results.
+temp_seattle,UHSEA,KXHIGHSEA,temperature,medium,partial,"Seattle Daily High Temp","Highest temperature in Seattle",ForecastEx has Seattle. Kalshi coverage likely but unconfirmed ticker.
+temp_san_francisco,UHSFO,KXHIGHSFO,temperature,medium,partial,"San Francisco Daily High Temp","Highest temperature in San Francisco",ForecastEx has SFO. Kalshi coverage likely but unconfirmed ticker.
+temp_boston,UHBOS,KXHIGHBOS,temperature,medium,partial,"Boston Daily High Temp","Highest temperature in Boston",ForecastEx has Boston. Kalshi coverage likely.
+temp_las_vegas,UHLAS,KXHIGHLAS,temperature,medium,partial,"Las Vegas Daily High Temp","Highest temperature in Las Vegas",ForecastEx has Las Vegas. Kalshi coverage likely.
+temp_detroit,UHDTW,KXHIGHDTW,temperature,medium,partial,"Detroit Daily High Temp","Highest temperature in Detroit",ForecastEx has Detroit. Kalshi coverage unconfirmed.
+temp_dc,UHDCA,KXHIGHDC,temperature,medium,partial,"Washington DC Daily High Temp","Highest temperature in DC",ForecastEx has DC. Kalshi coverage unconfirmed.
+# =============================================================================
+# CLIMATE — Global Temperature / Carbon
+# =============================================================================
+global_temp_annual,GT,KXHMONTHRANGE,climate,medium,partial,"Global Temperature Annual","Monthly temperature increase",ForecastEx GT is annual global temp anomaly. Kalshi KXHMONTHRANGE is monthly temp increase. Different timeframes and possibly different data sources.
+global_temp_monthly,GTM,KXHMONTHRANGE,climate,medium,partial,"Global Temperature Monthly","Monthly temperature increase",ForecastEx GTM is monthly global temp. Kalshi KXHMONTHRANGE is monthly. Closer alignment but data source verification needed.
+co2_atmospheric,ACD,,climate,low,none,"Atmospheric CO2 Concentration","(no confirmed Kalshi CO2 market)",ForecastEx has ACD. No confirmed Kalshi equivalent.
+carbon_emissions,GCE,,climate,low,none,"Global Carbon Dioxide Emissions","(no confirmed Kalshi emissions market)",ForecastEx has GCE. No confirmed Kalshi equivalent.
+# =============================================================================
+# ELECTIONS / POLITICS
+# =============================================================================
+house_control,HORC,CONTROLH,politics,high,direct,"US House of Representatives Control","Which party will win the US House",Both ask about party control of the House after 2026 midterms. Same resolution — which party holds majority. Highest OI on ForecastEx (1.6M contracts).
+senate_control,SENM,CONTROLS,politics,high,direct,"US Senate Majority","Which party will win the US Senate",Both ask about party control of the Senate. Same resolution.
+governor_california,G01CA,KXGOVCA,politics,high,direct,"California Governor Race","California Governor winner",Both track the 2026 CA gubernatorial race outcome. Same election.
+governor_ohio,G01OH,KXGOVOH,politics,medium,partial,"Ohio Governor Race","Ohio Governor winner",ForecastEx has OH governor. Kalshi has OH governor markets. Exact Kalshi ticker inferred.
+governor_georgia,G01GA,KXGOVGA,politics,medium,partial,"Georgia Governor Race","Georgia Governor winner",ForecastEx has GA governor. Kalshi has GA governor markets.
+governor_florida,G01FL,KXGOVFL,politics,medium,partial,"Florida Governor Race","Florida Governor winner",ForecastEx has FL governor. Kalshi likely has FL governor.
+governor_texas,G01TX,KXGOVTX,politics,medium,partial,"Texas Governor Race","Texas Governor winner",ForecastEx has TX governor. Kalshi likely has TX governor.
+governor_new_york,G01NY,KXGOVNY,politics,medium,partial,"New York Governor Race","New York Governor winner",ForecastEx has NY governor. Kalshi likely has NY governor.
+presidential_candidate_dem,PCD,,politics,low,none,"US Presidential Candidate Democrat (2028)","(no confirmed Kalshi 2028 Dem primary market yet)",ForecastEx has PCD for 2028. Kalshi may add but not confirmed.
+presidential_candidate_rep,PCR,,politics,low,none,"US Presidential Candidate Republican (2028)","(no confirmed Kalshi 2028 GOP primary market yet)",ForecastEx has PCR for 2028. Kalshi may add but not confirmed.
+fed_chair_nomination,PNFED,,politics,low,none,"Presidential Nomination for Fed Chair","(no confirmed Kalshi Fed Chair market)",ForecastEx has PNFED (Jan 2029 expiry). Kalshi status unconfirmed.

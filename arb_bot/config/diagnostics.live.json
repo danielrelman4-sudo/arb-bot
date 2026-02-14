@@ -1,0 +1,12 @@
+{
+  "kalshi_candidates": 28805,
+  "polymarket_candidates": 21881,
+  "mappings_emitted": 1708,
+  "unmatched_kalshi": 27097,
+  "unmatched_polymarket": 20173,
+  "skip_reasons": {
+    "below_threshold": 26233,
+    "no_indexable_tokens": 379,
+    "ambiguous_top_match": 172
+  }
+}

@@ -398,3 +398,38 @@ All must be green before Phase 8 Stage 1.
 - `arb_bot/paper.py` — Paper simulation (needs Phase 3 execution realism upgrades)
 - `arb_bot/config.py` — Configuration (needs new params for all phases)
 - `arb_bot/order_store.py` — NEW: persistent SQLite store (Phase 0)
+
+---
+
+## POST-PHASE BACKLOG (Identified During Paper Run Validation)
+
+### B1. Cross-venue mapping semantic verification pipeline
+- Current cross_venue_map generator matches markets by name/text similarity only
+- Does NOT verify both sides ask the same question (e.g., "will X run?" vs "will X win?")
+- KX2028RRUN mapping bug inflated paper PnL by 81% — detected 65¢ "edges" that were just the difference between probability of running vs winning
+- **Architecture: LLM-as-offline-curator (NOT in the hot path)**
+  - Separate process runs parallel to the bot, periodically (e.g., every 15-30 min)
+  - Fetches market titles, descriptions, and resolution criteria from both venues
+  - Uses LLM to semantically compare each candidate pair: same question? same resolution? same time horizon?
+  - Outputs a confirmed-matches CSV with confidence scores and rejection reasons
+  - Bot reads the confirmed-matches file on startup and via hot-reload when updated
+  - LLM latency (~1-5s per pair) is acceptable offline but NOT in the detection/execution loop
+- Pipeline stages:
+  1. Text-similarity candidate generation (current approach — fast, high recall, low precision)
+  2. LLM semantic verification (new — slower, high precision, filters false positives)
+  3. Price correlation validation (optional — truly equivalent markets should co-move)
+  4. Output: `cross_venue_map.verified.csv` with only LLM-confirmed matches
+- Runtime safety: bot also applies a max-edge-per-contract sanity gate (e.g., reject cross-venue edges >30% as likely mapping errors)
+- Related: runtime price-sum sanity check already added for structural buckets (_BUCKET_PRICE_SUM_MIN=0.70)
+
+### B2. Monte Carlo execution simulation for paper runs
+- Current paper mode books `expected_realized_profit` as actual PnL for every trade — this is an expected value, not a simulated outcome
+- Result: 100% win rate across 1000+ trades, which is unrealistic
+- Need: Monte Carlo settlement that randomly simulates per-trade outcomes:
+  - Fill/no-fill for each leg (using fill_probability per leg, not just combined)
+  - Legging risk: leg 1 fills but leg 2 doesn't → exposed position with loss
+  - Adverse selection: filled orders have worse-than-expected outcomes (price moved against us)
+  - Slippage: actual fill price differs from quoted price
+  - Execution latency: edge decay between detection and fill
+- Should produce realistic PnL distributions with wins AND losses
+- Key metric: what % of the expected-value PnL actually converts to realized PnL?
