@@ -844,7 +844,25 @@ def build_generation_diagnostics(
 
                         if any_denied:
                             skip_reason = "not_mutually_exclusive:exchange_denied"
-                        elif not all_confirmed:
+
+                        # Always check temporal/threshold patterns regardless
+                        # of exchange flag — exchanges misclassify nested
+                        # temporal intervals as mutually exclusive.
+                        if skip_reason is None:
+                            diag_market_ids = [m.market_id for m in candidate]
+                            diag_titles = [m.title for m in candidate]
+                            if _looks_like_temporal_suffixes(diag_market_ids):
+                                skip_reason = "not_mutually_exclusive:temporal_variant_markets"
+                            elif _looks_like_numeric_thresholds(outcomes):
+                                skip_reason = "not_mutually_exclusive:numeric_threshold_markets"
+                            elif any(
+                                pattern.search(title)
+                                for title in diag_titles
+                                for pattern in _TEMPORAL_PATTERNS
+                            ):
+                                skip_reason = "not_mutually_exclusive:temporal_language_in_title"
+
+                        if skip_reason is None and not all_confirmed:
                             rejection = _classify_bucket_exclusivity(candidate, outcomes)
                             if rejection is not None:
                                 skip_reason = f"not_mutually_exclusive:{rejection}"
@@ -942,7 +960,7 @@ def generate_structural_rules_payload(
         # --- Tiered mutual exclusivity check ---
         # Priority 1: exchange-authoritative flag (Kalshi mutually_exclusive,
         # Polymarket negRisk).  If any market explicitly denies exclusivity,
-        # hard reject.  If all confirm, skip heuristics entirely.
+        # hard reject.  If all confirm, trust the exchange for most checks.
         exchange_flags = [m.exchange_mutually_exclusive for m in candidate]
         any_denied = any(f is False for f in exchange_flags)
         all_confirmed = all(f is True for f in exchange_flags)
@@ -950,10 +968,29 @@ def generate_structural_rules_payload(
         if any_denied:
             continue
 
+        # Priority 1.5: ALWAYS run temporal/threshold structural checks,
+        # even when exchange confirms exclusivity.  Exchanges (especially
+        # Kalshi) mark entire events as mutually_exclusive even when
+        # sub-markets are nested temporal intervals ("by March" ⊂ "by April")
+        # or cumulative thresholds — these can NEVER be mutually exclusive
+        # regardless of exchange flag.
+        market_ids = [m.market_id for m in candidate]
+        titles = [m.title for m in candidate]
+        if _looks_like_temporal_suffixes(market_ids):
+            continue
+        if _looks_like_numeric_thresholds(outcomes):
+            continue
+        if any(
+            pattern.search(title)
+            for title in titles
+            for pattern in _TEMPORAL_PATTERNS
+        ):
+            continue
+
         exclusivity_source = "exchange_api" if all_confirmed else "heuristic"
 
-        # Priority 2: heuristic text-pattern checks (only when no exchange
-        # confirmation is available).
+        # Priority 2: remaining heuristic text-pattern checks (only when no
+        # exchange confirmation is available).
         if not all_confirmed:
             rejection = _classify_bucket_exclusivity(candidate, outcomes)
             if rejection is not None:

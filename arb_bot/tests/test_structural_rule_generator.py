@@ -923,15 +923,55 @@ def _kalshi_market_with_me(
     return row
 
 
+def _kalshi_market_with_me_title(
+    event_ticker: str,
+    suffix: str,
+    outcome: str,
+    title: str,
+    *,
+    mutually_exclusive: bool | None = None,
+    liquidity: float = 100.0,
+) -> dict:
+    """Helper: Kalshi market dict with custom title and optional ME field."""
+    row = {
+        "venue": "kalshi",
+        "event_ticker": event_ticker,
+        "ticker": f"{event_ticker}-{suffix}",
+        "title": title,
+        "subtitle": outcome,
+        "status": "open",
+        "liquidity": liquidity,
+    }
+    if mutually_exclusive is not None:
+        row["mutually_exclusive"] = mutually_exclusive
+    return row
+
+
 class TestExchangeAuthorityInGeneration:
     """Tests for tiered exclusivity check in generate_structural_rules_payload."""
 
-    def test_exchange_confirmed_bucket_bypasses_heuristics(self) -> None:
-        """ME=True bucket that would fail numeric threshold check still generates.
+    def test_exchange_confirmed_bucket_bypasses_remaining_heuristics(self) -> None:
+        """ME=True bucket with legitimate outcomes bypasses remaining heuristics.
 
-        Without exchange confirmation, these numeric outcomes would be
-        rejected by _looks_like_numeric_thresholds().  With ME=True, the
-        heuristic is skipped.
+        Alice/Bob/Carol pass temporal/threshold structural checks (they're
+        not temporal or numeric), so exchange confirmation is trusted.
+        """
+        markets = [
+            _kalshi_market_with_me("KXRACE", "A", "Alice", mutually_exclusive=True),
+            _kalshi_market_with_me("KXRACE", "B", "Bob", mutually_exclusive=True),
+            _kalshi_market_with_me("KXRACE", "C", "Carol", mutually_exclusive=True),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        buckets = payload["mutually_exclusive_buckets"]
+        assert len(buckets) == 1
+        assert buckets[0]["exclusivity_source"] == "exchange_api"
+
+    def test_numeric_thresholds_rejected_even_with_exchange_confirmation(self) -> None:
+        """Numeric threshold outcomes are rejected even when exchange says ME=True.
+
+        Exchanges sometimes mark events with cumulative threshold sub-markets
+        (5, 10, 20, 50, 100) as mutually_exclusive — but these are NEVER
+        truly exclusive (if value > 20, both "above 10" and "above 20" resolve YES).
         """
         markets = [
             _kalshi_market_with_me("KXTEST", "5", "5", mutually_exclusive=True),
@@ -941,9 +981,7 @@ class TestExchangeAuthorityInGeneration:
             _kalshi_market_with_me("KXTEST", "100", "100", mutually_exclusive=True),
         ]
         payload = generate_structural_rules_payload(markets)
-        buckets = payload["mutually_exclusive_buckets"]
-        assert len(buckets) == 1
-        assert buckets[0]["exclusivity_source"] == "exchange_api"
+        assert len(payload["mutually_exclusive_buckets"]) == 0
 
     def test_exchange_denied_bucket_rejected(self) -> None:
         """ME=False bucket is rejected regardless of heuristic outcome.
@@ -998,6 +1036,62 @@ class TestExchangeAuthorityInGeneration:
         assert len(buckets) == 1
         assert "exclusivity_source" in buckets[0]
         assert buckets[0]["exclusivity_source"] == "exchange_api"
+
+    def test_temporal_suffixes_rejected_even_with_exchange_confirmation(self) -> None:
+        """Temporal month-suffix market IDs are rejected even when ME=True.
+
+        This is the KXKHAMENEIOUT-AKHA case: markets like "by March / by April /
+        by July / by September" are nested temporal intervals where "by March" ⊂
+        "by April".  These can NEVER be mutually exclusive regardless of exchange flag.
+        """
+        markets = [
+            _kalshi_market_with_me("KXEXIT", "26MAR01", "By March", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEXIT", "26APR01", "By April", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEXIT", "26JUL01", "By July", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEXIT", "26SEP01", "By September", mutually_exclusive=True),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        assert len(payload["mutually_exclusive_buckets"]) == 0
+
+    def test_temporal_title_rejected_even_with_exchange_confirmation(self) -> None:
+        """Temporal 'by [date]' language in title rejected even when ME=True.
+
+        Catches cases like KXUSAIRANAGREEMENT where market IDs don't have
+        obvious month suffixes but titles say 'by April 2026'.
+        """
+        markets = [
+            _kalshi_market_with_me_title(
+                "KXDEAL", "27", "By end of 2027",
+                "Will the US reach a deal by end of 2027?",
+                mutually_exclusive=True,
+            ),
+            _kalshi_market_with_me_title(
+                "KXDEAL", "27-26APR", "By April 2026",
+                "Will the US reach a deal by April 2026?",
+                mutually_exclusive=True,
+            ),
+            _kalshi_market_with_me_title(
+                "KXDEAL", "27-26AUG", "By August 2026",
+                "Will the US reach a deal by August 2026?",
+                mutually_exclusive=True,
+            ),
+        ]
+        payload = generate_structural_rules_payload(markets)
+        assert len(payload["mutually_exclusive_buckets"]) == 0
+
+    def test_diagnostics_temporal_override_reports_reason(self) -> None:
+        """Diagnostics should report temporal_variant_markets even when ME=True."""
+        markets = [
+            _kalshi_market_with_me("KXEXIT", "26MAR01", "By March", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEXIT", "26APR01", "By April", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEXIT", "26JUL01", "By July", mutually_exclusive=True),
+            _kalshi_market_with_me("KXEXIT", "26SEP01", "By September", mutually_exclusive=True),
+        ]
+        diagnostics = build_generation_diagnostics(markets)
+        assert len(diagnostics) == 1
+        assert diagnostics[0].bucket_emitted is False
+        assert diagnostics[0].skip_reason is not None
+        assert "temporal_variant_markets" in diagnostics[0].skip_reason
 
     def test_diagnostics_exchange_denied_reports_reason(self) -> None:
         """Diagnostics should report exchange_denied for ME=False events."""
