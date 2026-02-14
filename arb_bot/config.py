@@ -693,6 +693,7 @@ class AppSettings:
     paper_monte_carlo_edge_decay_half_life_seconds: float = 30.0
     paper_monte_carlo_resolution_success_rate: float = 0.95
     paper_monte_carlo_seed: int | None = None
+    control_socket_port: int = 9120
 
 
 
@@ -885,6 +886,7 @@ def load_settings() -> AppSettings:
             os.getenv("ARB_PAPER_MONTE_CARLO_SEED"),
             0,
         ) or None,
+        control_socket_port=_as_int(os.getenv("ARB_CONTROL_SOCKET_PORT"), 9120),
         stream_mode=_as_bool(os.getenv("ARB_STREAM_MODE"), False),
         stream_recompute_cooldown_ms=_as_int(os.getenv("ARB_STREAM_RECOMPUTE_COOLDOWN_MS"), 400),
         stream_poll_decision_clock=_as_bool(os.getenv("ARB_STREAM_POLL_DECISION_CLOCK"), True),
