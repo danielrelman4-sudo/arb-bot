@@ -416,8 +416,13 @@ class ArbEngine:
 
         def _start_stream_task(adapter: ExchangeAdapter, *, reason: str) -> None:
             async def _consume(adapter_ref: ExchangeAdapter) -> None:
-                async for quote in adapter_ref.stream_quotes():
-                    await queue.put(quote)
+                try:
+                    async for quote in adapter_ref.stream_quotes():
+                        await queue.put(quote)
+                except asyncio.CancelledError:
+                    LOGGER.debug("stream consume task cancelled for %s", adapter_ref.venue)
+                except Exception as exc:
+                    LOGGER.warning("stream consume task error for %s: %s", adapter_ref.venue, exc)
 
             task = asyncio.create_task(_consume(adapter))
             stream_tasks[adapter.venue] = (adapter, task)
@@ -590,6 +595,10 @@ class ArbEngine:
                         last_eval_ts = now_ms
                 except asyncio.TimeoutError:
                     pass
+                except asyncio.CancelledError:
+                    # A stream task cancellation can propagate through queue.get()
+                    # on Python 3.9. Swallow it so the loop survives.
+                    LOGGER.debug("stream loop queue.get() cancelled, continuing")
 
                 now_ts = time.time()
                 if (now_ts - last_poll_refresh_ts) >= effective_poll_refresh_interval:
