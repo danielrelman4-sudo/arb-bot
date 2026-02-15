@@ -81,6 +81,7 @@ class CryptoSettings:
     bankroll: float = 500.0
     max_position_per_market: float = 50.0
     max_concurrent_positions: int = 10
+    max_positions_per_underlying: int = 3
     kelly_fraction_cap: float = 0.10
 
     # ── Execution ──────────────────────────────────────────────────
@@ -131,6 +132,7 @@ def load_crypto_settings() -> CryptoSettings:
         bankroll=_as_float(os.getenv("ARB_CRYPTO_BANKROLL"), 500.0),
         max_position_per_market=_as_float(os.getenv("ARB_CRYPTO_MAX_POSITION_PER_MARKET"), 50.0),
         max_concurrent_positions=_as_int(os.getenv("ARB_CRYPTO_MAX_CONCURRENT_POSITIONS"), 10),
+        max_positions_per_underlying=_as_int(os.getenv("ARB_CRYPTO_MAX_POSITIONS_PER_UNDERLYING"), 3),
         kelly_fraction_cap=_as_float(os.getenv("ARB_CRYPTO_KELLY_FRACTION_CAP"), 0.10),
         use_maker=_as_bool(os.getenv("ARB_CRYPTO_USE_MAKER"), True),
         maker_timeout_seconds=_as_float(os.getenv("ARB_CRYPTO_MAKER_TIMEOUT_SECONDS"), 5.0),

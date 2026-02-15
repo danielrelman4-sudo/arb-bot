@@ -660,3 +660,62 @@ class TestAllowedDirections:
 
         probs = engine._compute_model_probabilities([up_quote])
         assert up_market.ticker in probs
+
+
+# ── Per-underlying position cap (A2) ──────────────────────────────
+
+class TestPerUnderlyingPositionCap:
+    def test_count_positions_for_underlying(self) -> None:
+        """_count_positions_for_underlying correctly counts BTC positions."""
+        settings = _make_settings(max_positions_per_underlying=3)
+        engine = CryptoEngine(settings)
+
+        # Inject 2 BTC positions directly
+        edge1 = _make_edge(ticker="KXBTCD-26FEB14-T97000", side="yes", yes_price=0.50)
+        edge2 = _make_edge(ticker="KXBTCD-26FEB14-T98000", side="yes", yes_price=0.40)
+        engine._execute_paper_trade(edge1, 5)
+        engine._execute_paper_trade(edge2, 5)
+
+        assert engine._count_positions_for_underlying("BTC") == 2
+        assert engine._count_positions_for_underlying("ETH") == 0
+
+    def test_underlying_cap_blocks_excess_positions(self) -> None:
+        """When cap is reached, new positions for that underlying are blocked."""
+        async def _run() -> None:
+            settings = _make_settings(
+                mc_num_paths=100,
+                max_positions_per_underlying=2,
+                max_concurrent_positions=10,
+                min_edge_pct=0.01,
+                min_edge_cents=0.01,
+                max_model_uncertainty=0.20,
+                paper_slippage_cents=0.0,
+            )
+            engine = CryptoEngine(settings)
+
+            # Inject BTC price data — price clearly above strikes
+            ts = time.time()
+            for i in range(100):
+                engine.price_feed.inject_tick(
+                    PriceTick("btcusdt", 100000.0, ts - 100 + i, 1.0)
+                )
+
+            # Pre-inject 2 BTC positions to reach the cap
+            edge1 = _make_edge(ticker="KXBTCD-26FEB14-T90000", side="yes", yes_price=0.30)
+            edge2 = _make_edge(ticker="KXBTCD-26FEB14-T91000", side="yes", yes_price=0.30)
+            engine._execute_paper_trade(edge1, 5)
+            engine._execute_paper_trade(edge2, 5)
+
+            assert engine._count_positions_for_underlying("BTC") == 2
+
+            # Try to open a 3rd BTC position via cycle — should be blocked
+            quote = _make_quote(
+                "KXBTCD-26FEB14-T80000",
+                yes_price=0.30, no_price=0.70, tte_minutes=10.0,
+            )
+            await engine.run_cycle_with_quotes([quote])
+
+            # Should still have only 2 BTC positions (3rd blocked by cap)
+            assert engine._count_positions_for_underlying("BTC") == 2
+
+        asyncio.run(_run())

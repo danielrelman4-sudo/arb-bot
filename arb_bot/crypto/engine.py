@@ -224,6 +224,19 @@ class CryptoEngine:
         """Signal the engine to stop after the current cycle."""
         self._running = False
 
+    # ── Position helpers ────────────────────────────────────────────
+
+    def _count_positions_for_underlying(self, underlying: str) -> int:
+        """Count open positions for a given underlying (e.g., 'BTC')."""
+        count = 0
+        for ticker in self._positions:
+            for ul in _KALSHI_TO_BINANCE:
+                if ul in ticker.upper():
+                    if ul == underlying:
+                        count += 1
+                    break
+        return count
+
     # ── Cycle ─────────────────────────────────────────────────────
 
     async def _run_cycle(self) -> None:
@@ -250,6 +263,9 @@ class CryptoEngine:
                 break
             if edge.market.ticker in self._positions:
                 continue  # Already have a position
+            underlying = edge.market.meta.underlying
+            if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
+                continue
 
             contracts = self._compute_position_size(edge)
             if contracts <= 0:
@@ -343,6 +359,9 @@ class CryptoEngine:
             if len(self._positions) >= self._settings.max_concurrent_positions:
                 break
             if edge.market.ticker in self._positions:
+                continue
+            underlying = edge.market.meta.underlying
+            if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
                 continue
 
             contracts = self._compute_position_size(edge)
