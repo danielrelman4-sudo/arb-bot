@@ -112,6 +112,11 @@ class CryptoSettings:
     activity_scaling_short_window_seconds: int = 300    # "current" volume window
     activity_scaling_long_window_seconds: int = 3600    # "average" volume window
 
+    # ── Volume clock ────────────────────────────────────────────
+    volume_clock_enabled: bool = False  # Default off for backward compat
+    volume_clock_short_window_seconds: int = 300    # Current volume rate window
+    volume_clock_baseline_window_seconds: int = 3600  # Baseline ("normal") volume window
+
     # ── Cycle timing ───────────────────────────────────────────────
     scan_interval_seconds: float = 5.0
 
@@ -175,6 +180,9 @@ def load_crypto_settings() -> CryptoSettings:
         ofi_recalibrate_interval_hours=_as_float(os.getenv("ARB_CRYPTO_OFI_RECALIBRATE_HOURS"), 4.0),
         ofi_impact_exponent=_as_float(os.getenv("ARB_CRYPTO_OFI_IMPACT_EXPONENT"), 0.5),
         agg_trades_ws_enabled=_as_bool(os.getenv("ARB_CRYPTO_AGG_TRADES_WS_ENABLED"), True),
+        volume_clock_enabled=_as_bool(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_ENABLED"), False),
+        volume_clock_short_window_seconds=_as_int(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_SHORT_WINDOW"), 300),
+        volume_clock_baseline_window_seconds=_as_int(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_BASELINE_WINDOW"), 3600),
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),
