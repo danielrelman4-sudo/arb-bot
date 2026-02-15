@@ -385,7 +385,7 @@ async def run_paper_test(
     engine = CryptoEngine(settings)
 
     print(f"\n{'='*70}")
-    print(f"  Crypto Prediction Engine — Paper Test v2")
+    print(f"  Crypto Prediction Engine — Paper Test v2 (aggTrades WS)")
     print(f"  (OFI drift + activity scaling + jump diffusion + 15m markets)")
     print(f"{'='*70}")
     print(f"  Underlyings:    {', '.join(underlyings)}")
@@ -472,7 +472,15 @@ async def run_paper_test(
             else:
                 print(f"   {sym.upper()}: insufficient data for vol estimate")
 
-        # 4. Main loop
+        # 4. Start aggTrades WebSocket for continuous OFI data
+        agg_trades_task = None
+        if settings.agg_trades_ws_enabled:
+            agg_trades_task = asyncio.create_task(
+                engine.price_feed.connect_agg_trades_ws()
+            )
+            print("\nStarted aggTrades WebSocket stream for continuous OFI data")
+
+        # 5. Main loop
         start_time = time.monotonic()
         cycle = 0
 
@@ -494,21 +502,7 @@ async def run_paper_test(
                     PriceTick(symbol=sym, price=price, timestamp=time.time(), volume=0)
                 )
 
-            # Refresh aggTrades for live OFI updates
-            for sym in binance_symbols:
-                trades = await fetch_binance_agg_trades(sym, 100, client)
-                for trade in trades:
-                    try:
-                        ts = float(trade["T"]) / 1000.0
-                        price_t = float(trade["p"])
-                        qty = float(trade["q"])
-                        is_bm = trade.get("m")
-                    except (KeyError, ValueError, TypeError):
-                        continue
-                    engine.price_feed.inject_tick(PriceTick(
-                        symbol=sym.lower(), price=price_t, timestamp=ts,
-                        volume=qty, is_buyer_maker=is_bm,
-                    ))
+            # OFI data now comes via aggTrades WebSocket (no per-cycle REST poll)
 
             for sym in [s.lower() for s in binance_symbols]:
                 p = engine.price_feed.get_current_price(sym)
@@ -584,6 +578,14 @@ async def run_paper_test(
             print(f"   Bankroll: ${engine.bankroll:.2f}")
 
             await asyncio.sleep(scan_interval)
+
+    # Clean up aggTrades WebSocket
+    if agg_trades_task is not None:
+        agg_trades_task.cancel()
+        try:
+            await agg_trades_task
+        except asyncio.CancelledError:
+            pass
 
     # Force-settle any remaining open positions using model probability
     # so we can evaluate PnL even on a short test run

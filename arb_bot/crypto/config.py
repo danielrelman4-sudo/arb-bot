@@ -104,6 +104,9 @@ class CryptoSettings:
     ofi_recalibrate_interval_hours: float = 4.0
     ofi_impact_exponent: float = 0.5  # Power-law exponent (0.5 = square root law)
 
+    # ── AggTrades WebSocket ────────────────────────────────────────────
+    agg_trades_ws_enabled: bool = True
+
     # ── Activity scaling ─────────────────────────────────────────────
     activity_scaling_enabled: bool = True
     activity_scaling_short_window_seconds: int = 300    # "current" volume window
@@ -171,6 +174,7 @@ def load_crypto_settings() -> CryptoSettings:
         ofi_alpha=_as_float(os.getenv("ARB_CRYPTO_OFI_ALPHA"), 0.0),
         ofi_recalibrate_interval_hours=_as_float(os.getenv("ARB_CRYPTO_OFI_RECALIBRATE_HOURS"), 4.0),
         ofi_impact_exponent=_as_float(os.getenv("ARB_CRYPTO_OFI_IMPACT_EXPONENT"), 0.5),
+        agg_trades_ws_enabled=_as_bool(os.getenv("ARB_CRYPTO_AGG_TRADES_WS_ENABLED"), True),
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),

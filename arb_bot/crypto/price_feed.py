@@ -60,6 +60,7 @@ class PriceFeed:
         self._snapshot_url = snapshot_url
         self._history_minutes = history_minutes
 
+        self._symbols_set: set = {s.lower() for s in self._symbols}
         self._ticks: Dict[str, Deque[PriceTick]] = {
             s: deque(maxlen=_MAX_TICK_HISTORY) for s in self._symbols
         }
@@ -353,6 +354,56 @@ class PriceFeed:
             is_buy = not tick.is_buyer_maker
             dq_bs = self._buy_sells.setdefault(sym, deque(maxlen=_MAX_TICK_HISTORY))
             dq_bs.append((tick.timestamp, tick.volume, is_buy))
+
+    # ── aggTrade WebSocket ──────────────────────────────────────────
+
+    def _handle_agg_trade_message(self, msg: dict) -> None:
+        """Parse a Binance aggTrade WebSocket message and inject as tick."""
+        try:
+            symbol = msg.get("s", "").lower()
+            if not symbol or symbol not in self._symbols_set:
+                return
+            price = float(msg["p"])
+            qty = float(msg["q"])
+            ts = float(msg["T"]) / 1000.0
+            is_buyer_maker = msg.get("m")
+        except (KeyError, ValueError, TypeError):
+            return
+
+        tick = PriceTick(
+            symbol=symbol, price=price, timestamp=ts,
+            volume=qty, is_buyer_maker=is_buyer_maker,
+        )
+        self.inject_tick(tick)
+
+    async def connect_agg_trades_ws(self) -> None:
+        """Connect to Binance aggTrade WebSocket stream for all symbols.
+
+        Reconnects automatically on disconnection.
+        """
+        try:
+            import websockets  # type: ignore[import-untyped]
+        except ImportError:
+            LOGGER.warning("PriceFeed: websockets not installed, aggTrades WS disabled")
+            return
+
+        streams = "/".join(f"{s}@aggTrade" for s in sorted(self._symbols_set))
+        url = f"wss://stream.binance.us:9443/stream?streams={streams}"
+        LOGGER.info("PriceFeed: connecting aggTrades WS: %s", url)
+
+        while self._running:
+            try:
+                async with websockets.connect(url) as ws:
+                    LOGGER.info("PriceFeed: aggTrades WS connected")
+                    async for raw_msg in ws:
+                        data = json.loads(raw_msg)
+                        payload = data.get("data", data)
+                        self._handle_agg_trade_message(payload)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                LOGGER.warning("PriceFeed: aggTrades WS error: %s, reconnecting in 5s", exc)
+                await asyncio.sleep(5)
 
     # ── internal ───────────────────────────────────────────────────
 
