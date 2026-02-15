@@ -63,6 +63,12 @@ class CryptoSettings:
     mc_jump_mean: float = 0.0        # Mean log jump size
     mc_jump_vol: float = 0.02        # Stdev of log jump size
 
+    # ── Hawkes self-exciting jumps ────────────────────────────────
+    hawkes_enabled: bool = True
+    hawkes_alpha: float = 5.0        # Excitation amplitude
+    hawkes_beta: float = 0.00115     # Decay rate (ln(2)/600 ~ 10-min half-life)
+    hawkes_return_threshold_sigma: float = 4.0  # Sigma threshold to trigger shock
+
     # ── Edge detection ─────────────────────────────────────────────
     min_edge_pct: float = 0.05
     min_edge_pct_daily: float = 0.06
@@ -135,6 +141,10 @@ def load_crypto_settings() -> CryptoSettings:
         mc_jump_intensity=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_INTENSITY"), 3.0),
         mc_jump_mean=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_MEAN"), 0.0),
         mc_jump_vol=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_VOL"), 0.02),
+        hawkes_enabled=_as_bool(os.getenv("ARB_CRYPTO_HAWKES_ENABLED"), True),
+        hawkes_alpha=_as_float(os.getenv("ARB_CRYPTO_HAWKES_ALPHA"), 5.0),
+        hawkes_beta=_as_float(os.getenv("ARB_CRYPTO_HAWKES_BETA"), 0.00115),
+        hawkes_return_threshold_sigma=_as_float(os.getenv("ARB_CRYPTO_HAWKES_RETURN_THRESHOLD_SIGMA"), 4.0),
         min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.05),
         min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.06),
         min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.02),

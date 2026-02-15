@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from arb_bot.crypto.calibration import ModelCalibrator
+from arb_bot.crypto.hawkes import HawkesIntensity
 from arb_bot.crypto.ofi_calibrator import OFICalibrator
 from arb_bot.crypto.config import CryptoSettings
 from arb_bot.crypto.edge_detector import CryptoEdge, EdgeDetector
@@ -133,6 +134,12 @@ class CryptoEngine:
         )
         self._calibrator = ModelCalibrator()
         self._ofi_calibrator = OFICalibrator()
+        self._hawkes = HawkesIntensity(
+            mu=settings.mc_jump_intensity,
+            alpha=settings.hawkes_alpha,
+            beta=settings.hawkes_beta,
+            return_threshold_sigma=settings.hawkes_return_threshold_sigma,
+        )
 
         # State
         self._positions: Dict[str, CryptoPosition] = {}
@@ -270,12 +277,38 @@ class CryptoEngine:
             self._ofi_cal_cache_time = now
         return self._ofi_cal_cache
 
+    def _update_hawkes_from_returns(self) -> None:
+        """Check recent 1-min returns for each symbol and feed large ones to Hawkes."""
+        now = time.monotonic()
+        for binance_sym in self._settings.price_feed_symbols:
+            returns = self._price_feed.get_returns(
+                binance_sym, interval_seconds=60, window_minutes=1,
+            )
+            if len(returns) < 2:
+                continue
+            # Use realised vol over a slightly longer window for stability
+            vol_returns = self._price_feed.get_returns(
+                binance_sym, interval_seconds=60, window_minutes=5,
+            )
+            if len(vol_returns) < 2:
+                continue
+            arr = np.array(vol_returns, dtype=np.float64)
+            realized_vol = float(np.std(arr, ddof=1))
+            if realized_vol <= 0:
+                continue
+            # Feed only the most recent return
+            latest_return = returns[-1]
+            self._hawkes.record_return(now, latest_return, realized_vol)
+
     # ── Cycle ─────────────────────────────────────────────────────
 
     async def _run_cycle(self) -> None:
         """Single scan → model → detect → size → execute cycle."""
         self._cycle_count += 1
         cycle_start = time.monotonic()
+
+        # 0. Update Hawkes intensity from recent returns
+        self._update_hawkes_from_returns()
 
         # 1. Discover markets (from Kalshi if adapter available, else skip)
         market_quotes = await self._fetch_market_quotes()
@@ -383,6 +416,9 @@ class CryptoEngine:
     ) -> list[CryptoEdge]:
         """Run a single cycle with provided quotes. For testing."""
         self._cycle_count += 1
+
+        # Update Hawkes intensity from recent returns
+        self._update_hawkes_from_returns()
 
         model_probs = self._compute_model_probabilities(quotes)
         edges = self._edge_detector.detect_edges(quotes, model_probs)
@@ -494,9 +530,14 @@ class CryptoEngine:
 
             # Select path generator: jump diffusion or plain GBM
             if self._settings.use_jump_diffusion:
+                # Use Hawkes dynamic intensity if enabled
+                if self._settings.hawkes_enabled:
+                    dynamic_intensity = self._hawkes.intensity(time.monotonic())
+                else:
+                    dynamic_intensity = self._settings.mc_jump_intensity
                 paths = self._price_model.generate_paths_jump_diffusion(
                     current_price, vol, horizon, drift=drift,
-                    jump_intensity=self._settings.mc_jump_intensity,
+                    jump_intensity=dynamic_intensity,
                     jump_mean=self._settings.mc_jump_mean,
                     jump_vol=self._settings.mc_jump_vol,
                 )
