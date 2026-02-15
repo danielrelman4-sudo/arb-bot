@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from arb_bot.crypto.calibration import ModelCalibrator
+from arb_bot.crypto.cycle_logger import CycleLogger, CycleSnapshot
+from arb_bot.crypto.hawkes import HawkesIntensity
 from arb_bot.crypto.ofi_calibrator import OFICalibrator
 from arb_bot.crypto.config import CryptoSettings
 from arb_bot.crypto.edge_detector import CryptoEdge, EdgeDetector
@@ -133,6 +135,12 @@ class CryptoEngine:
         )
         self._calibrator = ModelCalibrator()
         self._ofi_calibrator = OFICalibrator()
+        self._hawkes = HawkesIntensity(
+            mu=settings.mc_jump_intensity,
+            alpha=settings.hawkes_alpha,
+            beta=settings.hawkes_beta,
+            return_threshold_sigma=settings.hawkes_return_threshold_sigma,
+        )
 
         # State
         self._positions: Dict[str, CryptoPosition] = {}
@@ -141,6 +149,9 @@ class CryptoEngine:
         self._cycle_count: int = 0
         self._running = False
         self._bankroll: float = settings.bankroll
+
+        # Cycle logger (optional, for offline calibration)
+        self._cycle_logger: Optional[CycleLogger] = None
 
         # OFI calibration cache (S1/S3: avoid recalibrating every quote)
         from arb_bot.crypto.ofi_calibrator import OFICalibrationResult
@@ -247,6 +258,13 @@ class CryptoEngine:
                 count += 1
         return count
 
+    def _apply_ofi_impact(self, ofi: float, alpha: float) -> float:
+        """Apply power-law impact model: drift = alpha * sgn(ofi) * |ofi|^theta."""
+        theta = self._settings.ofi_impact_exponent
+        if ofi == 0.0 or alpha == 0.0:
+            return 0.0
+        return alpha * math.copysign(abs(ofi) ** theta, ofi)
+
     def _get_ofi_calibration(self) -> "OFICalibrationResult":
         """Return cached OFI calibration, recalibrating on interval.
 
@@ -263,12 +281,90 @@ class CryptoEngine:
             self._ofi_cal_cache_time = now
         return self._ofi_cal_cache
 
+    def _update_hawkes_from_returns(self) -> None:
+        """Check recent 1-min returns for each symbol and feed large ones to Hawkes."""
+        now = time.monotonic()
+        for binance_sym in self._settings.price_feed_symbols:
+            returns = self._price_feed.get_returns(
+                binance_sym, interval_seconds=60, window_minutes=1,
+            )
+            if len(returns) < 2:
+                continue
+            # Use realised vol over a slightly longer window for stability
+            vol_returns = self._price_feed.get_returns(
+                binance_sym, interval_seconds=60, window_minutes=5,
+            )
+            if len(vol_returns) < 2:
+                continue
+            arr = np.array(vol_returns, dtype=np.float64)
+            realized_vol = float(np.std(arr, ddof=1))
+            if realized_vol <= 0:
+                continue
+            # Feed only the most recent return
+            latest_return = returns[-1]
+            self._hawkes.record_return(now, latest_return, realized_vol)
+
+    # ── Cycle logger ─────────────────────────────────────────────
+
+    def set_cycle_logger(self, logger: CycleLogger) -> None:
+        """Set a cycle logger for per-cycle data recording."""
+        self._cycle_logger = logger
+
+    def _log_cycle(self, edges_count: int) -> None:
+        """Log per-cycle data to CSV if a logger is configured."""
+        if self._cycle_logger is None:
+            return
+        import time as _time
+        now = _time.monotonic()
+        for binance_sym in self._settings.price_feed_symbols:
+            price = self._price_feed.get_current_price(binance_sym)
+            if price is None:
+                continue
+            ofi = self._price_feed.get_ofi(
+                binance_sym, self._settings.ofi_window_seconds,
+            )
+            sr = self._price_feed.get_volume_flow_rate(
+                binance_sym, self._settings.activity_scaling_short_window_seconds,
+            )
+            lr = self._price_feed.get_volume_flow_rate(
+                binance_sym, self._settings.activity_scaling_long_window_seconds,
+            )
+            ar = sr / lr if lr > 0 and sr > 0 else 1.0
+            returns = self._price_feed.get_returns(binance_sym, 60, 5)
+            vol = float(np.std(returns)) if len(returns) >= 2 else 0.0
+            hi = (
+                self._hawkes.intensity(now)
+                if self._settings.hawkes_enabled
+                else self._settings.mc_jump_intensity
+            )
+
+            self._cycle_logger.log(CycleSnapshot(
+                timestamp=_time.time(),
+                cycle=self._cycle_count,
+                symbol=binance_sym,
+                price=price,
+                ofi=ofi,
+                volume_rate_short=sr,
+                volume_rate_long=lr,
+                activity_ratio=ar,
+                realized_vol=vol,
+                hawkes_intensity=hi,
+                num_edges=edges_count,
+                num_positions=len(self._positions),
+                session_pnl=self._session_pnl,
+                bankroll=self._bankroll,
+            ))
+        self._cycle_logger.flush()
+
     # ── Cycle ─────────────────────────────────────────────────────
 
     async def _run_cycle(self) -> None:
         """Single scan → model → detect → size → execute cycle."""
         self._cycle_count += 1
         cycle_start = time.monotonic()
+
+        # 0. Update Hawkes intensity from recent returns
+        self._update_hawkes_from_returns()
 
         # 1. Discover markets (from Kalshi if adapter available, else skip)
         market_quotes = await self._fetch_market_quotes()
@@ -302,6 +398,9 @@ class CryptoEngine:
 
         # 5. Check and settle expired positions
         self._settle_expired_positions()
+
+        # 6. Log cycle data for offline calibration
+        self._log_cycle(len(edges))
 
         elapsed_ms = (time.monotonic() - cycle_start) * 1000
         LOGGER.info(
@@ -377,6 +476,9 @@ class CryptoEngine:
         """Run a single cycle with provided quotes. For testing."""
         self._cycle_count += 1
 
+        # Update Hawkes intensity from recent returns
+        self._update_hawkes_from_returns()
+
         model_probs = self._compute_model_probabilities(quotes)
         edges = self._edge_detector.detect_edges(quotes, model_probs)
 
@@ -398,6 +500,7 @@ class CryptoEngine:
             trades_opened += 1
 
         self._settle_expired_positions()
+        self._log_cycle(len(edges))
         return edges
 
     # ── Model ─────────────────────────────────────────────────────
@@ -483,13 +586,18 @@ class CryptoEngine:
                 # Use cached calibration result, recalibrate on interval
                 cal_result = self._get_ofi_calibration()
                 alpha = cal_result.alpha if cal_result.alpha != 0 else self._settings.ofi_alpha
-                drift = alpha * ofi
+                drift = self._apply_ofi_impact(ofi, alpha)
 
             # Select path generator: jump diffusion or plain GBM
             if self._settings.use_jump_diffusion:
+                # Use Hawkes dynamic intensity if enabled
+                if self._settings.hawkes_enabled:
+                    dynamic_intensity = self._hawkes.intensity(time.monotonic())
+                else:
+                    dynamic_intensity = self._settings.mc_jump_intensity
                 paths = self._price_model.generate_paths_jump_diffusion(
                     current_price, vol, horizon, drift=drift,
-                    jump_intensity=self._settings.mc_jump_intensity,
+                    jump_intensity=dynamic_intensity,
                     jump_mean=self._settings.mc_jump_mean,
                     jump_vol=self._settings.mc_jump_vol,
                 )
@@ -512,10 +620,22 @@ class CryptoEngine:
             elif direction == "below" and strike is not None:
                 prob = self._price_model.probability_below(paths, strike)
             elif direction == "up":
-                prob = self._price_model.probability_up(paths, current_price)
+                ref_price = current_price  # fallback
+                if mq.market.meta.interval_start_time is not None:
+                    start_ts = mq.market.meta.interval_start_time.timestamp()
+                    looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                    if looked_up is not None:
+                        ref_price = looked_up
+                prob = self._price_model.probability_up(paths, ref_price)
             elif direction == "down":
-                # P(down) = 1 - P(up)
-                up = self._price_model.probability_up(paths, current_price)
+                # P(down) = 1 - P(up), using interval start price as reference
+                ref_price = current_price  # fallback
+                if mq.market.meta.interval_start_time is not None:
+                    start_ts = mq.market.meta.interval_start_time.timestamp()
+                    looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                    if looked_up is not None:
+                        ref_price = looked_up
+                up = self._price_model.probability_up(paths, ref_price)
                 prob = ProbabilityEstimate(
                     probability=1.0 - up.probability,
                     ci_lower=1.0 - up.ci_upper,

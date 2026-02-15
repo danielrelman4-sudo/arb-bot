@@ -96,6 +96,7 @@ class CryptoMarketMeta:
     direction: str       # "up", "down", "above", "below"
     series_ticker: str   # e.g. "KXBTCD", "KXBTC15M"
     interval_index: int | None = None  # For up/down: which interval (e.g. 12)
+    interval_start_time: datetime | None = None  # For up/down: start of the interval
 
 
 @dataclass(frozen=True)

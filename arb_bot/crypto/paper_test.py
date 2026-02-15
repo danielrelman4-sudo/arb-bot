@@ -17,13 +17,14 @@ import logging
 import math
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 
 import httpx
 import numpy as np
 
 from arb_bot.crypto.config import CryptoSettings
+from arb_bot.crypto.cycle_logger import CycleLogger
 from arb_bot.crypto.edge_detector import CryptoEdge, EdgeDetector, compute_implied_probability
 from arb_bot.crypto.engine import CryptoEngine
 from arb_bot.crypto.market_scanner import (
@@ -39,6 +40,7 @@ LOGGER = logging.getLogger(__name__)
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 BINANCE_KLINES = "https://api.binance.us/api/v3/klines"
 BINANCE_PRICE = "https://api.binance.us/api/v3/ticker/price"
+BINANCE_AGG_TRADES = "https://api.binance.us/api/v3/aggTrades"
 
 # Map underlying to Kalshi series tickers
 _SERIES_MAP = {
@@ -98,6 +100,28 @@ async def fetch_binance_klines(
             return [(float(k[0]) / 1000.0, float(k[4])) for k in data]
     except Exception as exc:
         LOGGER.warning("Binance klines %s failed: %s", symbol, exc)
+    return []
+
+
+async def fetch_binance_agg_trades(
+    symbol: str,
+    limit: int,
+    client: httpx.AsyncClient,
+) -> list[dict]:
+    """Fetch recent aggregate trades from Binance US for OFI bootstrap."""
+    try:
+        resp = await client.get(
+            BINANCE_AGG_TRADES,
+            params={
+                "symbol": symbol,
+                "limit": min(limit, 1000),
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as exc:
+        LOGGER.warning("Binance aggTrades %s failed: %s", symbol, exc)
     return []
 
 
@@ -187,6 +211,23 @@ def kalshi_raw_to_quote(
     interval = _infer_interval(series)
     direction, strike = _infer_direction_and_strike(ticker, subtitle, series)
 
+    # Compute interval_start_time for up/down contracts
+    interval_start_time = None
+    if direction in ("up", "down"):
+        # Use open_time from API if available, otherwise derive from close_time
+        open_str = raw.get("open_time", "")
+        if open_str:
+            try:
+                open_str_clean = open_str.replace("Z", "+00:00")
+                interval_start_time = datetime.fromisoformat(open_str_clean)
+            except (ValueError, TypeError):
+                pass
+        if interval_start_time is None:
+            if interval == "15min":
+                interval_start_time = close_time - timedelta(minutes=15)
+            elif interval == "1hour":
+                interval_start_time = close_time - timedelta(hours=1)
+
     meta = CryptoMarketMeta(
         underlying=underlying,
         interval=interval,
@@ -195,6 +236,7 @@ def kalshi_raw_to_quote(
         direction=direction,
         series_ticker=series,
         interval_index=None,
+        interval_start_time=interval_start_time,
     )
     market = CryptoMarket(ticker=ticker, meta=meta)
 
@@ -308,11 +350,14 @@ async def run_paper_test(
         price_feed_symbols=[s.lower() for s in binance_symbols],
         mc_num_paths=mc_paths,
         min_edge_pct=min_edge,
+        min_edge_pct_daily=0.06,
         min_edge_cents=min_edge,
         max_model_uncertainty=0.20,
+        model_uncertainty_multiplier=3.0,
         bankroll=500.0,
         max_position_per_market=50.0,
         max_concurrent_positions=10,
+        max_positions_per_underlying=3,
         kelly_fraction_cap=0.10,
         scan_interval_seconds=scan_interval,
         paper_slippage_cents=0.5,
@@ -321,23 +366,45 @@ async def run_paper_test(
         min_minutes_to_expiry=1,
         max_minutes_to_expiry=max_tte,
         min_book_depth_contracts=1,
+        allowed_directions=["above", "below", "up", "down"],
+        # OFI microstructure drift
+        ofi_enabled=True,
+        ofi_window_seconds=600,
+        ofi_alpha=0.0,  # starts neutral, calibrated at runtime
+        ofi_recalibrate_interval_hours=4.0,
+        # Activity-scaled volatility
+        activity_scaling_enabled=True,
+        activity_scaling_short_window_seconds=300,
+        activity_scaling_long_window_seconds=3600,
+        # Jump diffusion
+        use_jump_diffusion=True,
+        mc_jump_intensity=3.0,
+        mc_jump_mean=0.0,
+        mc_jump_vol=0.02,
     )
 
     engine = CryptoEngine(settings)
 
     print(f"\n{'='*70}")
-    print(f"  Crypto Prediction Engine — Paper Test")
+    print(f"  Crypto Prediction Engine — Paper Test v3")
+    print(f"  (power-law OFI + Hawkes + ref-price + aggTrades WS + cycle log)")
     print(f"{'='*70}")
     print(f"  Underlyings:    {', '.join(underlyings)}")
     print(f"  Binance feeds:  {', '.join(binance_symbols)}")
     print(f"  MC paths:       {mc_paths}")
-    print(f"  Min edge:       {min_edge*100:.1f}%")
+    print(f"  Min edge:       {min_edge*100:.1f}% (daily: 6.0%)")
     print(f"  Duration:       {duration_minutes} min")
     print(f"  Max TTE:        {max_tte} min")
     print(f"  Scan interval:  {scan_interval}s")
+    print(f"  Directions:     above, below, up, down (ref-price fixed)")
+    print(f"  OFI drift:      enabled (window=600s, recal=4h)")
+    print(f"  Activity scale: enabled (short=300s, long=3600s)")
+    print(f"  Jump diffusion: enabled (λ=3/day, μ=0, σ_j=0.02)")
+    print(f"  Unc multiplier: 3.0x")
+    print(f"  Max per-UL:     3 positions")
     print(f"{'='*70}\n")
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
         # 1. Bootstrap with Binance klines
         print("Loading historical prices from Binance US REST API...")
         for sym in binance_symbols:
@@ -363,6 +430,38 @@ async def run_paper_test(
         if not prices:
             print("   WARNING: No Binance prices available. Using historical data only.")
 
+        # 2b. Bootstrap OFI data from aggTrades
+        print("\nBootstrapping OFI data from Binance aggTrades...")
+        for sym in binance_symbols:
+            trades = await fetch_binance_agg_trades(sym, 1000, client)
+            if trades:
+                buy_count = 0
+                sell_count = 0
+                for trade in trades:
+                    try:
+                        ts = float(trade["T"]) / 1000.0
+                        price = float(trade["p"])
+                        qty = float(trade["q"])
+                        is_buyer_maker = trade.get("m")
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    tick = PriceTick(
+                        symbol=sym.lower(), price=price, timestamp=ts,
+                        volume=qty, is_buyer_maker=is_buyer_maker,
+                    )
+                    engine.price_feed.inject_tick(tick)
+                    if isinstance(is_buyer_maker, bool):
+                        if is_buyer_maker:
+                            sell_count += 1
+                        else:
+                            buy_count += 1
+                ofi = engine.price_feed.get_ofi(sym.lower(), window_seconds=600)
+                print(
+                    f"   {sym}: {len(trades)} trades loaded, "
+                    f"{buy_count} buys / {sell_count} sells, "
+                    f"OFI={ofi:+.3f}"
+                )
+
         # 3. Show vol estimates
         print("\nVolatility estimates:")
         for sym in [s.lower() for s in binance_symbols]:
@@ -374,7 +473,21 @@ async def run_paper_test(
             else:
                 print(f"   {sym.upper()}: insufficient data for vol estimate")
 
-        # 4. Main loop
+        # 4. Start aggTrades WebSocket for continuous OFI data
+        agg_trades_task = None
+        if settings.agg_trades_ws_enabled:
+            agg_trades_task = asyncio.create_task(
+                engine.price_feed.connect_agg_trades_ws()
+            )
+            print("\nStarted aggTrades WebSocket stream for continuous OFI data")
+
+        # 5. Set up per-cycle CSV logger
+        log_path = f"arb_bot/output/paper_v3_{int(time.time())}.csv"
+        logger = CycleLogger(log_path)
+        engine.set_cycle_logger(logger)
+        print(f"\nCycle data will be logged to: {log_path}")
+
+        # 6. Main loop
         start_time = time.monotonic()
         cycle = 0
 
@@ -389,17 +502,20 @@ async def run_paper_test(
             print(f"Cycle {cycle} ({elapsed:.1f}m / {duration_minutes}m)")
             print(f"{'─'*50}")
 
-            # Refresh prices
+            # Refresh prices + trade flow for OFI
             new_prices = await fetch_binance_prices(binance_symbols, client)
             for sym, price in new_prices.items():
                 engine.price_feed.inject_tick(
                     PriceTick(symbol=sym, price=price, timestamp=time.time(), volume=0)
                 )
 
+            # OFI data now comes via aggTrades WebSocket (no per-cycle REST poll)
+
             for sym in [s.lower() for s in binance_symbols]:
                 p = engine.price_feed.get_current_price(sym)
+                ofi = engine.price_feed.get_ofi(sym, window_seconds=300)
                 if p:
-                    print(f"   {sym.upper()}: ${p:,.2f}")
+                    print(f"   {sym.upper()}: ${p:,.2f}  OFI={ofi:+.3f}")
 
             # Fetch Kalshi markets
             raw_markets = await fetch_kalshi_crypto_markets(underlyings, client)
@@ -449,7 +565,7 @@ async def run_paper_test(
                             f"edge={e.edge_cents*100:+.1f}% "
                             f"model={e.model_prob.probability:.0%} "
                             f"market={e.market_implied_prob:.0%} "
-                            f"unc={e.model_uncertainty:.3f}"
+                            f"unc={e.model_uncertainty:.3f} spread={e.spread_cost*100:.1f}\u00a2"
                         )
                 else:
                     print("   No edges above threshold")
@@ -470,6 +586,14 @@ async def run_paper_test(
 
             await asyncio.sleep(scan_interval)
 
+    # Clean up aggTrades WebSocket
+    if agg_trades_task is not None:
+        agg_trades_task.cancel()
+        try:
+            await agg_trades_task
+        except asyncio.CancelledError:
+            pass
+
     # Force-settle any remaining open positions using model probability
     # so we can evaluate PnL even on a short test run
     open_positions = list(engine.positions.keys())
@@ -489,6 +613,9 @@ async def run_paper_test(
                     f"PnL=${record.pnl:+.2f} ({record.side.upper()} "
                     f"{record.contracts}@{record.entry_price:.2f})"
                 )
+
+    # Close cycle logger
+    logger.close()
 
     # Final summary
     print(f"\n{'='*70}")
@@ -519,6 +646,7 @@ async def run_paper_test(
             )
     print(f"\n  Net PnL:        ${engine.session_pnl:+.2f}")
     print(f"  Final bankroll: ${engine.bankroll:.2f}")
+    print(f"  Cycle data:     {log_path}")
     print(f"{'='*70}")
 
     # Export

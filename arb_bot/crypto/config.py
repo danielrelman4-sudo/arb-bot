@@ -63,6 +63,12 @@ class CryptoSettings:
     mc_jump_mean: float = 0.0        # Mean log jump size
     mc_jump_vol: float = 0.02        # Stdev of log jump size
 
+    # ── Hawkes self-exciting jumps ────────────────────────────────
+    hawkes_enabled: bool = True
+    hawkes_alpha: float = 5.0        # Excitation amplitude
+    hawkes_beta: float = 0.00115     # Decay rate (ln(2)/600 ~ 10-min half-life)
+    hawkes_return_threshold_sigma: float = 4.0  # Sigma threshold to trigger shock
+
     # ── Edge detection ─────────────────────────────────────────────
     min_edge_pct: float = 0.05
     min_edge_pct_daily: float = 0.06
@@ -96,6 +102,10 @@ class CryptoSettings:
     ofi_window_seconds: int = 300
     ofi_alpha: float = 0.0   # Starting alpha (0 = neutral, calibrated at runtime)
     ofi_recalibrate_interval_hours: float = 4.0
+    ofi_impact_exponent: float = 0.5  # Power-law exponent (0.5 = square root law)
+
+    # ── AggTrades WebSocket ────────────────────────────────────────────
+    agg_trades_ws_enabled: bool = True
 
     # ── Activity scaling ─────────────────────────────────────────────
     activity_scaling_enabled: bool = True
@@ -134,6 +144,10 @@ def load_crypto_settings() -> CryptoSettings:
         mc_jump_intensity=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_INTENSITY"), 3.0),
         mc_jump_mean=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_MEAN"), 0.0),
         mc_jump_vol=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_VOL"), 0.02),
+        hawkes_enabled=_as_bool(os.getenv("ARB_CRYPTO_HAWKES_ENABLED"), True),
+        hawkes_alpha=_as_float(os.getenv("ARB_CRYPTO_HAWKES_ALPHA"), 5.0),
+        hawkes_beta=_as_float(os.getenv("ARB_CRYPTO_HAWKES_BETA"), 0.00115),
+        hawkes_return_threshold_sigma=_as_float(os.getenv("ARB_CRYPTO_HAWKES_RETURN_THRESHOLD_SIGMA"), 4.0),
         min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.05),
         min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.06),
         min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.02),
@@ -159,6 +173,8 @@ def load_crypto_settings() -> CryptoSettings:
         ofi_window_seconds=_as_int(os.getenv("ARB_CRYPTO_OFI_WINDOW_SECONDS"), 300),
         ofi_alpha=_as_float(os.getenv("ARB_CRYPTO_OFI_ALPHA"), 0.0),
         ofi_recalibrate_interval_hours=_as_float(os.getenv("ARB_CRYPTO_OFI_RECALIBRATE_HOURS"), 4.0),
+        ofi_impact_exponent=_as_float(os.getenv("ARB_CRYPTO_OFI_IMPACT_EXPONENT"), 0.5),
+        agg_trades_ws_enabled=_as_bool(os.getenv("ARB_CRYPTO_AGG_TRADES_WS_ENABLED"), True),
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),
