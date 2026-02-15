@@ -231,3 +231,37 @@ class TestBuySellVolume:
         # Only the recent tick should count
         assert buy_vol == pytest.approx(1.0)
         assert sell_vol == 0.0
+
+
+class TestOFI:
+    def test_ofi_computation(self) -> None:
+        """3 buy ticks (vol 1.0 each) + 1 sell tick (vol 1.0) => OFI = (3-1)/(3+1) = 0.5."""
+        feed = PriceFeed(symbols=["btcusdt"])
+        now = time.time()
+        # 3 buy ticks
+        feed.inject_tick(PriceTick("btcusdt", 97000.0, now - 10, volume=1.0, is_buyer_maker=False))
+        feed.inject_tick(PriceTick("btcusdt", 97100.0, now - 8, volume=1.0, is_buyer_maker=False))
+        feed.inject_tick(PriceTick("btcusdt", 97200.0, now - 6, volume=1.0, is_buyer_maker=False))
+        # 1 sell tick
+        feed.inject_tick(PriceTick("btcusdt", 96900.0, now - 4, volume=1.0, is_buyer_maker=True))
+
+        ofi = feed.get_ofi("btcusdt", window_seconds=60)
+        assert ofi == pytest.approx(0.5)
+
+    def test_ofi_no_data_returns_zero(self) -> None:
+        feed = PriceFeed(symbols=["btcusdt"])
+        assert feed.get_ofi("btcusdt") == 0.0
+
+    def test_ofi_all_buys_returns_one(self) -> None:
+        feed = PriceFeed(symbols=["btcusdt"])
+        now = time.time()
+        feed.inject_tick(PriceTick("btcusdt", 97000.0, now - 5, volume=2.0, is_buyer_maker=False))
+        feed.inject_tick(PriceTick("btcusdt", 97100.0, now - 3, volume=3.0, is_buyer_maker=False))
+        assert feed.get_ofi("btcusdt", window_seconds=60) == pytest.approx(1.0)
+
+    def test_ofi_all_sells_returns_negative_one(self) -> None:
+        feed = PriceFeed(symbols=["btcusdt"])
+        now = time.time()
+        feed.inject_tick(PriceTick("btcusdt", 97000.0, now - 5, volume=2.0, is_buyer_maker=True))
+        feed.inject_tick(PriceTick("btcusdt", 96900.0, now - 3, volume=3.0, is_buyer_maker=True))
+        assert feed.get_ofi("btcusdt", window_seconds=60) == pytest.approx(-1.0)

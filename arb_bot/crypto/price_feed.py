@@ -167,6 +167,18 @@ class PriceFeed:
                     sell_vol += vol
         return (buy_vol, sell_vol)
 
+    def get_ofi(self, symbol: str, window_seconds: int = 300) -> float:
+        """Order Flow Imbalance: (buy_vol - sell_vol) / (buy_vol + sell_vol).
+
+        Returns a value in [-1, +1]. Positive = net buy pressure.
+        Returns 0.0 if no data available.
+        """
+        buy_vol, sell_vol = self.get_buy_sell_volume(symbol, window_seconds)
+        total = buy_vol + sell_vol
+        if total <= 0:
+            return 0.0
+        return (buy_vol - sell_vol) / total
+
     async def load_historical(self, symbol: str) -> None:
         """Bootstrap tick history from Binance REST klines.
 
