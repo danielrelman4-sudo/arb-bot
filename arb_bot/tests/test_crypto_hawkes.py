@@ -233,7 +233,7 @@ class TestHawkesConfig:
 
     def test_hawkes_return_threshold_sigma_default(self) -> None:
         s = CryptoSettings()
-        assert s.hawkes_return_threshold_sigma == 4.0
+        assert s.hawkes_return_threshold_sigma == 3.0
 
     def test_hawkes_enabled_from_env(self) -> None:
         with mock.patch.dict(os.environ, {"ARB_CRYPTO_HAWKES_ENABLED": "false"}, clear=True):

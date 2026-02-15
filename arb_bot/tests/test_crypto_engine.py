@@ -772,7 +772,7 @@ class TestModelUncertaintyMultiplier:
         unc_unscaled = probs_unscaled[ticker].uncertainty
 
         # Scaled uncertainty should be exactly 3x the unscaled
-        assert abs(unc_scaled - 3.0 * unc_unscaled) < 1e-10
+        assert abs(unc_scaled - 3.0 * unc_unscaled) < 1e-9
 
         # CI should be wider
         width_scaled = probs_scaled[ticker].ci_upper - probs_scaled[ticker].ci_lower

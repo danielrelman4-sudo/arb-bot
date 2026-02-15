@@ -310,7 +310,9 @@ class CryptoEngine:
 
         # Effective horizon = clock_horizon * (short_rate / long_rate)
         activity_ratio = short_rate / long_rate
-        activity_ratio = max(0.25, min(4.0, activity_ratio))
+        floor = self._settings.volume_clock_ratio_floor
+        ceiling = self._settings.volume_clock_ratio_ceiling
+        activity_ratio = max(floor, min(ceiling, activity_ratio))
 
         effective_horizon = clock_horizon_minutes * activity_ratio
         return effective_horizon, projected_volume, long_rate

@@ -183,6 +183,8 @@ class TestComputeEffectiveHorizon:
             volume_clock_enabled=True,
             volume_clock_short_window_seconds=10,
             volume_clock_baseline_window_seconds=300,
+            volume_clock_ratio_ceiling=2.5,
+            volume_clock_ratio_floor=0.25,
         )
         now = time.time()
         # Very low baseline: 0.01 vol over 300s
@@ -196,8 +198,32 @@ class TestComputeEffectiveHorizon:
                 "btcusdt", 97000, now - 10 + i, 100.0, None,
             ))
         h, _, _ = engine._compute_effective_horizon("btcusdt", 10.0)
-        # Clamped to 4.0x
-        assert h == pytest.approx(40.0, rel=0.01)
+        # Clamped to 2.5x (ceiling)
+        assert h == pytest.approx(25.0, rel=0.01)
+
+    def test_clamped_with_custom_bounds(self):
+        """Verify configurable clamp floor/ceiling are respected."""
+        engine = _make_engine(
+            volume_clock_enabled=True,
+            volume_clock_short_window_seconds=10,
+            volume_clock_baseline_window_seconds=300,
+            volume_clock_ratio_floor=0.5,
+            volume_clock_ratio_ceiling=3.0,
+        )
+        now = time.time()
+        # Very low baseline: 0.01 vol over 300s
+        for i in range(300):
+            engine._price_feed.inject_tick(PriceTick(
+                "btcusdt", 97000, now - 300 + i, 0.01, None,
+            ))
+        # Extreme spike: 100.0 vol in last 10s
+        for i in range(10):
+            engine._price_feed.inject_tick(PriceTick(
+                "btcusdt", 97000, now - 10 + i, 100.0, None,
+            ))
+        h, _, _ = engine._compute_effective_horizon("btcusdt", 10.0)
+        # Clamped to custom ceiling 3.0x
+        assert h == pytest.approx(30.0, rel=0.01)
 
 
 # ── Behavioral tests ──────────────────────────────────────────

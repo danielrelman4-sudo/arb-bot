@@ -372,12 +372,21 @@ async def run_paper_test(
         ofi_window_seconds=600,
         ofi_alpha=0.0,  # starts neutral, calibrated at runtime
         ofi_recalibrate_interval_hours=4.0,
-        # Activity-scaled volatility
-        activity_scaling_enabled=True,
+        # Volume clock — calibrated from 30-day historical data
+        # BTC has 11× diurnal volume range → needs 4-hr baseline
+        volume_clock_enabled=True,
+        volume_clock_short_window_seconds=300,
+        volume_clock_baseline_window_seconds=14400,  # 4hr (was 1hr)
+        volume_clock_ratio_floor=0.25,
+        volume_clock_ratio_ceiling=2.5,  # (was 4.0)
+        activity_scaling_enabled=False,  # Superseded by volume clock
         activity_scaling_short_window_seconds=300,
         activity_scaling_long_window_seconds=3600,
-        # Jump diffusion
+        # Jump diffusion + Hawkes self-exciting intensity
+        # Hawkes threshold calibrated: 3.0σ gives ~4-8 shocks/day
+        # (was 4.0σ → ~1 per 11 days, never triggered in paper v4)
         use_jump_diffusion=True,
+        hawkes_enabled=True,
         mc_jump_intensity=3.0,
         mc_jump_mean=0.0,
         mc_jump_vol=0.02,
@@ -386,8 +395,8 @@ async def run_paper_test(
     engine = CryptoEngine(settings)
 
     print(f"\n{'='*70}")
-    print(f"  Crypto Prediction Engine — Paper Test v3")
-    print(f"  (power-law OFI + Hawkes + ref-price + aggTrades WS + cycle log)")
+    print(f"  Crypto Prediction Engine — Paper Test v5")
+    print(f"  (calibrated from 30-day historical + paper v4 results)")
     print(f"{'='*70}")
     print(f"  Underlyings:    {', '.join(underlyings)}")
     print(f"  Binance feeds:  {', '.join(binance_symbols)}")
@@ -398,8 +407,10 @@ async def run_paper_test(
     print(f"  Scan interval:  {scan_interval}s")
     print(f"  Directions:     above, below, up, down (ref-price fixed)")
     print(f"  OFI drift:      enabled (window=600s, recal=4h)")
-    print(f"  Activity scale: enabled (short=300s, long=3600s)")
-    print(f"  Jump diffusion: enabled (λ=3/day, μ=0, σ_j=0.02)")
+    print(f"  Volume clock:   enabled (short=300s, baseline=14400s/4hr)")
+    print(f"  VC clamps:      [{settings.volume_clock_ratio_floor}, {settings.volume_clock_ratio_ceiling}]")
+    print(f"  Hawkes jumps:   enabled (α=5.0, β=0.00115, threshold=3.0σ)")
+    print(f"  Jump diffusion: enabled (μ=0, σ_j=0.02, base λ=3/day)")
     print(f"  Unc multiplier: 3.0x")
     print(f"  Max per-UL:     3 positions")
     print(f"{'='*70}\n")
@@ -670,8 +681,8 @@ def main() -> None:
                         help="How long to run (default: 5)")
     parser.add_argument("--mc-paths", type=int, default=1000,
                         help="Monte Carlo paths (default: 1000)")
-    parser.add_argument("--min-edge", type=float, default=0.03,
-                        help="Min edge fraction (default: 0.03 = 3%%)")
+    parser.add_argument("--min-edge", type=float, default=0.06,
+                        help="Min edge fraction (default: 0.06 = 6%%)")
     parser.add_argument("--scan-interval", type=float, default=15.0,
                         help="Seconds between scans (default: 15)")
     parser.add_argument("--max-tte", type=int, default=600,

@@ -67,13 +67,20 @@ class CryptoSettings:
     hawkes_enabled: bool = True
     hawkes_alpha: float = 5.0        # Excitation amplitude
     hawkes_beta: float = 0.00115     # Decay rate (ln(2)/600 ~ 10-min half-life)
-    hawkes_return_threshold_sigma: float = 4.0  # Sigma threshold to trigger shock
+    hawkes_return_threshold_sigma: float = 3.0  # Sigma threshold to trigger shock
+    # Calibrated from 30-day historical data: avg 1-min vol = 0.435% (BTC),
+    # 0.645% (SOL).  At 3.0σ the trigger is ~1.3% (BTC) / ~1.9% (SOL),
+    # giving ~4-8 shocks/day (fat-tail adjusted).  Previous 4.0σ fired
+    # only ~once per 11 days — far too rare to be useful.
 
     # ── Edge detection ─────────────────────────────────────────────
-    min_edge_pct: float = 0.05
+    min_edge_pct: float = 0.06
     min_edge_pct_daily: float = 0.06
-    min_edge_cents: float = 0.02
+    min_edge_cents: float = 0.03
     max_model_uncertainty: float = 0.15
+    # Calibrated from paper run v4: trades with <5% edge went 1/6 (17%
+    # win rate).  Trades with >6% edge went 4/5 (80%).  Raising the
+    # floor from 5% → 6% cuts marginal losers.
     model_uncertainty_multiplier: float = 3.0
     confidence_level: float = 0.95
 
@@ -115,7 +122,16 @@ class CryptoSettings:
     # ── Volume clock ────────────────────────────────────────────
     volume_clock_enabled: bool = False  # Default off for backward compat
     volume_clock_short_window_seconds: int = 300    # Current volume rate window
-    volume_clock_baseline_window_seconds: int = 3600  # Baseline ("normal") volume window
+    volume_clock_baseline_window_seconds: int = 14400  # Baseline ("normal") volume window
+    # Calibrated from 30-day historical data: BTC has 11× diurnal volume
+    # range (peak $4,697/min at 14 UTC vs trough $426/min at 10 UTC).
+    # A 1-hour baseline runs out of data in thin periods.  4 hours
+    # smooths the ratio to [0.40, 1.55], preventing extreme scaling.
+    volume_clock_ratio_floor: float = 0.25    # Minimum activity ratio
+    volume_clock_ratio_ceiling: float = 2.5   # Maximum activity ratio
+    # With 4-hr baseline, the smoothed ratio ranges ~0.40-1.55 under
+    # normal conditions.  Ceiling of 2.5 gives headroom for genuine
+    # volume spikes (news events, crashes) while blocking noise.
 
     # ── Cycle timing ───────────────────────────────────────────────
     scan_interval_seconds: float = 5.0
@@ -152,10 +168,10 @@ def load_crypto_settings() -> CryptoSettings:
         hawkes_enabled=_as_bool(os.getenv("ARB_CRYPTO_HAWKES_ENABLED"), True),
         hawkes_alpha=_as_float(os.getenv("ARB_CRYPTO_HAWKES_ALPHA"), 5.0),
         hawkes_beta=_as_float(os.getenv("ARB_CRYPTO_HAWKES_BETA"), 0.00115),
-        hawkes_return_threshold_sigma=_as_float(os.getenv("ARB_CRYPTO_HAWKES_RETURN_THRESHOLD_SIGMA"), 4.0),
-        min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.05),
+        hawkes_return_threshold_sigma=_as_float(os.getenv("ARB_CRYPTO_HAWKES_RETURN_THRESHOLD_SIGMA"), 3.0),
+        min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.06),
         min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.06),
-        min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.02),
+        min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.03),
         max_model_uncertainty=_as_float(os.getenv("ARB_CRYPTO_MAX_MODEL_UNCERTAINTY"), 0.15),
         model_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_MODEL_UNCERTAINTY_MULTIPLIER"), 3.0),
         confidence_level=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_LEVEL"), 0.95),
@@ -182,7 +198,9 @@ def load_crypto_settings() -> CryptoSettings:
         agg_trades_ws_enabled=_as_bool(os.getenv("ARB_CRYPTO_AGG_TRADES_WS_ENABLED"), True),
         volume_clock_enabled=_as_bool(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_ENABLED"), False),
         volume_clock_short_window_seconds=_as_int(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_SHORT_WINDOW"), 300),
-        volume_clock_baseline_window_seconds=_as_int(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_BASELINE_WINDOW"), 3600),
+        volume_clock_baseline_window_seconds=_as_int(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_BASELINE_WINDOW"), 14400),
+        volume_clock_ratio_floor=_as_float(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_RATIO_FLOOR"), 0.25),
+        volume_clock_ratio_ceiling=_as_float(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_RATIO_CEILING"), 2.5),
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),
