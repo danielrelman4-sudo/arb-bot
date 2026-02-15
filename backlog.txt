@@ -383,6 +383,22 @@ All must be green before Phase 8 Stage 1.
 | 63 | Post-submission order status polling | 0D |
 | 64 | Partial fill handling | 0E |
 | 65 | Cancel/replace for unfilled legs | 0C |
+| 66 | Crypto: disable up/down markets | C0A |
+| 67 | Crypto: per-underlying position cap | C0B |
+| 68 | Crypto: higher min edge for daily | C0C |
+| 69 | Crypto: model uncertainty multiplier | C0D |
+| 70 | Crypto: parse is_buyer_maker | C1A |
+| 71 | Crypto: OFI computation | C1B |
+| 72 | Crypto: volume flow rate | C1C |
+| 73 | Crypto: OFI calibrator | C1D |
+| 74 | Crypto: wire OFI drift into engine | C1E |
+| 75 | Crypto: historical aggTrades bootstrap | C1F |
+| 76 | Crypto: rolling OFI recalibration | C1G |
+| 77 | Crypto: activity-scaled volatility | C2A |
+| 78 | Crypto: full volume clock (SBM) | C3A-B |
+| 79 | Crypto: Hawkes self-exciting vol | C4A-B |
+| 80 | Crypto: bootstrap vol uncertainty | C5A |
+| 81 | Crypto: Bayesian posterior CI | C5B |
 
 ---
 
@@ -433,3 +449,70 @@ All must be green before Phase 8 Stage 1.
   - Execution latency: edge decay between detection and fill
 - Should produce realistic PnL distributions with wins AND losses
 - Key metric: what % of the expected-value PnL actually converts to realized PnL?
+
+---
+
+## CRYPTO MODULE UPGRADES (Identified During 1-Hour Paper Test Sanity Check)
+
+**Context:** 1-hour paper test (Feb 14 2026) showed -$108.94 PnL on $500 bankroll. Root causes: zero-drift GBM has no directional signal, 15-min up/down markets are pure coinflips, correlated positions across strikes, uncertainty estimates are artificially tight. See `docs/plans/2026-02-14-crypto-microstructure-upgrade.md` for full implementation plan.
+
+### C0. Tier 0 — Risk Control Fixes (Immediate)
+- **C0A.** Disable 15-min up/down markets — model outputs 50% for all of them (zero drift GBM is symmetric). Re-enable only after OFI drift is live.
+  - Config: `allowed_directions: List[str] = ["above", "below"]`
+  - Files: `arb_bot/crypto/config.py`, `arb_bot/crypto/engine.py`
+- **C0B.** Per-underlying position correlation cap — max 3 simultaneous positions per underlying (BTC, SOL, etc.) at different strikes. Paper test had 7 correlated BTC positions that all lost together.
+  - Config: `max_positions_per_underlying: int = 3`
+  - Files: `arb_bot/crypto/config.py`, `arb_bot/crypto/engine.py`
+- **C0C.** Higher min edge for daily markets — raise from 3% to 6% for above/below markets (>30 min TTE). 3-4% edges were noise.
+  - Config: `min_edge_pct_daily: float = 0.06`
+  - Files: `arb_bot/crypto/config.py`, `arb_bot/crypto/edge_detector.py`
+- **C0D.** Model uncertainty multiplier — multiply Wilson CI half-width by 3x to reflect vol estimation uncertainty (not just MC sampling error). This feeds through to Baker-McHale shrinkage for smaller position sizes.
+  - Config: `model_uncertainty_multiplier: float = 3.0`
+  - Files: `arb_bot/crypto/config.py`, `arb_bot/crypto/engine.py`
+
+### C1. Tier 1 — OFI Directional Signal (Short Term)
+- **C1A.** Parse `is_buyer_maker` from Binance WS trade stream. Track buy vs sell volume per symbol.
+  - Files: `arb_bot/crypto/price_feed.py` (extend `PriceTick`, `_handle_message`)
+- **C1B.** Expose `get_ofi(symbol, window_seconds)` returning Order Flow Imbalance in [-1, +1].
+  - OFI = (buy_vol - sell_vol) / (buy_vol + sell_vol)
+  - Files: `arb_bot/crypto/price_feed.py`
+- **C1C.** Volume flow rate tracking — `get_volume_flow_rate(symbol, window_seconds)` for activity scaling.
+  - Files: `arb_bot/crypto/price_feed.py`
+- **C1D.** OFI calibrator — rolling OLS regression of OFI against 5-min forward returns. Fit alpha coefficient with R² gating (alpha=0 if signal is noise).
+  - New module: `arb_bot/crypto/ofi_calibrator.py`
+  - Config: `ofi_recalibrate_interval_hours: float = 4.0`
+- **C1E.** Wire OFI drift into engine — replace `drift = 0.0` with `drift = alpha * ofi`. Alpha starts at 0 and self-calibrates.
+  - Config: `ofi_enabled: bool = True`, `ofi_window_seconds: int = 300`
+  - Files: `arb_bot/crypto/engine.py:415`
+- **C1F.** Historical aggTrades bootstrap — fetch 48h of Binance aggTrades REST data for initial OFI alpha calibration on first run (no 24h wait required).
+  - Files: `arb_bot/crypto/price_feed.py` (add `load_historical_trades`)
+- **C1G.** Rolling OFI recalibration — refit alpha every N hours on trailing window. If R² drops below threshold, reduce alpha toward 0 (regime guard).
+  - Files: `arb_bot/crypto/engine.py`, `arb_bot/crypto/ofi_calibrator.py`
+- **References:** Cont, Kukanov & Stoikov (2014) "The Price Impact of Order Book Events"
+
+### C2. Tier 2 Lite — Activity-Scaled Volatility (Short Term)
+- **C2A.** Activity-scaled vol — multiply volatility by `sqrt(current_volume_rate / avg_volume_rate)`, clamped to [0.25, 4.0]. Automatically "speeds up" vol during crashes and "slows down" during low-volume chop.
+  - Config: `activity_scaling_enabled: bool = True`, `activity_scaling_short_window_seconds: int = 300`, `activity_scaling_long_window_seconds: int = 3600`
+  - Files: `arb_bot/crypto/engine.py`, `arb_bot/crypto/price_feed.py`
+- **References:** Clark (1973) "A Subordinated Stochastic Process Model with Finite Variance for Speculative Prices"
+
+### C3. Tier 2 Full — Volume Clock (Medium Term, Future)
+- **C3A.** Full Subordinated Brownian Motion — replace `dt = horizon_minutes / MINUTES_PER_YEAR` with volume-based time. Requires rederiving drift terms, jump intensity (per-volume instead of per-time), and removing BS analytical crosscheck (N(d2) assumes clock-time GBM).
+  - Depends on: C2A proving value via paper tests
+  - Files: `arb_bot/crypto/price_model.py`, `arb_bot/crypto/engine.py`
+- **C3B.** Volume path generation — stochastic volume forecasting for non-linear time-to-expiry modeling. Volume rate itself is predictable (US hours vs 3AM UTC, liquidation cascades).
+  - Files: `arb_bot/crypto/price_model.py`
+
+### C4. Tier 2 Full — Hawkes Self-Exciting Volatility (Medium Term, Future)
+- **C4A.** Hawkes process intensity tracker — track "tick outliers" (returns > 3σ), model intensity λ(t) = baseline + Σ decaying memory of past shocks. Prevents "selling insurance during a crash."
+  - New module: `arb_bot/crypto/hawkes_vol.py`
+  - Config: `hawkes_enabled: bool`, `hawkes_baseline: float`, `hawkes_decay: float`
+- **C4B.** Wire Hawkes into vol estimation — when Hawkes intensity is elevated, scale vol up (or block trades entirely). Provides a "volatility regime" signal.
+  - Files: `arb_bot/crypto/engine.py`, `arb_bot/crypto/price_model.py`
+- **References:** Filimonov & Sornette (2012) "Quantifying Reflexivity in Financial Markets"
+
+### C5. Tier 3 — Input-Uncertainty-Aware Confidence (Medium Term, Future)
+- **C5A.** Bootstrap vol uncertainty — resample returns history, compute vol for each subsample, generate MC paths across the vol distribution. Produces honest ~3-10x wider CIs than current Wilson CI.
+  - Files: `arb_bot/crypto/price_model.py`
+- **C5B.** Replace Wilson CI with Bayesian posterior — full posterior over probability incorporating vol, drift, and MC sampling uncertainty. Directly feeds into Kelly sizing for better risk management.
+  - Files: `arb_bot/crypto/price_model.py`, `arb_bot/crypto/engine.py`
