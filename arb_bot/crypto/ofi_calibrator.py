@@ -1,13 +1,14 @@
-"""OFI-to-drift calibrator: fits alpha for mu = alpha * OFI.
+"""OFI-to-drift calibrator: fits alpha for mu = alpha * sgn(OFI) * |OFI|^theta.
 
-Performs rolling OLS regression of Order Flow Imbalance against
-forward returns to determine the optimal drift coefficient.
+Performs rolling nonlinear regression of Order Flow Imbalance against
+forward returns to determine the optimal drift coefficient and power-law
+exponent (square-root law from Kyle/Cont).
 """
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Tuple
+from typing import Deque, Optional, Tuple
 
 import numpy as np
 
@@ -16,14 +17,18 @@ import numpy as np
 class OFICalibrationResult:
     """Result of OFI alpha calibration."""
     alpha: float       # Fitted drift coefficient
+    theta: float       # Power-law exponent
     r_squared: float   # Goodness of fit
     n_samples: int     # Number of samples used
 
 
 class OFICalibrator:
-    """Calibrates OFI alpha using rolling OLS.
+    """Calibrates OFI alpha and theta using nonlinear power-law fitting.
 
-    Fits: forward_return = alpha * OFI + epsilon
+    Fits: forward_return = alpha * sgn(OFI) * |OFI|^theta + epsilon
+
+    Falls back to OLS linear fit (theta=1.0) if scipy is unavailable
+    or curve_fit fails.
 
     Parameters
     ----------
@@ -50,35 +55,43 @@ class OFICalibrator:
         """Record an (OFI, forward_return) observation."""
         self._samples.append((ofi, forward_return))
 
-    def calibrate(self) -> OFICalibrationResult:
-        """Fit alpha via OLS and return calibration result.
+    @staticmethod
+    def _power_law_model(x: np.ndarray, alpha: float, theta: float) -> np.ndarray:
+        """Power-law impact model: y = alpha * sgn(x) * |x|^theta."""
+        return alpha * np.sign(x) * np.abs(x) ** theta
 
-        Returns alpha=0.0 if:
+    def calibrate(self) -> OFICalibrationResult:
+        """Fit alpha and theta via nonlinear curve_fit, with OLS fallback.
+
+        Returns alpha=0.0, theta=0.5 if:
         - Not enough samples (< min_samples)
         - R² below min_r_squared (signal is noise)
         - Degenerate data (all OFI values are zero)
         """
         n = len(self._samples)
         if n < self._min_samples:
-            return OFICalibrationResult(alpha=0.0, r_squared=0.0, n_samples=n)
+            return OFICalibrationResult(alpha=0.0, theta=0.5, r_squared=0.0, n_samples=n)
 
         arr = np.array(list(self._samples))
         x = arr[:, 0]  # OFI values
         y = arr[:, 1]  # forward returns
 
-        # OLS without intercept: y = alpha * x + epsilon
-        # alpha = sum(x*y) / sum(x^2)
+        # Check for degenerate data
         x_sq_sum = float(np.sum(x * x))
         if x_sq_sum < 1e-12:
-            return OFICalibrationResult(alpha=0.0, r_squared=0.0, n_samples=n)
+            return OFICalibrationResult(alpha=0.0, theta=0.5, r_squared=0.0, n_samples=n)
 
-        alpha = float(np.sum(x * y)) / x_sq_sum
+        # Try nonlinear power-law fit via scipy curve_fit
+        alpha, theta = self._fit_power_law(x, y)
 
-        # R-squared (uncentered, appropriate for no-intercept regression)
-        # For y = alpha*x (no intercept), the correct R² uses uncentered
-        # SS_tot = sum(y²) rather than centered SS_tot = sum((y - mean(y))²).
-        # See: Kvalseth (1985), "Cautionary Note about R²".
-        y_pred = alpha * x
+        if alpha is None:
+            # Fallback: OLS linear fit (theta=1.0)
+            alpha_lin, theta_lin = self._fit_ols_linear(x, y)
+            alpha = alpha_lin
+            theta = theta_lin
+
+        # Compute R² (uncentered, appropriate for no-intercept model)
+        y_pred = alpha * np.sign(x) * np.abs(x) ** theta
         ss_res = float(np.sum((y - y_pred) ** 2))
         ss_tot = float(np.sum(y * y))
         r_sq = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
@@ -86,9 +99,41 @@ class OFICalibrator:
 
         # If R² below threshold, signal is not predictive
         if r_sq < self._min_r_squared:
-            return OFICalibrationResult(alpha=0.0, r_squared=r_sq, n_samples=n)
+            return OFICalibrationResult(alpha=0.0, theta=0.5, r_squared=r_sq, n_samples=n)
 
-        return OFICalibrationResult(alpha=alpha, r_squared=r_sq, n_samples=n)
+        return OFICalibrationResult(alpha=alpha, theta=theta, r_squared=r_sq, n_samples=n)
+
+    def _fit_power_law(
+        self, x: np.ndarray, y: np.ndarray
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Attempt nonlinear power-law fit. Returns (alpha, theta) or (None, None)."""
+        try:
+            from scipy.optimize import curve_fit
+        except ImportError:
+            return None, None
+
+        try:
+            popt, _ = curve_fit(
+                self._power_law_model,
+                x,
+                y,
+                p0=[0.1, 0.5],
+                bounds=([-10, 0.1], [10, 1.5]),
+                maxfev=5000,
+            )
+            return float(popt[0]), float(popt[1])
+        except (RuntimeError, ValueError, TypeError):
+            return None, None
+
+    def _fit_ols_linear(
+        self, x: np.ndarray, y: np.ndarray
+    ) -> Tuple[float, float]:
+        """OLS linear fallback: y = alpha * x (theta=1.0)."""
+        x_sq_sum = float(np.sum(x * x))
+        if x_sq_sum < 1e-12:
+            return 0.0, 1.0
+        alpha = float(np.sum(x * y)) / x_sq_sum
+        return alpha, 1.0
 
     @property
     def sample_count(self) -> int:

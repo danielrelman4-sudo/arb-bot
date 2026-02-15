@@ -96,6 +96,7 @@ class CryptoSettings:
     ofi_window_seconds: int = 300
     ofi_alpha: float = 0.0   # Starting alpha (0 = neutral, calibrated at runtime)
     ofi_recalibrate_interval_hours: float = 4.0
+    ofi_impact_exponent: float = 0.5  # Power-law exponent (0.5 = square root law)
 
     # ── Activity scaling ─────────────────────────────────────────────
     activity_scaling_enabled: bool = True
@@ -159,6 +160,7 @@ def load_crypto_settings() -> CryptoSettings:
         ofi_window_seconds=_as_int(os.getenv("ARB_CRYPTO_OFI_WINDOW_SECONDS"), 300),
         ofi_alpha=_as_float(os.getenv("ARB_CRYPTO_OFI_ALPHA"), 0.0),
         ofi_recalibrate_interval_hours=_as_float(os.getenv("ARB_CRYPTO_OFI_RECALIBRATE_HOURS"), 4.0),
+        ofi_impact_exponent=_as_float(os.getenv("ARB_CRYPTO_OFI_IMPACT_EXPONENT"), 0.5),
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),

@@ -92,8 +92,9 @@ class TestOFICalibrator:
 
     def test_ofi_calibration_result_dataclass(self) -> None:
         """Verify OFICalibrationResult fields are accessible."""
-        result = OFICalibrationResult(alpha=0.42, r_squared=0.85, n_samples=100)
+        result = OFICalibrationResult(alpha=0.42, theta=0.5, r_squared=0.85, n_samples=100)
         assert result.alpha == 0.42
+        assert result.theta == 0.5
         assert result.r_squared == 0.85
         assert result.n_samples == 100
 

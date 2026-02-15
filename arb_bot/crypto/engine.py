@@ -247,6 +247,13 @@ class CryptoEngine:
                 count += 1
         return count
 
+    def _apply_ofi_impact(self, ofi: float, alpha: float) -> float:
+        """Apply power-law impact model: drift = alpha * sgn(ofi) * |ofi|^theta."""
+        theta = self._settings.ofi_impact_exponent
+        if ofi == 0.0 or alpha == 0.0:
+            return 0.0
+        return alpha * math.copysign(abs(ofi) ** theta, ofi)
+
     def _get_ofi_calibration(self) -> "OFICalibrationResult":
         """Return cached OFI calibration, recalibrating on interval.
 
@@ -483,7 +490,7 @@ class CryptoEngine:
                 # Use cached calibration result, recalibrate on interval
                 cal_result = self._get_ofi_calibration()
                 alpha = cal_result.alpha if cal_result.alpha != 0 else self._settings.ofi_alpha
-                drift = alpha * ofi
+                drift = self._apply_ofi_impact(ofi, alpha)
 
             # Select path generator: jump diffusion or plain GBM
             if self._settings.use_jump_diffusion:
