@@ -142,6 +142,11 @@ class CryptoEngine:
         self._running = False
         self._bankroll: float = settings.bankroll
 
+        # OFI calibration cache (S1/S3: avoid recalibrating every quote)
+        from arb_bot.crypto.ofi_calibrator import OFICalibrationResult
+        self._ofi_cal_cache: Optional[OFICalibrationResult] = None
+        self._ofi_cal_cache_time: float = 0.0
+
     # ── Properties ────────────────────────────────────────────────
 
     @property
@@ -237,13 +242,26 @@ class CryptoEngine:
     def _count_positions_for_underlying(self, underlying: str) -> int:
         """Count open positions for a given underlying (e.g., 'BTC')."""
         count = 0
-        for ticker in self._positions:
-            for ul in _KALSHI_TO_BINANCE:
-                if ul in ticker.upper():
-                    if ul == underlying:
-                        count += 1
-                    break
+        for pos in self._positions.values():
+            if pos.edge.market.meta.underlying == underlying:
+                count += 1
         return count
+
+    def _get_ofi_calibration(self) -> "OFICalibrationResult":
+        """Return cached OFI calibration, recalibrating on interval.
+
+        Avoids calling ``calibrate()`` (which does OLS) on every quote
+        every cycle. Respects ``ofi_recalibrate_interval_hours``.
+        """
+        now = time.monotonic()
+        interval_secs = self._settings.ofi_recalibrate_interval_hours * 3600.0
+        if (
+            self._ofi_cal_cache is None
+            or (now - self._ofi_cal_cache_time) >= interval_secs
+        ):
+            self._ofi_cal_cache = self._ofi_calibrator.calibrate()
+            self._ofi_cal_cache_time = now
+        return self._ofi_cal_cache
 
     # ── Cycle ─────────────────────────────────────────────────────
 
@@ -462,7 +480,8 @@ class CryptoEngine:
                     binance_sym,
                     window_seconds=self._settings.ofi_window_seconds,
                 )
-                cal_result = self._ofi_calibrator.calibrate()
+                # Use cached calibration result, recalibrate on interval
+                cal_result = self._get_ofi_calibration()
                 alpha = cal_result.alpha if cal_result.alpha != 0 else self._settings.ofi_alpha
                 drift = alpha * ofi
 

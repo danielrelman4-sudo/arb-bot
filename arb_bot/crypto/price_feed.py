@@ -182,17 +182,28 @@ class PriceFeed:
     def get_volume_flow_rate(self, symbol: str, window_seconds: int = 300) -> float:
         """Average volume per minute over the last window_seconds.
 
+        Uses the actual data span (first tick to now) instead of the full
+        window duration to avoid under-reporting when data covers less
+        than the requested window.
+
         Returns 0.0 if insufficient data.
         """
         sym = symbol.lower()
         ticks = self._ticks.get(sym)
         if not ticks:
             return 0.0
-        cutoff = time.time() - window_seconds
-        total_vol = sum(t.volume for t in ticks if t.timestamp >= cutoff)
-        minutes = window_seconds / 60.0
-        if minutes <= 0:
+        now = time.time()
+        cutoff = now - window_seconds
+        window_ticks = [t for t in ticks if t.timestamp >= cutoff]
+        if not window_ticks:
             return 0.0
+        total_vol = sum(t.volume for t in window_ticks)
+        # Use actual data span: first qualifying tick to now
+        actual_span_seconds = now - window_ticks[0].timestamp
+        if actual_span_seconds < 1.0:
+            # Less than 1 second of data — not meaningful
+            return 0.0
+        minutes = actual_span_seconds / 60.0
         return total_vol / minutes
 
     async def load_historical(self, symbol: str) -> None:

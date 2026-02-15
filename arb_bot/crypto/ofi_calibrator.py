@@ -74,10 +74,13 @@ class OFICalibrator:
 
         alpha = float(np.sum(x * y)) / x_sq_sum
 
-        # R-squared
+        # R-squared (uncentered, appropriate for no-intercept regression)
+        # For y = alpha*x (no intercept), the correct R² uses uncentered
+        # SS_tot = sum(y²) rather than centered SS_tot = sum((y - mean(y))²).
+        # See: Kvalseth (1985), "Cautionary Note about R²".
         y_pred = alpha * x
         ss_res = float(np.sum((y - y_pred) ** 2))
-        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        ss_tot = float(np.sum(y * y))
         r_sq = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
         r_sq = max(0.0, r_sq)
 

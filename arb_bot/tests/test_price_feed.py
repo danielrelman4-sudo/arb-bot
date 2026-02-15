@@ -269,16 +269,20 @@ class TestOFI:
 
 class TestVolumeFlowRate:
     def test_volume_flow_rate(self) -> None:
-        """Inject 120 ticks of volume 1.0 over 120 seconds => 120 vol / 2 min = 60.0/min."""
+        """Inject 120 ticks of volume 1.0 over 120 seconds.
+
+        Uses actual data span (~120s ≈ 2 min) not the full window (300s),
+        so rate ≈ 120 vol / 2 min = 60.0/min.
+        """
         feed = PriceFeed(symbols=["btcusdt"])
         now = time.time()
         for i in range(120):
             feed.inject_tick(PriceTick("btcusdt", 97000.0, now - 120 + i, volume=1.0))
 
         rate = feed.get_volume_flow_rate("btcusdt", window_seconds=300)
-        # 120 ticks * 1.0 vol each = 120.0 total vol over 5 min window = 24.0/min
-        # But all 120 ticks are within the window, so: 120 / 5 = 24.0
-        assert rate == pytest.approx(24.0)
+        # 120 ticks * 1.0 vol each, actual span ≈ 120s from first tick to now
+        # rate = 120.0 / (120/60) ≈ 60.0 per minute
+        assert rate == pytest.approx(60.0, rel=0.05)
 
     def test_volume_flow_rate_no_data(self) -> None:
         feed = PriceFeed(symbols=["btcusdt"])
