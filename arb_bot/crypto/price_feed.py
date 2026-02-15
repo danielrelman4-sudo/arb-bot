@@ -103,6 +103,28 @@ class PriceFeed:
         """Latest price for *symbol* (e.g. ``'btcusdt'``)."""
         return self._current_price.get(symbol.lower())
 
+    def get_price_at_time(self, symbol: str, target_timestamp: float) -> float | None:
+        """Return the price of the tick closest to *target_timestamp*.
+
+        Searches through stored ticks for *symbol* and returns the price
+        of the tick whose timestamp is nearest to the target.  Returns
+        ``None`` if no ticks exist for the symbol.
+        """
+        sym = symbol.lower()
+        ticks = self._ticks.get(sym)
+        if not ticks:
+            return None
+
+        best_tick: PriceTick | None = None
+        best_diff = float("inf")
+        for tick in ticks:
+            diff = abs(tick.timestamp - target_timestamp)
+            if diff < best_diff:
+                best_diff = diff
+                best_tick = tick
+
+        return best_tick.price if best_tick is not None else None
+
     def get_price_history(self, symbol: str, minutes: int = 0) -> list[PriceTick]:
         """Recent ticks for *symbol*, optionally limited to last *minutes*."""
         sym = symbol.lower()

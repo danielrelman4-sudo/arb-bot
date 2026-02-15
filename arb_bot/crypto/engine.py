@@ -560,10 +560,22 @@ class CryptoEngine:
             elif direction == "below" and strike is not None:
                 prob = self._price_model.probability_below(paths, strike)
             elif direction == "up":
-                prob = self._price_model.probability_up(paths, current_price)
+                ref_price = current_price  # fallback
+                if mq.market.meta.interval_start_time is not None:
+                    start_ts = mq.market.meta.interval_start_time.timestamp()
+                    looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                    if looked_up is not None:
+                        ref_price = looked_up
+                prob = self._price_model.probability_up(paths, ref_price)
             elif direction == "down":
-                # P(down) = 1 - P(up)
-                up = self._price_model.probability_up(paths, current_price)
+                # P(down) = 1 - P(up), using interval start price as reference
+                ref_price = current_price  # fallback
+                if mq.market.meta.interval_start_time is not None:
+                    start_ts = mq.market.meta.interval_start_time.timestamp()
+                    looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                    if looked_up is not None:
+                        ref_price = looked_up
+                up = self._price_model.probability_up(paths, ref_price)
                 prob = ProbabilityEstimate(
                     probability=1.0 - up.probability,
                     ci_lower=1.0 - up.ci_upper,

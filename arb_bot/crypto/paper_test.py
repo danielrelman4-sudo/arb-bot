@@ -17,7 +17,7 @@ import logging
 import math
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 
 import httpx
@@ -210,6 +210,23 @@ def kalshi_raw_to_quote(
     interval = _infer_interval(series)
     direction, strike = _infer_direction_and_strike(ticker, subtitle, series)
 
+    # Compute interval_start_time for up/down contracts
+    interval_start_time = None
+    if direction in ("up", "down"):
+        # Use open_time from API if available, otherwise derive from close_time
+        open_str = raw.get("open_time", "")
+        if open_str:
+            try:
+                open_str_clean = open_str.replace("Z", "+00:00")
+                interval_start_time = datetime.fromisoformat(open_str_clean)
+            except (ValueError, TypeError):
+                pass
+        if interval_start_time is None:
+            if interval == "15min":
+                interval_start_time = close_time - timedelta(minutes=15)
+            elif interval == "1hour":
+                interval_start_time = close_time - timedelta(hours=1)
+
     meta = CryptoMarketMeta(
         underlying=underlying,
         interval=interval,
@@ -218,6 +235,7 @@ def kalshi_raw_to_quote(
         direction=direction,
         series_ticker=series,
         interval_index=None,
+        interval_start_time=interval_start_time,
     )
     market = CryptoMarket(ticker=ticker, meta=meta)
 
@@ -347,11 +365,10 @@ async def run_paper_test(
         min_minutes_to_expiry=1,
         max_minutes_to_expiry=max_tte,
         min_book_depth_contracts=1,
-        # Enable all directions now that OFI provides directional signal
         allowed_directions=["above", "below", "up", "down"],
         # OFI microstructure drift
         ofi_enabled=True,
-        ofi_window_seconds=300,
+        ofi_window_seconds=600,
         ofi_alpha=0.0,  # starts neutral, calibrated at runtime
         ofi_recalibrate_interval_hours=4.0,
         # Activity-scaled volatility
@@ -378,15 +395,15 @@ async def run_paper_test(
     print(f"  Duration:       {duration_minutes} min")
     print(f"  Max TTE:        {max_tte} min")
     print(f"  Scan interval:  {scan_interval}s")
-    print(f"  Directions:     above, below, up, down")
-    print(f"  OFI drift:      enabled (window=300s, recal=4h)")
+    print(f"  Directions:     above, below, up, down (ref-price fixed)")
+    print(f"  OFI drift:      enabled (window=600s, recal=4h)")
     print(f"  Activity scale: enabled (short=300s, long=3600s)")
     print(f"  Jump diffusion: enabled (λ=3/day, μ=0, σ_j=0.02)")
     print(f"  Unc multiplier: 3.0x")
     print(f"  Max per-UL:     3 positions")
     print(f"{'='*70}\n")
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
         # 1. Bootstrap with Binance klines
         print("Loading historical prices from Binance US REST API...")
         for sym in binance_symbols:
