@@ -287,3 +287,144 @@ class TestVolumeFlowRate:
     def test_volume_flow_rate_unknown_symbol(self) -> None:
         feed = PriceFeed(symbols=["btcusdt"])
         assert feed.get_volume_flow_rate("solusdt") == 0.0
+
+
+# ── Historical aggTrades bootstrap (B6) ─────────────────────────────
+
+def _make_mock_aiohttp(mock_data, status=200):
+    """Build a mock aiohttp module whose ClientSession returns *mock_data*."""
+    import sys
+    from unittest.mock import AsyncMock, MagicMock
+    from types import ModuleType
+
+    mock_resp = AsyncMock()
+    mock_resp.status = status
+    mock_resp.json = AsyncMock(return_value=mock_data)
+
+    # session.get(url) returns an async context manager (the response)
+    mock_session_ctx = AsyncMock()
+    mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(return_value=mock_session_ctx)
+
+    # ClientSession() itself is an async context manager
+    mock_client_ctx = AsyncMock()
+    mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_aiohttp = ModuleType("aiohttp")
+    mock_aiohttp.ClientSession = MagicMock(return_value=mock_client_ctx)  # type: ignore[attr-defined]
+
+    return mock_aiohttp, mock_session
+
+
+class TestLoadHistoricalTrades:
+    def test_load_historical_trades_populates_data(self) -> None:
+        """Historical aggTrades should populate buy/sell volume tracking."""
+        import asyncio
+        import sys
+        from unittest.mock import patch
+
+        feed = PriceFeed(symbols=["btcusdt"])
+        now_ms = int(time.time() * 1000)
+
+        mock_data = [
+            {"a": 1, "p": "70000.00", "q": "1.5", "f": 1, "l": 1, "T": now_ms, "m": False},
+            {"a": 2, "p": "70001.00", "q": "0.5", "f": 2, "l": 2, "T": now_ms + 100, "m": True},
+            {"a": 3, "p": "70002.00", "q": "2.0", "f": 3, "l": 3, "T": now_ms + 200, "m": False},
+        ]
+
+        mock_aiohttp, _ = _make_mock_aiohttp(mock_data)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            async def _run():
+                return await feed.load_historical_trades("btcusdt", limit=3)
+            count = asyncio.run(_run())
+
+        assert count == 3
+        # Price should be set to the last trade's price
+        assert feed.get_current_price("btcusdt") == 70002.0
+        # Buy/sell volume: trade 1 (buy, 1.5), trade 2 (sell, 0.5), trade 3 (buy, 2.0)
+        buy_vol, sell_vol = feed.get_buy_sell_volume("btcusdt", window_seconds=60)
+        assert buy_vol == pytest.approx(3.5)   # 1.5 + 2.0
+        assert sell_vol == pytest.approx(0.5)
+
+    def test_load_historical_trades_handles_http_error(self) -> None:
+        """Non-200 response should return 0 and not crash."""
+        import asyncio
+        import sys
+        from unittest.mock import patch
+
+        feed = PriceFeed(symbols=["btcusdt"])
+        mock_aiohttp, _ = _make_mock_aiohttp([], status=429)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            async def _run():
+                return await feed.load_historical_trades("btcusdt")
+            count = asyncio.run(_run())
+
+        assert count == 0
+
+    def test_load_historical_trades_handles_missing_aiohttp(self) -> None:
+        """Missing aiohttp should return 0 gracefully."""
+        import asyncio
+        import sys
+        from unittest.mock import patch
+
+        feed = PriceFeed(symbols=["btcusdt"])
+
+        # Setting a module to None in sys.modules causes ImportError on import
+        with patch.dict(sys.modules, {"aiohttp": None}):
+            async def _run():
+                return await feed.load_historical_trades("btcusdt")
+            count = asyncio.run(_run())
+
+        assert count == 0
+
+    def test_load_historical_trades_skips_malformed_records(self) -> None:
+        """Malformed trade records should be skipped without crashing."""
+        import asyncio
+        import sys
+        from unittest.mock import patch
+
+        feed = PriceFeed(symbols=["btcusdt"])
+        now_ms = int(time.time() * 1000)
+
+        mock_data = [
+            {"a": 1, "p": "70000.00", "q": "1.5", "f": 1, "l": 1, "T": now_ms, "m": False},
+            {"a": 2, "p": "bad_price", "q": "0.5", "f": 2, "l": 2, "T": now_ms + 100, "m": True},
+            {},  # empty record
+            {"a": 4, "p": "70002.00", "q": "2.0", "f": 4, "l": 4, "T": now_ms + 300, "m": False},
+        ]
+
+        mock_aiohttp, _ = _make_mock_aiohttp(mock_data)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            async def _run():
+                return await feed.load_historical_trades("btcusdt", limit=4)
+            count = asyncio.run(_run())
+
+        # Only 2 valid records (1 and 4), records 2 and 3 are malformed
+        assert count == 2
+
+    def test_load_historical_trades_limits_to_1000(self) -> None:
+        """Limit parameter should be capped at 1000."""
+        import asyncio
+        import sys
+        from unittest.mock import patch
+
+        feed = PriceFeed(symbols=["btcusdt"])
+        mock_aiohttp, mock_session = _make_mock_aiohttp([])
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            async def _run():
+                return await feed.load_historical_trades("btcusdt", limit=5000)
+            count = asyncio.run(_run())
+
+        # Verify URL contains limit=1000 (capped), not 5000
+        get_call = mock_session.get.call_args
+        url_arg = get_call[0][0]
+        assert "limit=1000" in url_arg
+        assert count == 0

@@ -245,6 +245,71 @@ class PriceFeed:
         LOGGER.info("PriceFeed: loaded %d klines for %s (latest=%.2f)",
                      len(data), sym, self._current_price.get(sym, 0.0))
 
+    async def load_historical_trades(self, symbol: str, limit: int = 1000) -> int:
+        """Bootstrap buy/sell volume from Binance aggTrades REST.
+
+        Loads recent aggregate trades to populate OFI data for initial
+        calibration. Returns the number of trades loaded.
+
+        Parameters
+        ----------
+        symbol:
+            Binance symbol (e.g., 'btcusdt').
+        limit:
+            Number of recent trades to fetch (max 1000 per Binance API).
+        """
+        sym = symbol.lower()
+        url = (
+            f"https://api.binance.com/api/v3/aggTrades"
+            f"?symbol={sym.upper()}"
+            f"&limit={min(limit, 1000)}"
+        )
+        LOGGER.info("PriceFeed: loading historical trades for %s", sym)
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        LOGGER.warning("PriceFeed: aggTrades request failed: %s", resp.status)
+                        return 0
+                    data = await resp.json()
+        except ImportError:
+            LOGGER.warning("PriceFeed: aiohttp not installed, skipping historical trades")
+            return 0
+        except Exception as exc:
+            LOGGER.warning("PriceFeed: historical trades load failed: %s", exc)
+            return 0
+
+        if not isinstance(data, list):
+            return 0
+
+        count = 0
+        dq = self._ticks.setdefault(sym, deque(maxlen=_MAX_TICK_HISTORY))
+        dq_bs = self._buy_sells.setdefault(sym, deque(maxlen=_MAX_TICK_HISTORY))
+        for trade in data:
+            # Binance aggTrades format:
+            # {"a":id, "p":"price", "q":"qty", "f":first_id, "l":last_id, "T":timestamp, "m":is_buyer_maker}
+            try:
+                ts = float(trade["T"]) / 1000.0
+                price = float(trade["p"])
+                qty = float(trade["q"])
+                is_buyer_maker = trade.get("m")
+            except (KeyError, ValueError, TypeError):
+                continue
+
+            tick = PriceTick(symbol=sym, price=price, timestamp=ts, volume=qty, is_buyer_maker=is_buyer_maker)
+            dq.append(tick)
+            self._current_price[sym] = price
+
+            if isinstance(is_buyer_maker, bool):
+                is_buy = not is_buyer_maker
+                dq_bs.append((ts, qty, is_buy))
+
+            count += 1
+
+        LOGGER.info("PriceFeed: loaded %d historical trades for %s", count, sym)
+        return count
+
     def inject_tick(self, tick: PriceTick) -> None:
         """Inject a tick manually (useful for testing or alternative feeds)."""
         sym = tick.symbol.lower()
