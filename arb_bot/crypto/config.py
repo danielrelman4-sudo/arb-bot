@@ -68,6 +68,7 @@ class CryptoSettings:
     min_edge_pct_daily: float = 0.06
     min_edge_cents: float = 0.02
     max_model_uncertainty: float = 0.15
+    model_uncertainty_multiplier: float = 3.0
     confidence_level: float = 0.95
 
     # ── Market filtering ───────────────────────────────────────────
@@ -126,6 +127,7 @@ def load_crypto_settings() -> CryptoSettings:
         min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.06),
         min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.02),
         max_model_uncertainty=_as_float(os.getenv("ARB_CRYPTO_MAX_MODEL_UNCERTAINTY"), 0.15),
+        model_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_MODEL_UNCERTAINTY_MULTIPLIER"), 3.0),
         confidence_level=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_LEVEL"), 0.95),
         allowed_directions=_as_csv(os.getenv("ARB_CRYPTO_ALLOWED_DIRECTIONS")) or ["above", "below"],
         min_minutes_to_expiry=_as_int(os.getenv("ARB_CRYPTO_MIN_MINUTES_TO_EXPIRY"), 2),

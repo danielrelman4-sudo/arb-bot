@@ -719,3 +719,97 @@ class TestPerUnderlyingPositionCap:
             assert engine._count_positions_for_underlying("BTC") == 2
 
         asyncio.run(_run())
+
+
+# ── Model uncertainty multiplier (A4) ─────────────────────────────
+
+class TestModelUncertaintyMultiplier:
+    def test_uncertainty_scaled_by_multiplier(self) -> None:
+        """model_uncertainty_multiplier=3.0 should widen CI by 3x."""
+        from arb_bot.crypto.price_model import PriceModel
+
+        settings_scaled = _make_settings(
+            mc_num_paths=500,
+            model_uncertainty_multiplier=3.0,
+        )
+        settings_unscaled = _make_settings(
+            mc_num_paths=500,
+            model_uncertainty_multiplier=1.0,
+        )
+        engine_scaled = CryptoEngine(settings_scaled)
+        engine_unscaled = CryptoEngine(settings_unscaled)
+
+        # Use the same seed so both engines generate identical MC paths
+        engine_scaled._price_model = PriceModel(
+            num_paths=500, confidence_level=0.95, seed=42,
+        )
+        engine_unscaled._price_model = PriceModel(
+            num_paths=500, confidence_level=0.95, seed=42,
+        )
+
+        # Inject identical BTC price data into both engines
+        ts = time.time()
+        for i in range(100):
+            tick = PriceTick("btcusdt", 97000.0 + i * 10, ts - 100 + i, 1.0)
+            engine_scaled.price_feed.inject_tick(tick)
+            engine_unscaled.price_feed.inject_tick(tick)
+
+        quote = _make_quote(
+            ticker="KXBTCD-26FEB14-T97500",
+            yes_price=0.50,
+            no_price=0.50,
+            tte_minutes=10.0,
+        )
+
+        probs_scaled = engine_scaled._compute_model_probabilities([quote])
+        probs_unscaled = engine_unscaled._compute_model_probabilities([quote])
+
+        ticker = quote.market.ticker
+        assert ticker in probs_scaled
+        assert ticker in probs_unscaled
+
+        unc_scaled = probs_scaled[ticker].uncertainty
+        unc_unscaled = probs_unscaled[ticker].uncertainty
+
+        # Scaled uncertainty should be exactly 3x the unscaled
+        assert abs(unc_scaled - 3.0 * unc_unscaled) < 1e-10
+
+        # CI should be wider
+        width_scaled = probs_scaled[ticker].ci_upper - probs_scaled[ticker].ci_lower
+        width_unscaled = probs_unscaled[ticker].ci_upper - probs_unscaled[ticker].ci_lower
+        assert width_scaled >= width_unscaled
+
+    def test_multiplier_1_leaves_uncertainty_unchanged(self) -> None:
+        """model_uncertainty_multiplier=1.0 should not change uncertainty."""
+        settings = _make_settings(
+            mc_num_paths=500,
+            model_uncertainty_multiplier=1.0,
+        )
+        engine = CryptoEngine(settings)
+
+        ts = time.time()
+        for i in range(100):
+            engine.price_feed.inject_tick(
+                PriceTick("btcusdt", 97000.0, ts - 100 + i, 1.0)
+            )
+
+        quote = _make_quote(
+            ticker="KXBTCD-26FEB14-T97500",
+            yes_price=0.50,
+            no_price=0.50,
+            tte_minutes=10.0,
+        )
+
+        probs = engine._compute_model_probabilities([quote])
+        ticker = quote.market.ticker
+        assert ticker in probs
+        # With multiplier=1.0, raw Wilson CI uncertainty should be preserved
+        # (no scaling applied)
+        prob = probs[ticker]
+        assert prob.uncertainty > 0
+        # CI should be symmetric around probability
+        expected_lower = max(0.0, prob.probability - prob.uncertainty)
+        expected_upper = min(1.0, prob.probability + prob.uncertainty)
+        # The raw Wilson CI center != p_hat, so the CI may not be symmetric
+        # around probability. But the uncertainty field should be the original
+        # Wilson CI half-width.

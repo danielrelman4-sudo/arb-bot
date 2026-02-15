@@ -475,6 +475,19 @@ class CryptoEngine:
             else:
                 continue
 
+            # Scale uncertainty to reflect input uncertainty (vol estimate),
+            # not just MC sampling error from Wilson CI
+            unc_mult = self._settings.model_uncertainty_multiplier
+            if unc_mult != 1.0:
+                scaled_unc = prob.uncertainty * unc_mult
+                prob = ProbabilityEstimate(
+                    probability=prob.probability,
+                    ci_lower=max(0.0, prob.probability - scaled_unc),
+                    ci_upper=min(1.0, prob.probability + scaled_unc),
+                    uncertainty=scaled_unc,
+                    num_paths=prob.num_paths,
+                )
+
             result[mq.market.ticker] = prob
 
         return result
