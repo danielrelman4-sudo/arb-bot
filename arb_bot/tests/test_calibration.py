@@ -153,3 +153,49 @@ class TestBlendProbabilities:
         # model_weight = 0.7 * exp(0) = 0.7
         # blended = 0.7 * 1.0 + 0.3 * 0.0 = 0.7
         assert abs(result - 0.7) < 1e-10
+
+
+# ── Market Brier score and Brier skill score tests ────────────────
+
+
+class TestMarketBrierScore:
+    def test_market_brier_score_computation(self) -> None:
+        """Market Brier score uses market_implied_prob."""
+        cal = ModelCalibrator(min_samples_for_calibration=1000)
+        # Market predicts 0.8 for outcomes that are True -> (0.8 - 1.0)^2 = 0.04
+        # Market predicts 0.2 for outcomes that are False -> (0.2 - 0.0)^2 = 0.04
+        for _ in range(50):
+            cal.record_outcome(0.9, True, market_implied_prob=0.8)
+            cal.record_outcome(0.1, False, market_implied_prob=0.2)
+        score = cal.compute_market_brier_score()
+        assert abs(score - 0.04) < 0.01
+
+    def test_brier_skill_positive_when_model_better(self) -> None:
+        """Model well-calibrated, market random -> BSS > 0."""
+        cal = ModelCalibrator(min_samples_for_calibration=1000)
+        # Model predicts perfectly, market predicts 0.5
+        for _ in range(50):
+            cal.record_outcome(1.0, True, market_implied_prob=0.5)
+            cal.record_outcome(0.0, False, market_implied_prob=0.5)
+        bss = cal.compute_brier_skill_score()
+        assert bss > 0  # Model beats market
+
+    def test_brier_skill_negative_when_market_better(self) -> None:
+        """Model miscalibrated, market accurate -> BSS < 0."""
+        cal = ModelCalibrator(min_samples_for_calibration=1000)
+        # Model always predicts 0.5, market predicts accurately
+        for _ in range(50):
+            cal.record_outcome(0.5, True, market_implied_prob=0.95)
+            cal.record_outcome(0.5, False, market_implied_prob=0.05)
+        bss = cal.compute_brier_skill_score()
+        assert bss < 0  # Market beats model
+
+    def test_market_brier_empty_records(self) -> None:
+        """Empty calibrator returns 1.0."""
+        cal = ModelCalibrator()
+        assert cal.compute_market_brier_score() == 1.0
+
+    def test_brier_skill_empty_records(self) -> None:
+        """Empty calibrator returns 0.0."""
+        cal = ModelCalibrator()
+        assert cal.compute_brier_skill_score() == 0.0

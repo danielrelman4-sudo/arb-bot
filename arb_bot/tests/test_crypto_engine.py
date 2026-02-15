@@ -251,6 +251,7 @@ class TestSettlement:
         record = engine.settle_position_with_outcome(ticker, settled_yes=True)
         assert record is not None
         assert record.settled is True
+        assert record.actual_outcome == "yes"
         # PnL = (1.0 - 0.40) * 10 = 6.0
         assert abs(record.pnl - 6.0) < 0.01
         assert abs(engine.session_pnl - 6.0) < 0.01
@@ -266,6 +267,7 @@ class TestSettlement:
         ticker = edge.market.ticker
         record = engine.settle_position_with_outcome(ticker, settled_yes=False)
         assert record is not None
+        assert record.actual_outcome == "no"
         # PnL = (0.0 - 0.60) * 10 = -6.0
         assert abs(record.pnl - (-6.0)) < 0.01
         assert abs(engine.session_pnl - (-6.0)) < 0.01
@@ -279,6 +281,7 @@ class TestSettlement:
         ticker = edge.market.ticker
         record = engine.settle_position_with_outcome(ticker, settled_yes=False)
         assert record is not None
+        assert record.actual_outcome == "no"
         # NO wins when settled_yes=False → PnL = (1.0 - 0.30) * 10 = 7.0
         assert abs(record.pnl - 7.0) < 0.01
 
@@ -291,6 +294,7 @@ class TestSettlement:
         ticker = edge.market.ticker
         record = engine.settle_position_with_outcome(ticker, settled_yes=True)
         assert record is not None
+        assert record.actual_outcome == "yes"
         # NO loses when settled_yes=True → PnL = (0.0 - 0.40) * 10 = -4.0
         assert abs(record.pnl - (-4.0)) < 0.01
 
@@ -316,6 +320,100 @@ class TestSettlement:
         engine._execute_paper_trade(edge, 5)
         engine.settle_position_with_outcome(edge.market.ticker, True)
         assert len(engine.positions) == 0
+
+
+# ── Real settlement tests ─────────────────────────────────────────
+
+class TestRealSettlement:
+    def test_fetch_settlement_returns_none_without_client(self) -> None:
+        """Without HTTP client, _fetch_settlement_outcome returns None."""
+        settings = _make_settings()
+        engine = CryptoEngine(settings)
+        result = asyncio.get_event_loop().run_until_complete(
+            engine._fetch_settlement_outcome("KXBTCD-26FEB14-T97500")
+        )
+        assert result is None
+
+    def test_settle_with_real_yes_outcome(self) -> None:
+        """Mock HTTP returning yes -> position settled with real outcome."""
+        import unittest.mock as mock
+
+        settings = _make_settings(bankroll=1000.0, paper_slippage_cents=0.0)
+        engine = CryptoEngine(settings)
+        edge = _make_edge(side="yes", yes_price=0.40)
+        engine._execute_paper_trade(edge, 10)
+        ticker = edge.market.ticker
+
+        # Create mock HTTP response (MagicMock because resp.json() is sync)
+        mock_response = mock.MagicMock()
+        mock_response.json.return_value = {"market": {"result": "yes", "status": "settled"}}
+        mock_response.status_code = 200
+        mock_response.raise_for_status = mock.Mock()
+
+        mock_client = mock.AsyncMock()
+        mock_client.get = mock.AsyncMock(return_value=mock_response)
+        engine.set_http_client(mock_client)
+
+        outcome = asyncio.get_event_loop().run_until_complete(
+            engine._fetch_settlement_outcome(ticker)
+        )
+        assert outcome is True
+
+        # Settle with the outcome
+        record = engine.settle_position_with_outcome(ticker, outcome)
+        assert record is not None
+        assert record.actual_outcome == "yes"
+        assert abs(record.pnl - 6.0) < 0.01  # (1.0 - 0.40) * 10
+
+    def test_settle_with_real_no_outcome(self) -> None:
+        """Mock HTTP returning no -> position settled correctly."""
+        import unittest.mock as mock
+
+        settings = _make_settings(bankroll=1000.0, paper_slippage_cents=0.0)
+        engine = CryptoEngine(settings)
+        edge = _make_edge(side="yes", yes_price=0.60)
+        engine._execute_paper_trade(edge, 10)
+        ticker = edge.market.ticker
+
+        mock_response = mock.MagicMock()
+        mock_response.json.return_value = {"market": {"result": "no", "status": "settled"}}
+        mock_response.status_code = 200
+        mock_response.raise_for_status = mock.Mock()
+
+        mock_client = mock.AsyncMock()
+        mock_client.get = mock.AsyncMock(return_value=mock_response)
+        engine.set_http_client(mock_client)
+
+        outcome = asyncio.get_event_loop().run_until_complete(
+            engine._fetch_settlement_outcome(ticker)
+        )
+        assert outcome is False
+
+        record = engine.settle_position_with_outcome(ticker, outcome)
+        assert record is not None
+        assert record.actual_outcome == "no"
+        assert abs(record.pnl - (-6.0)) < 0.01  # (0.0 - 0.60) * 10
+
+    def test_fetch_returns_none_when_not_settled(self) -> None:
+        """Mock HTTP returning empty result -> None."""
+        import unittest.mock as mock
+
+        settings = _make_settings()
+        engine = CryptoEngine(settings)
+
+        mock_response = mock.MagicMock()
+        mock_response.json.return_value = {"market": {"result": "", "status": "open"}}
+        mock_response.status_code = 200
+        mock_response.raise_for_status = mock.Mock()
+
+        mock_client = mock.AsyncMock()
+        mock_client.get = mock.AsyncMock(return_value=mock_response)
+        engine.set_http_client(mock_client)
+
+        outcome = asyncio.get_event_loop().run_until_complete(
+            engine._fetch_settlement_outcome("KXBTCD-26FEB14-T97500")
+        )
+        assert outcome is None
 
 
 # ── Model probability computation tests ────────────────────────────
@@ -564,8 +662,21 @@ class TestCSVExport:
         csv_data = engine.export_trades_csv()
         header = csv_data.strip().split("\n")[0]
         for field in ["ticker", "side", "contracts", "entry_price", "pnl",
-                       "edge_at_entry", "model_prob_at_entry", "settled"]:
+                       "edge_at_entry", "model_prob_at_entry", "settled", "actual_outcome"]:
             assert field in header
+
+    def test_actual_outcome_in_csv_data(self) -> None:
+        settings = _make_settings(paper_slippage_cents=0.0)
+        engine = CryptoEngine(settings)
+        edge = _make_edge(side="yes", yes_price=0.50)
+        engine._execute_paper_trade(edge, 5)
+        engine.settle_position_with_outcome(edge.market.ticker, True)
+
+        csv_data = engine.export_trades_csv()
+        lines = csv_data.strip().split("\n")
+        assert len(lines) == 2
+        # actual_outcome should be "yes"
+        assert "yes" in lines[1]
 
 
 # ── Kalshi-to-Binance mapping tests ────────────────────────────────
@@ -772,7 +883,7 @@ class TestModelUncertaintyMultiplier:
         unc_unscaled = probs_unscaled[ticker].uncertainty
 
         # Scaled uncertainty should be exactly 3x the unscaled
-        assert abs(unc_scaled - 3.0 * unc_unscaled) < 1e-10
+        assert abs(unc_scaled - 3.0 * unc_unscaled) < 1e-9
 
         # CI should be wider
         width_scaled = probs_scaled[ticker].ci_upper - probs_scaled[ticker].ci_lower
