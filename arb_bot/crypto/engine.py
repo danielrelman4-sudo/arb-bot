@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from arb_bot.crypto.calibration import ModelCalibrator
+from arb_bot.crypto.ofi_calibrator import OFICalibrator
 from arb_bot.crypto.config import CryptoSettings
 from arb_bot.crypto.edge_detector import CryptoEdge, EdgeDetector
 from arb_bot.crypto.market_scanner import (
@@ -130,6 +131,7 @@ class CryptoEngine:
             max_model_uncertainty=settings.max_model_uncertainty,
         )
         self._calibrator = ModelCalibrator()
+        self._ofi_calibrator = OFICalibrator()
 
         # State
         self._positions: Dict[str, CryptoPosition] = {}
@@ -168,6 +170,10 @@ class CryptoEngine:
     @property
     def calibrator(self) -> ModelCalibrator:
         return self._calibrator
+
+    @property
+    def ofi_calibrator(self) -> OFICalibrator:
+        return self._ofi_calibrator
 
     # ── Main loop ─────────────────────────────────────────────────
 
@@ -432,7 +438,16 @@ class CryptoEngine:
             if horizon <= 0:
                 continue
 
-            drift = 0.0  # Martingale assumption
+            # Compute OFI-based drift if enabled
+            drift = 0.0
+            if self._settings.ofi_enabled and binance_sym:
+                ofi = self._price_feed.get_ofi(
+                    binance_sym,
+                    window_seconds=self._settings.ofi_window_seconds,
+                )
+                cal_result = self._ofi_calibrator.calibrate()
+                alpha = cal_result.alpha if cal_result.alpha != 0 else self._settings.ofi_alpha
+                drift = alpha * ofi
 
             # Select path generator: jump diffusion or plain GBM
             if self._settings.use_jump_diffusion:

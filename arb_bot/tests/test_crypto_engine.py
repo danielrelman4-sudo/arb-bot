@@ -813,3 +813,87 @@ class TestModelUncertaintyMultiplier:
         # The raw Wilson CI center != p_hat, so the CI may not be symmetric
         # around probability. But the uncertainty field should be the original
         # Wilson CI half-width.
+
+
+# ── OFI drift injection (B5) ──────────────────────────────────────
+
+class TestOFIDrift:
+    def test_ofi_drift_injected_into_paths(self) -> None:
+        """When OFI is positive and alpha is set, drift should affect probabilities."""
+        settings = _make_settings(
+            mc_num_paths=2000,
+            ofi_enabled=True,
+            ofi_window_seconds=60,
+            allowed_directions=["above", "below"],
+        )
+        engine = CryptoEngine(settings)
+
+        # Inject price data + heavy buy pressure (all buys, OFI -> +1.0)
+        now = time.time()
+        for i in range(60):
+            engine.price_feed.inject_tick(
+                PriceTick("btcusdt", 70000.0, now - 60 + i, 2.0, is_buyer_maker=False)
+            )
+
+        # Set a known alpha by injecting calibration samples
+        # alpha ~ 0.5 means drift = 0.5 * OFI
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            ofi_sample = rng.uniform(-1, 1)
+            engine._ofi_calibrator.record_sample(ofi_sample, 0.5 * ofi_sample + rng.normal(0, 0.001))
+
+        # Verify OFI is strongly positive
+        ofi = engine.price_feed.get_ofi("btcusdt", window_seconds=60)
+        assert ofi > 0.9
+
+        # Build a quote for above-strike (strike below current price)
+        # With positive drift, P(above 69500) should be high
+        quote = _make_quote(
+            ticker="KXBTCD-26FEB14-T69500",
+            yes_price=0.50,
+            no_price=0.50,
+            tte_minutes=10.0,
+        )
+        probs = engine._compute_model_probabilities([quote])
+        assert quote.market.ticker in probs
+        # With OFI=1.0 and alpha~0.5, drift is positive -> higher above-strike probability
+        assert probs[quote.market.ticker].probability > 0.5
+
+    def test_ofi_disabled_uses_zero_drift(self) -> None:
+        """When OFI is disabled, drift should be 0.0 (martingale)."""
+        settings = _make_settings(
+            mc_num_paths=500,
+            ofi_enabled=False,
+        )
+        engine = CryptoEngine(settings)
+
+        now = time.time()
+        for i in range(60):
+            engine.price_feed.inject_tick(
+                PriceTick("btcusdt", 70000.0, now - 60 + i, 2.0, is_buyer_maker=False)
+            )
+
+        # Even with calibration samples, drift should be zero
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            ofi_sample = rng.uniform(-1, 1)
+            engine._ofi_calibrator.record_sample(ofi_sample, 0.5 * ofi_sample)
+
+        quote = _make_quote(
+            ticker="KXBTCD-26FEB14-T70000",
+            yes_price=0.50,
+            no_price=0.50,
+            tte_minutes=10.0,
+        )
+        probs = engine._compute_model_probabilities([quote])
+        assert quote.market.ticker in probs
+        # With flat price and zero drift, probability should be around 0.50
+        prob = probs[quote.market.ticker].probability
+        assert 0.3 <= prob <= 0.7
+
+    def test_ofi_calibrator_property_accessible(self) -> None:
+        """The ofi_calibrator property should expose the OFICalibrator."""
+        settings = _make_settings()
+        engine = CryptoEngine(settings)
+        from arb_bot.crypto.ofi_calibrator import OFICalibrator
+        assert isinstance(engine.ofi_calibrator, OFICalibrator)
