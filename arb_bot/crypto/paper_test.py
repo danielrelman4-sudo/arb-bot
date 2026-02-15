@@ -39,6 +39,7 @@ LOGGER = logging.getLogger(__name__)
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 BINANCE_KLINES = "https://api.binance.us/api/v3/klines"
 BINANCE_PRICE = "https://api.binance.us/api/v3/ticker/price"
+BINANCE_AGG_TRADES = "https://api.binance.us/api/v3/aggTrades"
 
 # Map underlying to Kalshi series tickers
 _SERIES_MAP = {
@@ -98,6 +99,28 @@ async def fetch_binance_klines(
             return [(float(k[0]) / 1000.0, float(k[4])) for k in data]
     except Exception as exc:
         LOGGER.warning("Binance klines %s failed: %s", symbol, exc)
+    return []
+
+
+async def fetch_binance_agg_trades(
+    symbol: str,
+    limit: int,
+    client: httpx.AsyncClient,
+) -> list[dict]:
+    """Fetch recent aggregate trades from Binance US for OFI bootstrap."""
+    try:
+        resp = await client.get(
+            BINANCE_AGG_TRADES,
+            params={
+                "symbol": symbol,
+                "limit": min(limit, 1000),
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as exc:
+        LOGGER.warning("Binance aggTrades %s failed: %s", symbol, exc)
     return []
 
 
@@ -308,11 +331,14 @@ async def run_paper_test(
         price_feed_symbols=[s.lower() for s in binance_symbols],
         mc_num_paths=mc_paths,
         min_edge_pct=min_edge,
+        min_edge_pct_daily=0.06,
         min_edge_cents=min_edge,
         max_model_uncertainty=0.20,
+        model_uncertainty_multiplier=3.0,
         bankroll=500.0,
         max_position_per_market=50.0,
         max_concurrent_positions=10,
+        max_positions_per_underlying=3,
         kelly_fraction_cap=0.10,
         scan_interval_seconds=scan_interval,
         paper_slippage_cents=0.5,
@@ -321,20 +347,43 @@ async def run_paper_test(
         min_minutes_to_expiry=1,
         max_minutes_to_expiry=max_tte,
         min_book_depth_contracts=1,
+        # Enable all directions now that OFI provides directional signal
+        allowed_directions=["above", "below", "up", "down"],
+        # OFI microstructure drift
+        ofi_enabled=True,
+        ofi_window_seconds=300,
+        ofi_alpha=0.0,  # starts neutral, calibrated at runtime
+        ofi_recalibrate_interval_hours=4.0,
+        # Activity-scaled volatility
+        activity_scaling_enabled=True,
+        activity_scaling_short_window_seconds=300,
+        activity_scaling_long_window_seconds=3600,
+        # Jump diffusion
+        use_jump_diffusion=True,
+        mc_jump_intensity=3.0,
+        mc_jump_mean=0.0,
+        mc_jump_vol=0.02,
     )
 
     engine = CryptoEngine(settings)
 
     print(f"\n{'='*70}")
-    print(f"  Crypto Prediction Engine — Paper Test")
+    print(f"  Crypto Prediction Engine — Paper Test v2")
+    print(f"  (OFI drift + activity scaling + jump diffusion + 15m markets)")
     print(f"{'='*70}")
     print(f"  Underlyings:    {', '.join(underlyings)}")
     print(f"  Binance feeds:  {', '.join(binance_symbols)}")
     print(f"  MC paths:       {mc_paths}")
-    print(f"  Min edge:       {min_edge*100:.1f}%")
+    print(f"  Min edge:       {min_edge*100:.1f}% (daily: 6.0%)")
     print(f"  Duration:       {duration_minutes} min")
     print(f"  Max TTE:        {max_tte} min")
     print(f"  Scan interval:  {scan_interval}s")
+    print(f"  Directions:     above, below, up, down")
+    print(f"  OFI drift:      enabled (window=300s, recal=4h)")
+    print(f"  Activity scale: enabled (short=300s, long=3600s)")
+    print(f"  Jump diffusion: enabled (λ=3/day, μ=0, σ_j=0.02)")
+    print(f"  Unc multiplier: 3.0x")
+    print(f"  Max per-UL:     3 positions")
     print(f"{'='*70}\n")
 
     async with httpx.AsyncClient() as client:
@@ -363,6 +412,38 @@ async def run_paper_test(
         if not prices:
             print("   WARNING: No Binance prices available. Using historical data only.")
 
+        # 2b. Bootstrap OFI data from aggTrades
+        print("\nBootstrapping OFI data from Binance aggTrades...")
+        for sym in binance_symbols:
+            trades = await fetch_binance_agg_trades(sym, 1000, client)
+            if trades:
+                buy_count = 0
+                sell_count = 0
+                for trade in trades:
+                    try:
+                        ts = float(trade["T"]) / 1000.0
+                        price = float(trade["p"])
+                        qty = float(trade["q"])
+                        is_buyer_maker = trade.get("m")
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    tick = PriceTick(
+                        symbol=sym.lower(), price=price, timestamp=ts,
+                        volume=qty, is_buyer_maker=is_buyer_maker,
+                    )
+                    engine.price_feed.inject_tick(tick)
+                    if isinstance(is_buyer_maker, bool):
+                        if is_buyer_maker:
+                            sell_count += 1
+                        else:
+                            buy_count += 1
+                ofi = engine.price_feed.get_ofi(sym.lower(), window_seconds=600)
+                print(
+                    f"   {sym}: {len(trades)} trades loaded, "
+                    f"{buy_count} buys / {sell_count} sells, "
+                    f"OFI={ofi:+.3f}"
+                )
+
         # 3. Show vol estimates
         print("\nVolatility estimates:")
         for sym in [s.lower() for s in binance_symbols]:
@@ -389,17 +470,34 @@ async def run_paper_test(
             print(f"Cycle {cycle} ({elapsed:.1f}m / {duration_minutes}m)")
             print(f"{'─'*50}")
 
-            # Refresh prices
+            # Refresh prices + trade flow for OFI
             new_prices = await fetch_binance_prices(binance_symbols, client)
             for sym, price in new_prices.items():
                 engine.price_feed.inject_tick(
                     PriceTick(symbol=sym, price=price, timestamp=time.time(), volume=0)
                 )
 
+            # Refresh aggTrades for live OFI updates
+            for sym in binance_symbols:
+                trades = await fetch_binance_agg_trades(sym, 100, client)
+                for trade in trades:
+                    try:
+                        ts = float(trade["T"]) / 1000.0
+                        price_t = float(trade["p"])
+                        qty = float(trade["q"])
+                        is_bm = trade.get("m")
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    engine.price_feed.inject_tick(PriceTick(
+                        symbol=sym.lower(), price=price_t, timestamp=ts,
+                        volume=qty, is_buyer_maker=is_bm,
+                    ))
+
             for sym in [s.lower() for s in binance_symbols]:
                 p = engine.price_feed.get_current_price(sym)
+                ofi = engine.price_feed.get_ofi(sym, window_seconds=300)
                 if p:
-                    print(f"   {sym.upper()}: ${p:,.2f}")
+                    print(f"   {sym.upper()}: ${p:,.2f}  OFI={ofi:+.3f}")
 
             # Fetch Kalshi markets
             raw_markets = await fetch_kalshi_crypto_markets(underlyings, client)
