@@ -125,6 +125,7 @@ class CryptoEngine:
         )
         self._edge_detector = EdgeDetector(
             min_edge_pct=settings.min_edge_pct,
+            min_edge_pct_daily=settings.min_edge_pct_daily,
             min_edge_cents=settings.min_edge_cents,
             max_model_uncertainty=settings.max_model_uncertainty,
         )

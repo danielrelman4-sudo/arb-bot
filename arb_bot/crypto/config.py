@@ -65,6 +65,7 @@ class CryptoSettings:
 
     # ── Edge detection ─────────────────────────────────────────────
     min_edge_pct: float = 0.05
+    min_edge_pct_daily: float = 0.06
     min_edge_cents: float = 0.02
     max_model_uncertainty: float = 0.15
     confidence_level: float = 0.95
@@ -122,6 +123,7 @@ def load_crypto_settings() -> CryptoSettings:
         mc_jump_mean=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_MEAN"), 0.0),
         mc_jump_vol=_as_float(os.getenv("ARB_CRYPTO_MC_JUMP_VOL"), 0.02),
         min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.05),
+        min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.06),
         min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.02),
         max_model_uncertainty=_as_float(os.getenv("ARB_CRYPTO_MAX_MODEL_UNCERTAINTY"), 0.15),
         confidence_level=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_LEVEL"), 0.95),
