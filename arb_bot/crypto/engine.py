@@ -17,6 +17,7 @@ import asyncio
 import csv
 import io
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -432,6 +433,22 @@ class CryptoEngine:
             if vol <= 0:
                 # Use a reasonable default vol for crypto
                 vol = 0.50  # 50% annualized — conservative default
+
+            # Activity scaling: adjust vol by sqrt(current_volume_rate / avg_volume_rate)
+            if self._settings.activity_scaling_enabled and binance_sym:
+                short_rate = self._price_feed.get_volume_flow_rate(
+                    binance_sym,
+                    window_seconds=self._settings.activity_scaling_short_window_seconds,
+                )
+                long_rate = self._price_feed.get_volume_flow_rate(
+                    binance_sym,
+                    window_seconds=self._settings.activity_scaling_long_window_seconds,
+                )
+                if long_rate > 0 and short_rate > 0:
+                    activity_ratio = short_rate / long_rate
+                    # Clamp to prevent extreme scaling
+                    activity_ratio = max(0.25, min(4.0, activity_ratio))
+                    vol *= math.sqrt(activity_ratio)
 
             # Generate paths for this horizon
             horizon = mq.time_to_expiry_minutes

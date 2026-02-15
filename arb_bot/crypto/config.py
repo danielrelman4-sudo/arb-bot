@@ -97,6 +97,11 @@ class CryptoSettings:
     ofi_alpha: float = 0.0   # Starting alpha (0 = neutral, calibrated at runtime)
     ofi_recalibrate_interval_hours: float = 4.0
 
+    # ── Activity scaling ─────────────────────────────────────────────
+    activity_scaling_enabled: bool = True
+    activity_scaling_short_window_seconds: int = 300    # "current" volume window
+    activity_scaling_long_window_seconds: int = 3600    # "average" volume window
+
     # ── Cycle timing ───────────────────────────────────────────────
     scan_interval_seconds: float = 5.0
 
@@ -147,6 +152,9 @@ def load_crypto_settings() -> CryptoSettings:
         use_maker=_as_bool(os.getenv("ARB_CRYPTO_USE_MAKER"), True),
         maker_timeout_seconds=_as_float(os.getenv("ARB_CRYPTO_MAKER_TIMEOUT_SECONDS"), 5.0),
         taker_fallback=_as_bool(os.getenv("ARB_CRYPTO_TAKER_FALLBACK"), True),
+        activity_scaling_enabled=_as_bool(os.getenv("ARB_CRYPTO_ACTIVITY_SCALING_ENABLED"), True),
+        activity_scaling_short_window_seconds=_as_int(os.getenv("ARB_CRYPTO_ACTIVITY_SCALING_SHORT_WINDOW"), 300),
+        activity_scaling_long_window_seconds=_as_int(os.getenv("ARB_CRYPTO_ACTIVITY_SCALING_LONG_WINDOW"), 3600),
         ofi_enabled=_as_bool(os.getenv("ARB_CRYPTO_OFI_ENABLED"), True),
         ofi_window_seconds=_as_int(os.getenv("ARB_CRYPTO_OFI_WINDOW_SECONDS"), 300),
         ofi_alpha=_as_float(os.getenv("ARB_CRYPTO_OFI_ALPHA"), 0.0),
