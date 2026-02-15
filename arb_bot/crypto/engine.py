@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from arb_bot.crypto.calibration import ModelCalibrator
+from arb_bot.crypto.cycle_logger import CycleLogger, CycleSnapshot
 from arb_bot.crypto.hawkes import HawkesIntensity
 from arb_bot.crypto.ofi_calibrator import OFICalibrator
 from arb_bot.crypto.config import CryptoSettings
@@ -148,6 +149,9 @@ class CryptoEngine:
         self._cycle_count: int = 0
         self._running = False
         self._bankroll: float = settings.bankroll
+
+        # Cycle logger (optional, for offline calibration)
+        self._cycle_logger: Optional[CycleLogger] = None
 
         # OFI calibration cache (S1/S3: avoid recalibrating every quote)
         from arb_bot.crypto.ofi_calibrator import OFICalibrationResult
@@ -300,6 +304,58 @@ class CryptoEngine:
             latest_return = returns[-1]
             self._hawkes.record_return(now, latest_return, realized_vol)
 
+    # ── Cycle logger ─────────────────────────────────────────────
+
+    def set_cycle_logger(self, logger: CycleLogger) -> None:
+        """Set a cycle logger for per-cycle data recording."""
+        self._cycle_logger = logger
+
+    def _log_cycle(self, edges_count: int) -> None:
+        """Log per-cycle data to CSV if a logger is configured."""
+        if self._cycle_logger is None:
+            return
+        import time as _time
+        now = _time.monotonic()
+        for binance_sym in self._settings.price_feed_symbols:
+            price = self._price_feed.get_current_price(binance_sym)
+            if price is None:
+                continue
+            ofi = self._price_feed.get_ofi(
+                binance_sym, self._settings.ofi_window_seconds,
+            )
+            sr = self._price_feed.get_volume_flow_rate(
+                binance_sym, self._settings.activity_scaling_short_window_seconds,
+            )
+            lr = self._price_feed.get_volume_flow_rate(
+                binance_sym, self._settings.activity_scaling_long_window_seconds,
+            )
+            ar = sr / lr if lr > 0 and sr > 0 else 1.0
+            returns = self._price_feed.get_returns(binance_sym, 60, 5)
+            vol = float(np.std(returns)) if len(returns) >= 2 else 0.0
+            hi = (
+                self._hawkes.intensity(now)
+                if self._settings.hawkes_enabled
+                else self._settings.mc_jump_intensity
+            )
+
+            self._cycle_logger.log(CycleSnapshot(
+                timestamp=_time.time(),
+                cycle=self._cycle_count,
+                symbol=binance_sym,
+                price=price,
+                ofi=ofi,
+                volume_rate_short=sr,
+                volume_rate_long=lr,
+                activity_ratio=ar,
+                realized_vol=vol,
+                hawkes_intensity=hi,
+                num_edges=edges_count,
+                num_positions=len(self._positions),
+                session_pnl=self._session_pnl,
+                bankroll=self._bankroll,
+            ))
+        self._cycle_logger.flush()
+
     # ── Cycle ─────────────────────────────────────────────────────
 
     async def _run_cycle(self) -> None:
@@ -342,6 +398,9 @@ class CryptoEngine:
 
         # 5. Check and settle expired positions
         self._settle_expired_positions()
+
+        # 6. Log cycle data for offline calibration
+        self._log_cycle(len(edges))
 
         elapsed_ms = (time.monotonic() - cycle_start) * 1000
         LOGGER.info(
@@ -441,6 +500,7 @@ class CryptoEngine:
             trades_opened += 1
 
         self._settle_expired_positions()
+        self._log_cycle(len(edges))
         return edges
 
     # ── Model ─────────────────────────────────────────────────────
