@@ -179,6 +179,22 @@ class PriceFeed:
             return 0.0
         return (buy_vol - sell_vol) / total
 
+    def get_volume_flow_rate(self, symbol: str, window_seconds: int = 300) -> float:
+        """Average volume per minute over the last window_seconds.
+
+        Returns 0.0 if insufficient data.
+        """
+        sym = symbol.lower()
+        ticks = self._ticks.get(sym)
+        if not ticks:
+            return 0.0
+        cutoff = time.time() - window_seconds
+        total_vol = sum(t.volume for t in ticks if t.timestamp >= cutoff)
+        minutes = window_seconds / 60.0
+        if minutes <= 0:
+            return 0.0
+        return total_vol / minutes
+
     async def load_historical(self, symbol: str) -> None:
         """Bootstrap tick history from Binance REST klines.
 
