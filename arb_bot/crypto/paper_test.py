@@ -24,6 +24,7 @@ import httpx
 import numpy as np
 
 from arb_bot.crypto.config import CryptoSettings
+from arb_bot.crypto.cycle_logger import CycleLogger
 from arb_bot.crypto.edge_detector import CryptoEdge, EdgeDetector, compute_implied_probability
 from arb_bot.crypto.engine import CryptoEngine
 from arb_bot.crypto.market_scanner import (
@@ -385,8 +386,8 @@ async def run_paper_test(
     engine = CryptoEngine(settings)
 
     print(f"\n{'='*70}")
-    print(f"  Crypto Prediction Engine — Paper Test v2 (aggTrades WS)")
-    print(f"  (OFI drift + activity scaling + jump diffusion + 15m markets)")
+    print(f"  Crypto Prediction Engine — Paper Test v3")
+    print(f"  (power-law OFI + Hawkes + ref-price + aggTrades WS + cycle log)")
     print(f"{'='*70}")
     print(f"  Underlyings:    {', '.join(underlyings)}")
     print(f"  Binance feeds:  {', '.join(binance_symbols)}")
@@ -480,7 +481,13 @@ async def run_paper_test(
             )
             print("\nStarted aggTrades WebSocket stream for continuous OFI data")
 
-        # 5. Main loop
+        # 5. Set up per-cycle CSV logger
+        log_path = f"arb_bot/output/paper_v3_{int(time.time())}.csv"
+        logger = CycleLogger(log_path)
+        engine.set_cycle_logger(logger)
+        print(f"\nCycle data will be logged to: {log_path}")
+
+        # 6. Main loop
         start_time = time.monotonic()
         cycle = 0
 
@@ -558,7 +565,7 @@ async def run_paper_test(
                             f"edge={e.edge_cents*100:+.1f}% "
                             f"model={e.model_prob.probability:.0%} "
                             f"market={e.market_implied_prob:.0%} "
-                            f"unc={e.model_uncertainty:.3f}"
+                            f"unc={e.model_uncertainty:.3f} spread={e.spread_cost*100:.1f}\u00a2"
                         )
                 else:
                     print("   No edges above threshold")
@@ -607,6 +614,9 @@ async def run_paper_test(
                     f"{record.contracts}@{record.entry_price:.2f})"
                 )
 
+    # Close cycle logger
+    logger.close()
+
     # Final summary
     print(f"\n{'='*70}")
     print(f"  FINAL RESULTS")
@@ -636,6 +646,7 @@ async def run_paper_test(
             )
     print(f"\n  Net PnL:        ${engine.session_pnl:+.2f}")
     print(f"  Final bankroll: ${engine.bankroll:.2f}")
+    print(f"  Cycle data:     {log_path}")
     print(f"{'='*70}")
 
     # Export

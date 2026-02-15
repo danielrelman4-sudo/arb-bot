@@ -33,6 +33,7 @@ class CryptoEdge:
     yes_buy_price: float
     no_buy_price: float
     blended_probability: float = 0.0  # After market blending
+    spread_cost: float = 0.0  # Half-spread in dollar terms
 
 
 def compute_implied_probability(yes_price: float, no_price: float) -> float:
@@ -185,6 +186,15 @@ class EdgeDetector:
                 )
                 continue
 
+            # Compute spread cost (half-spread for the traded side)
+            if side == "yes":
+                bid = mq.yes_bid_price if mq.yes_bid_price else mq.yes_buy_price
+                half_spread = (mq.yes_buy_price - bid) / 2.0
+            else:
+                bid = mq.no_bid_price if mq.no_bid_price else mq.no_buy_price
+                half_spread = (mq.no_buy_price - bid) / 2.0
+            spread_cost = max(0.0, half_spread)
+
             edges.append(CryptoEdge(
                 market=mq.market,
                 model_prob=model,
@@ -198,6 +208,7 @@ class EdgeDetector:
                 yes_buy_price=mq.yes_buy_price,
                 no_buy_price=mq.no_buy_price,
                 blended_probability=blended,
+                spread_cost=spread_cost,
             ))
 
         # Sort by largest absolute edge first
