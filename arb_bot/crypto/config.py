@@ -140,6 +140,9 @@ class CryptoSettings:
     paper_mode: bool = True
     paper_slippage_cents: float = 0.5
 
+    # ── Settlement ────────────────────────────────────────────────
+    settlement_grace_minutes: float = 10.0  # How long to wait for Kalshi settlement data
+
 
 def load_crypto_settings() -> CryptoSettings:
     """Build ``CryptoSettings`` from ``ARB_CRYPTO_*`` environment variables."""
@@ -204,4 +207,5 @@ def load_crypto_settings() -> CryptoSettings:
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),
+        settlement_grace_minutes=_as_float(os.getenv("ARB_CRYPTO_SETTLEMENT_GRACE_MINUTES"), 10.0),
     )

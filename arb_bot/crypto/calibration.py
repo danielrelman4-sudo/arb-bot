@@ -24,6 +24,7 @@ class CalibrationRecord:
     outcome: bool  # True if YES settled
     timestamp: float = 0.0
     ticker: str = ""
+    market_implied_prob: float = 0.5  # Market's implied probability at trade entry
 
 
 @dataclass
@@ -81,6 +82,7 @@ class ModelCalibrator:
         outcome: bool,
         timestamp: float = 0.0,
         ticker: str = "",
+        market_implied_prob: float = 0.5,
     ) -> None:
         """Record a prediction-outcome pair for calibration."""
         self._records.append(CalibrationRecord(
@@ -88,6 +90,7 @@ class ModelCalibrator:
             outcome=outcome,
             timestamp=timestamp,
             ticker=ticker,
+            market_implied_prob=market_implied_prob,
         ))
         self._samples_since_calibration += 1
 
@@ -155,6 +158,23 @@ class ModelCalibrator:
             outcome_val = 1.0 if r.outcome else 0.0
             total += (r.predicted_prob - outcome_val) ** 2
         return total / len(self._records)
+
+    def compute_market_brier_score(self) -> float:
+        """Brier score using market-implied probabilities. Lower is better."""
+        if not self._records:
+            return 1.0
+        total = 0.0
+        for r in self._records:
+            outcome_val = 1.0 if r.outcome else 0.0
+            total += (r.market_implied_prob - outcome_val) ** 2
+        return total / len(self._records)
+
+    def compute_brier_skill_score(self) -> float:
+        """BSS = 1 - (model_brier / market_brier). Positive = model beats market."""
+        market_brier = self.compute_market_brier_score()
+        if market_brier <= 0:
+            return 0.0
+        return 1.0 - (self.compute_brier_score() / market_brier)
 
     def compute_calibration_curve(self, num_bins: int = 10) -> List[CalibrationBin]:
         """Bin predictions by model_prob, compare vs realized frequency."""

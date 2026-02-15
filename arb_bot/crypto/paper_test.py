@@ -395,7 +395,7 @@ async def run_paper_test(
     engine = CryptoEngine(settings)
 
     print(f"\n{'='*70}")
-    print(f"  Crypto Prediction Engine — Paper Test v5")
+    print(f"  Crypto Prediction Engine — Paper Test v6 (real settlement)")
     print(f"  (calibrated from 30-day historical + paper v4 results)")
     print(f"{'='*70}")
     print(f"  Underlyings:    {', '.join(underlyings)}")
@@ -416,6 +416,9 @@ async def run_paper_test(
     print(f"{'='*70}\n")
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+        # Wire up HTTP client for real Kalshi settlement
+        engine.set_http_client(client)
+
         # 1. Bootstrap with Binance klines
         print("Loading historical prices from Binance US REST API...")
         for sym in binance_symbols:
@@ -605,25 +608,38 @@ async def run_paper_test(
         except asyncio.CancelledError:
             pass
 
-    # Force-settle any remaining open positions using model probability
-    # so we can evaluate PnL even on a short test run
+    # Settle remaining open positions via real Kalshi API
     open_positions = list(engine.positions.keys())
     if open_positions:
-        print(f"\n  Settling {len(open_positions)} open positions using model probability...")
+        print(f"\n  Settling {len(open_positions)} open positions via Kalshi API...")
+        settled_count = 0
+        unsettled_count = 0
         for ticker in open_positions:
             pos = engine.positions.get(ticker)
             if pos is None:
                 continue
-            # Settle using model prob — simulate outcome
-            settled_yes = np.random.random() < pos.model_prob
-            record = engine.settle_position_with_outcome(ticker, settled_yes)
-            if record:
-                outcome_str = "YES" if settled_yes else "NO"
-                print(
-                    f"    {ticker}: settled {outcome_str} → "
-                    f"PnL=${record.pnl:+.2f} ({record.side.upper()} "
-                    f"{record.contracts}@{record.entry_price:.2f})"
-                )
+            # Try real settlement from Kalshi
+            try:
+                outcome = await engine._fetch_settlement_outcome(ticker)
+            except Exception as exc:
+                LOGGER.warning("Settlement fetch failed for %s: %s", ticker, exc)
+                outcome = None
+
+            if outcome is not None:
+                record = engine.settle_position_with_outcome(ticker, outcome)
+                if record:
+                    outcome_str = "YES" if outcome else "NO"
+                    settled_count += 1
+                    print(
+                        f"    {ticker}: settled {outcome_str} (real) → "
+                        f"PnL=${record.pnl:+.2f} ({record.side.upper()} "
+                        f"{record.contracts}@{record.entry_price:.2f})"
+                    )
+            else:
+                unsettled_count += 1
+                print(f"    {ticker}: not yet settled (skipping — no simulated fallback)")
+        if unsettled_count:
+            print(f"  ⚠ {unsettled_count} positions remain unsettled (markets still open)")
 
     # Close cycle logger
     logger.close()
@@ -648,17 +664,61 @@ async def run_paper_test(
         print()
         print(f"  Per-trade breakdown:")
         for t in engine.trades:
+            outcome_tag = f"[{t.actual_outcome}]" if t.actual_outcome != "unsettled" else ""
             print(
-                f"    {t.ticker[:40]:40s} {t.side.upper():3s} "
+                f"    {t.ticker[:35]:35s} {t.side.upper():3s} "
                 f"{t.contracts:3d}@{t.entry_price:.2f} "
                 f"PnL=${t.pnl:+.2f} "
                 f"edge={t.edge_at_entry*100:.1f}% "
-                f"model={t.model_prob_at_entry:.0%} market={t.market_prob_at_entry:.0%}"
+                f"model={t.model_prob_at_entry:.0%} market={t.market_prob_at_entry:.0%} "
+                f"{outcome_tag}"
             )
     print(f"\n  Net PnL:        ${engine.session_pnl:+.2f}")
     print(f"  Final bankroll: ${engine.bankroll:.2f}")
     print(f"  Cycle data:     {log_path}")
     print(f"{'='*70}")
+
+    # Brier score comparison: model vs market
+    cal = engine.calibrator
+    if cal.num_records >= 1:
+        real_count = sum(
+            1 for t in engine.trades
+            if t.actual_outcome in ("yes", "no")
+        )
+        sim_count = sum(
+            1 for t in engine.trades
+            if t.actual_outcome == "simulated"
+        )
+        model_brier = cal.compute_brier_score()
+        market_brier = cal.compute_market_brier_score()
+        bss = cal.compute_brier_skill_score()
+
+        print(f"\n{'='*70}")
+        print(f"  BRIER SCORE COMPARISON ({cal.num_records} settled trades)")
+        print(f"  Real outcomes:  {real_count}  |  Simulated: {sim_count}")
+        print(f"{'='*70}")
+        print(f"  Model Brier:    {model_brier:.4f}")
+        print(f"  Market Brier:   {market_brier:.4f}")
+        if bss >= 0:
+            print(f"  Brier Skill:    {bss:+.4f}  (model beats market)")
+        else:
+            print(f"  Brier Skill:    {bss:+.4f}  (market beats model)")
+
+        # Calibration curve
+        curve = cal.compute_calibration_curve(num_bins=5)
+        if curve:
+            print(f"\n  Calibration curve:")
+            for b in curve:
+                print(
+                    f"    [{b.bin_lower:.1f}-{b.bin_upper:.1f}]  "
+                    f"predicted={b.mean_predicted:.3f}  "
+                    f"realized={b.mean_realized:.3f}  "
+                    f"count={b.count}"
+                )
+
+        print(f"{'='*70}")
+    else:
+        print("\n  (No settled trades for Brier score comparison)")
 
     # Export
     csv_data = engine.export_trades_csv()

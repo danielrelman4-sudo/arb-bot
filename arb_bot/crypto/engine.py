@@ -86,6 +86,7 @@ class CryptoTradeRecord:
     model_uncertainty: float = 0.0
     time_to_expiry_minutes: float = 0.0
     settled: bool = False
+    actual_outcome: str = "unsettled"  # "yes" / "no" / "unsettled" / "simulated"
 
 
 # ── Engine ─────────────────────────────────────────────────────────
@@ -158,6 +159,10 @@ class CryptoEngine:
         self._ofi_cal_cache: Optional[OFICalibrationResult] = None
         self._ofi_cal_cache_time: float = 0.0
 
+        # HTTP client for real settlement via Kalshi API
+        self._http_client: Any = None  # httpx.AsyncClient when set
+        self._pending_settlement: Dict[str, float] = {}  # ticker -> first_check_time
+
     # ── Properties ────────────────────────────────────────────────
 
     @property
@@ -191,6 +196,10 @@ class CryptoEngine:
     @property
     def ofi_calibrator(self) -> OFICalibrator:
         return self._ofi_calibrator
+
+    def set_http_client(self, client: Any) -> None:
+        """Set httpx client for real Kalshi settlement checks."""
+        self._http_client = client
 
     # ── Main loop ─────────────────────────────────────────────────
 
@@ -461,7 +470,7 @@ class CryptoEngine:
             trades_opened += 1
 
         # 5. Check and settle expired positions
-        self._settle_expired_positions()
+        await self._settle_expired_positions()
 
         # 6. Log cycle data for offline calibration
         self._log_cycle(len(edges))
@@ -563,7 +572,7 @@ class CryptoEngine:
             self._execute_paper_trade(edge, contracts)
             trades_opened += 1
 
-        self._settle_expired_positions()
+        await self._settle_expired_positions()
         self._log_cycle(len(edges))
         return edges
 
@@ -825,53 +834,169 @@ class CryptoEngine:
             edge.time_to_expiry_minutes,
         )
 
-    def _settle_expired_positions(self) -> None:
-        """Settle positions whose markets have expired."""
+    async def _settle_expired_positions(self) -> None:
+        """Settle positions whose markets have expired.
+
+        Uses real Kalshi API outcomes when an HTTP client is available.
+        Falls back to simulated settlement when no client is set.
+        """
         now = datetime.now(timezone.utc)
-        to_settle: list[str] = []
+        to_check: list[str] = []
 
         for ticker, pos in self._positions.items():
             if pos.edge.market.meta.expiry <= now:
-                to_settle.append(ticker)
+                to_check.append(ticker)
 
-        for ticker in to_settle:
-            pos = self._positions.pop(ticker)
-            # In paper mode, simulate settlement outcome
-            # The model probability at entry is our best estimate
-            pnl = self._simulate_settlement(pos)
-            self._session_pnl += pnl
-            self._bankroll += pos.entry_price * pos.contracts + pnl
+        for ticker in to_check:
+            pos = self._positions[ticker]
 
-            record = CryptoTradeRecord(
-                ticker=ticker,
-                side=pos.side,
-                contracts=pos.contracts,
-                entry_price=pos.entry_price,
-                entry_time=pos.entry_time,
-                exit_time=time.time(),
-                pnl=pnl,
-                edge_at_entry=pos.edge.edge_cents,
-                model_prob_at_entry=pos.model_prob,
-                market_prob_at_entry=pos.market_implied_prob,
-                model_uncertainty=pos.edge.model_uncertainty,
-                time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
-                settled=True,
-            )
-            self._trades.append(record)
+            if self._http_client is None:
+                # No HTTP client — fall back to simulated settlement
+                self._positions.pop(ticker)
+                pnl = self._simulate_settlement(pos)
+                self._session_pnl += pnl
+                self._bankroll += pos.entry_price * pos.contracts + pnl
 
-            LOGGER.info(
-                "CryptoEngine: SETTLED %s %s %d@%.2f¢ PnL=$%.4f",
-                pos.side.upper(),
-                ticker,
-                pos.contracts,
-                pos.entry_price * 100,
-                pnl,
-            )
+                record = CryptoTradeRecord(
+                    ticker=ticker,
+                    side=pos.side,
+                    contracts=pos.contracts,
+                    entry_price=pos.entry_price,
+                    entry_time=pos.entry_time,
+                    exit_time=time.time(),
+                    pnl=pnl,
+                    edge_at_entry=pos.edge.edge_cents,
+                    model_prob_at_entry=pos.model_prob,
+                    market_prob_at_entry=pos.market_implied_prob,
+                    model_uncertainty=pos.edge.model_uncertainty,
+                    time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
+                    settled=True,
+                    actual_outcome="simulated",
+                )
+                self._trades.append(record)
+                LOGGER.info(
+                    "CryptoEngine: SETTLED (simulated) %s %s %d@%.2f¢ PnL=$%.4f",
+                    pos.side.upper(), ticker, pos.contracts,
+                    pos.entry_price * 100, pnl,
+                )
+                continue
+
+            # Try real settlement from Kalshi API
+            outcome = await self._fetch_settlement_outcome(ticker)
+
+            if outcome is not None:
+                # Real outcome available
+                self._positions.pop(ticker)
+                self._pending_settlement.pop(ticker, None)
+
+                settled_yes = outcome
+                if pos.side == "yes":
+                    pnl_per_contract = (1.0 if settled_yes else 0.0) - pos.entry_price
+                else:
+                    pnl_per_contract = (1.0 if not settled_yes else 0.0) - pos.entry_price
+
+                pnl = pnl_per_contract * pos.contracts
+                self._session_pnl += pnl
+                self._bankroll += pos.entry_price * pos.contracts + pnl
+
+                self._calibrator.record_outcome(
+                    predicted_prob=pos.model_prob,
+                    outcome=settled_yes,
+                    timestamp=time.time(),
+                    ticker=ticker,
+                    market_implied_prob=pos.market_implied_prob,
+                )
+
+                record = CryptoTradeRecord(
+                    ticker=ticker,
+                    side=pos.side,
+                    contracts=pos.contracts,
+                    entry_price=pos.entry_price,
+                    entry_time=pos.entry_time,
+                    exit_time=time.time(),
+                    pnl=pnl,
+                    edge_at_entry=pos.edge.edge_cents,
+                    model_prob_at_entry=pos.model_prob,
+                    market_prob_at_entry=pos.market_implied_prob,
+                    model_uncertainty=pos.edge.model_uncertainty,
+                    time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
+                    settled=True,
+                    actual_outcome="yes" if settled_yes else "no",
+                )
+                self._trades.append(record)
+                LOGGER.info(
+                    "CryptoEngine: SETTLED (real) %s %s %d@%.2f¢ PnL=$%.4f outcome=%s",
+                    pos.side.upper(), ticker, pos.contracts,
+                    pos.entry_price * 100, pnl,
+                    "YES" if settled_yes else "NO",
+                )
+            else:
+                # Not yet settled — check grace period
+                first_check = self._pending_settlement.get(ticker)
+                if first_check is None:
+                    self._pending_settlement[ticker] = time.time()
+                    LOGGER.debug("Settlement pending for %s (first check)", ticker)
+                else:
+                    elapsed_minutes = (time.time() - first_check) / 60.0
+                    grace = self._settings.settlement_grace_minutes
+                    if elapsed_minutes > grace:
+                        # Grace period exceeded — mark unsettled
+                        self._positions.pop(ticker)
+                        self._pending_settlement.pop(ticker, None)
+                        self._bankroll += pos.entry_price * pos.contracts  # return capital
+
+                        record = CryptoTradeRecord(
+                            ticker=ticker,
+                            side=pos.side,
+                            contracts=pos.contracts,
+                            entry_price=pos.entry_price,
+                            entry_time=pos.entry_time,
+                            exit_time=time.time(),
+                            pnl=0.0,
+                            edge_at_entry=pos.edge.edge_cents,
+                            model_prob_at_entry=pos.model_prob,
+                            market_prob_at_entry=pos.market_implied_prob,
+                            model_uncertainty=pos.edge.model_uncertainty,
+                            time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
+                            settled=False,
+                            actual_outcome="unsettled",
+                        )
+                        self._trades.append(record)
+                        LOGGER.warning(
+                            "CryptoEngine: UNSETTLED %s after %.1f min grace",
+                            ticker, elapsed_minutes,
+                        )
+
+    async def _fetch_settlement_outcome(self, ticker: str) -> Optional[bool]:
+        """Fetch real settlement outcome from Kalshi public API.
+
+        Returns True if settled YES, False if settled NO, None if not yet settled.
+        """
+        if self._http_client is None:
+            return None
+
+        try:
+            url = f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}"
+            resp = await self._http_client.get(url, timeout=5.0)
+            if resp.status_code != 200:
+                LOGGER.warning("Settlement check %s: HTTP %d", ticker, resp.status_code)
+                return None
+            data = resp.json()
+            market = data.get("market", data)
+            result = market.get("result", "")
+            if result == "yes":
+                return True
+            elif result == "no":
+                return False
+            return None  # Not yet settled
+        except Exception as exc:
+            LOGGER.warning("Settlement check %s failed: %s", ticker, exc)
+            return None
 
     def settle_position_with_outcome(
         self, ticker: str, settled_yes: bool
     ) -> CryptoTradeRecord | None:
-        """Manually settle a position with known outcome. For testing."""
+        """Manually settle a position with known outcome. For testing and real settlement."""
         pos = self._positions.pop(ticker, None)
         if pos is None:
             return None
@@ -891,6 +1016,7 @@ class CryptoEngine:
             outcome=settled_yes,
             timestamp=time.time(),
             ticker=ticker,
+            market_implied_prob=pos.market_implied_prob,
         )
 
         record = CryptoTradeRecord(
@@ -907,27 +1033,25 @@ class CryptoEngine:
             model_uncertainty=pos.edge.model_uncertainty,
             time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
             settled=True,
+            actual_outcome="yes" if settled_yes else "no",
         )
         self._trades.append(record)
         return record
 
     def _simulate_settlement(self, pos: CryptoPosition) -> float:
-        """Simulate settlement using model probability as true probability.
+        """Simulate settlement using model probability (legacy fallback).
 
-        In paper mode, we use the model's probability estimate to randomly
-        settle the contract. This gives an unbiased estimate of expected PnL
-        over many trades.
+        Only used when no HTTP client is available for real settlement.
         """
-        # Use numpy RNG for settlement
         rng = np.random.default_rng()
         settled_yes = rng.random() < pos.model_prob
 
-        # Record outcome for calibration
         self._calibrator.record_outcome(
             predicted_prob=pos.model_prob,
             outcome=bool(settled_yes),
             timestamp=time.time(),
             ticker=pos.ticker,
+            market_implied_prob=pos.market_implied_prob,
         )
 
         if pos.side == "yes":
@@ -967,6 +1091,7 @@ class CryptoEngine:
             "entry_time", "exit_time", "pnl", "edge_at_entry",
             "model_prob_at_entry", "market_prob_at_entry",
             "model_uncertainty", "time_to_expiry_minutes", "settled",
+            "actual_outcome",
         ])
         writer.writeheader()
         for t in self._trades:
@@ -984,5 +1109,6 @@ class CryptoEngine:
                 "model_uncertainty": f"{t.model_uncertainty:.4f}",
                 "time_to_expiry_minutes": f"{t.time_to_expiry_minutes:.1f}",
                 "settled": t.settled,
+                "actual_outcome": t.actual_outcome,
             })
         return output.getvalue()
