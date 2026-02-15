@@ -265,6 +265,56 @@ class CryptoEngine:
             return 0.0
         return alpha * math.copysign(abs(ofi) ** theta, ofi)
 
+    def _compute_effective_horizon(
+        self,
+        binance_sym: str,
+        clock_horizon_minutes: float,
+    ) -> tuple:
+        """Compute volume-clock effective horizon.
+
+        Projects expected volume over remaining time to expiry using the
+        current volume rate, then compares against a baseline rate to
+        produce an activity-adjusted horizon.  During high-volume periods
+        (crashes), the effective horizon is *longer* (more variance);
+        during low-volume periods (dead hours), it is *shorter* (less
+        variance).
+
+        Returns
+        -------
+        tuple of (effective_horizon_minutes, projected_volume, baseline_rate)
+            effective_horizon_minutes:
+                ``clock_horizon * clamped(short_rate / long_rate)`` with
+                clamp bounds [0.25, 4.0].  Falls back to *clock_horizon*
+                when volume data is unavailable.
+            projected_volume:
+                ``short_rate × clock_horizon`` (total expected volume) or
+                ``None`` when data is unavailable.
+            baseline_rate:
+                Volume-per-minute from the long-window baseline, or
+                ``None`` when data is unavailable.
+        """
+        short_rate = self._price_feed.get_volume_flow_rate(
+            binance_sym,
+            window_seconds=self._settings.volume_clock_short_window_seconds,
+        )
+        long_rate = self._price_feed.get_volume_flow_rate(
+            binance_sym,
+            window_seconds=self._settings.volume_clock_baseline_window_seconds,
+        )
+
+        if long_rate <= 0 or short_rate <= 0:
+            return clock_horizon_minutes, None, None
+
+        # Project total volume: current_rate * horizon
+        projected_volume = short_rate * clock_horizon_minutes
+
+        # Effective horizon = clock_horizon * (short_rate / long_rate)
+        activity_ratio = short_rate / long_rate
+        activity_ratio = max(0.25, min(4.0, activity_ratio))
+
+        effective_horizon = clock_horizon_minutes * activity_ratio
+        return effective_horizon, projected_volume, long_rate
+
     def _get_ofi_calibration(self) -> "OFICalibrationResult":
         """Return cached OFI calibration, recalibrating on interval.
 
@@ -338,6 +388,16 @@ class CryptoEngine:
                 else self._settings.mc_jump_intensity
             )
 
+            # Volume clock data for offline calibration
+            eff_horizon = 0.0
+            proj_vol = 0.0
+            if self._settings.volume_clock_enabled:
+                eh, pv, _ = self._compute_effective_horizon(
+                    binance_sym, 10.0,  # representative 10-min horizon
+                )
+                eff_horizon = eh
+                proj_vol = pv or 0.0
+
             self._cycle_logger.log(CycleSnapshot(
                 timestamp=_time.time(),
                 cycle=self._cycle_count,
@@ -353,6 +413,8 @@ class CryptoEngine:
                 num_positions=len(self._positions),
                 session_pnl=self._session_pnl,
                 bankroll=self._bankroll,
+                effective_horizon=eff_horizon,
+                projected_volume=proj_vol,
             ))
         self._cycle_logger.flush()
 
@@ -555,8 +617,23 @@ class CryptoEngine:
                 # Use a reasonable default vol for crypto
                 vol = 0.50  # 50% annualized — conservative default
 
-            # Activity scaling: adjust vol by sqrt(current_volume_rate / avg_volume_rate)
-            if self._settings.activity_scaling_enabled and binance_sym:
+            # Generate paths for this horizon
+            horizon = mq.time_to_expiry_minutes
+            if horizon <= 0:
+                continue
+
+            # Volume clock: replace clock-time horizon with effective
+            # horizon based on projected volume.  This adjusts BOTH the
+            # diffusion variance (sigma^2 * dt) AND the expected jump
+            # count (lambda * dt) — jumps happen per unit of trading
+            # activity, not per unit of wall clock.
+            if self._settings.volume_clock_enabled and binance_sym:
+                effective_horizon, _, _ = self._compute_effective_horizon(
+                    binance_sym, horizon,
+                )
+                horizon = effective_horizon
+            elif self._settings.activity_scaling_enabled and binance_sym:
+                # Legacy activity scaling (backward compat)
                 short_rate = self._price_feed.get_volume_flow_rate(
                     binance_sym,
                     window_seconds=self._settings.activity_scaling_short_window_seconds,
@@ -567,14 +644,8 @@ class CryptoEngine:
                 )
                 if long_rate > 0 and short_rate > 0:
                     activity_ratio = short_rate / long_rate
-                    # Clamp to prevent extreme scaling
                     activity_ratio = max(0.25, min(4.0, activity_ratio))
                     vol *= math.sqrt(activity_ratio)
-
-            # Generate paths for this horizon
-            horizon = mq.time_to_expiry_minutes
-            if horizon <= 0:
-                continue
 
             # Compute OFI-based drift if enabled
             drift = 0.0

@@ -229,6 +229,45 @@ class PriceFeed:
         minutes = actual_span_seconds / 60.0
         return total_vol / minutes
 
+    def get_total_volume(self, symbol: str, window_seconds: int = 300) -> float:
+        """Sum of all tick volumes in the last *window_seconds*.
+
+        Returns 0.0 if no data available.
+        """
+        sym = symbol.lower()
+        ticks = self._ticks.get(sym)
+        if not ticks:
+            return 0.0
+        cutoff = time.time() - window_seconds
+        return sum(t.volume for t in ticks if t.timestamp >= cutoff)
+
+    def project_volume(
+        self,
+        symbol: str,
+        horizon_minutes: float,
+        rate_window_seconds: int = 300,
+    ) -> float | None:
+        """Project total expected volume from now until *horizon_minutes*.
+
+        Uses a simple linear forecast: ``current_rate × horizon_minutes``.
+        Returns ``None`` if no volume rate is available (caller should
+        fall back to clock-time).
+
+        Parameters
+        ----------
+        symbol:
+            Binance symbol (e.g., ``'btcusdt'``).
+        horizon_minutes:
+            Minutes from now to contract expiry.
+        rate_window_seconds:
+            Window for estimating the current volume rate.
+        """
+        rate = self.get_volume_flow_rate(symbol, rate_window_seconds)
+        if rate <= 0:
+            return None
+        return rate * horizon_minutes
+
+
     async def load_historical(self, symbol: str) -> None:
         """Bootstrap tick history from Binance REST klines.
 

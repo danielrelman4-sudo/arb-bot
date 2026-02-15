@@ -31,6 +31,8 @@ class CycleSnapshot:
     num_positions: int
     session_pnl: float
     bankroll: float
+    effective_horizon: float = 0.0        # Volume-clock effective horizon (0 = not active)
+    projected_volume: float = 0.0         # Total projected volume over horizon
 
 
 _FIELDS = [f.name for f in fields(CycleSnapshot)]
