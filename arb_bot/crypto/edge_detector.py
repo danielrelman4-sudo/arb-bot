@@ -34,6 +34,7 @@ class CryptoEdge:
     no_buy_price: float
     blended_probability: float = 0.0  # After market blending
     spread_cost: float = 0.0  # Half-spread in dollar terms
+    staleness_score: float = 0.0  # Set by engine: 0=fresh, 1=stale
     strategy_cell: str = ""  # Set by engine: "yes_15min", "yes_daily", "no_15min", "no_daily"
 
 
