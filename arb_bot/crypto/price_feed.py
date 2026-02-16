@@ -58,9 +58,9 @@ class PriceFeed:
 
     def __init__(
         self,
-        ws_url: str = "wss://stream.binance.com:9443/ws",
+        ws_url: str = "wss://ws.okx.com:8443/ws/v5/public",
         symbols: list[str] | None = None,
-        snapshot_url: str = "https://api.binance.com/api/v3/klines",
+        snapshot_url: str = "https://www.okx.com/api/v5/market/candles",
         history_minutes: int = 60,
     ) -> None:
         self._ws_url = ws_url
@@ -354,28 +354,53 @@ class PriceFeed:
 
 
     async def load_historical(self, symbol: str) -> None:
-        """Bootstrap tick history from Binance REST klines.
+        """Bootstrap tick history from OKX REST candles.
 
         Loads 1-minute candles for the last ``history_minutes`` and
         converts each close to a ``PriceTick``.
         """
         sym = symbol.lower()
-        url = (
-            f"{self._snapshot_url}"
-            f"?symbol={sym.upper()}"
-            f"&interval=1m"
-            f"&limit={self._history_minutes}"
-        )
-        LOGGER.info("PriceFeed: loading %d minutes of history for %s", self._history_minutes, sym)
+        okx_inst = _BINANCE_TO_OKX_SPOT.get(sym)
+        if not okx_inst:
+            LOGGER.warning("PriceFeed: no OKX mapping for %s, skipping historical load", sym)
+            return
+
+        LOGGER.info("PriceFeed: loading %d minutes of history for %s from OKX", self._history_minutes, sym)
+
+        all_candles: list[list] = []
+        after: str | None = None
+        remaining = min(self._history_minutes, 300)
+
         try:
             import aiohttp
 
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        LOGGER.warning("PriceFeed: klines request failed: %s", resp.status)
-                        return
-                    data = await resp.json()
+                while remaining > 0:
+                    batch = min(remaining, 100)
+                    url = (
+                        f"{self._snapshot_url}"
+                        f"?instId={okx_inst}"
+                        f"&bar=1m"
+                        f"&limit={batch}"
+                    )
+                    if after:
+                        url += f"&after={after}"
+
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            LOGGER.warning("PriceFeed: OKX candles request failed: %s", resp.status)
+                            break
+                        body = await resp.json()
+
+                    data = body.get("data", [])
+                    if not data:
+                        break
+                    all_candles.extend(data)
+                    after = data[-1][0]  # Oldest timestamp for pagination
+                    remaining -= len(data)
+                    if len(data) < batch:
+                        break
+
         except ImportError:
             LOGGER.warning("PriceFeed: aiohttp not installed, skipping historical load")
             return
@@ -383,12 +408,15 @@ class PriceFeed:
             LOGGER.warning("PriceFeed: historical load failed: %s", exc)
             return
 
-        if not isinstance(data, list):
+        if not all_candles:
             return
 
+        # OKX returns newest-first; reverse for chronological order
+        all_candles.reverse()
+
         dq = self._ticks.setdefault(sym, deque(maxlen=_MAX_TICK_HISTORY))
-        for candle in data:
-            # Binance kline format: [open_time, open, high, low, close, volume, ...]
+        for candle in all_candles:
+            # OKX candle format: [ts_ms, open, high, low, close, vol, volCcy, ...]
             if not isinstance(candle, list) or len(candle) < 6:
                 continue
             try:
@@ -400,37 +428,54 @@ class PriceFeed:
             dq.append(PriceTick(symbol=sym, price=close, timestamp=ts, volume=vol))
             self._current_price[sym] = close
 
-        LOGGER.info("PriceFeed: loaded %d klines for %s (latest=%.2f)",
-                     len(data), sym, self._current_price.get(sym, 0.0))
+        LOGGER.info("PriceFeed: loaded %d candles for %s from OKX (latest=%.2f)",
+                     len(all_candles), sym, self._current_price.get(sym, 0.0))
 
     async def load_historical_trades(self, symbol: str, limit: int = 1000) -> int:
-        """Bootstrap buy/sell volume from Binance aggTrades REST.
+        """Bootstrap buy/sell volume from OKX trades REST.
 
-        Loads recent aggregate trades to populate OFI data for initial
+        Loads recent trades to populate OFI data for initial
         calibration. Returns the number of trades loaded.
 
         Parameters
         ----------
         symbol:
-            Binance symbol (e.g., 'btcusdt').
+            Binance-style symbol (e.g., 'btcusdt').
         limit:
-            Number of recent trades to fetch (max 1000 per Binance API).
+            Number of recent trades to fetch (max 100 per OKX request,
+            will paginate if more are needed).
         """
         sym = symbol.lower()
-        url = (
-            f"https://api.binance.com/api/v3/aggTrades"
-            f"?symbol={sym.upper()}"
-            f"&limit={min(limit, 1000)}"
-        )
-        LOGGER.info("PriceFeed: loading historical trades for %s", sym)
+        okx_inst = _BINANCE_TO_OKX_SPOT.get(sym)
+        if not okx_inst:
+            LOGGER.warning("PriceFeed: no OKX mapping for %s, skipping historical trades", sym)
+            return 0
+
+        LOGGER.info("PriceFeed: loading historical trades for %s from OKX (%s)", sym, okx_inst)
+        all_trades: list[dict] = []
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        LOGGER.warning("PriceFeed: aggTrades request failed: %s", resp.status)
-                        return 0
-                    data = await resp.json()
+                remaining = min(limit, 500)  # Reasonable cap
+                after: str | None = None
+                while remaining > 0:
+                    batch = min(remaining, 100)
+                    url = f"https://www.okx.com/api/v5/market/trades?instId={okx_inst}&limit={batch}"
+                    if after:
+                        url += f"&after={after}"
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            LOGGER.warning("PriceFeed: OKX trades request failed: %s", resp.status)
+                            break
+                        body = await resp.json()
+                    data = body.get("data", [])
+                    if not data:
+                        break
+                    all_trades.extend(data)
+                    after = data[-1].get("tradeId", "")
+                    remaining -= len(data)
+                    if len(data) < batch:
+                        break
         except ImportError:
             LOGGER.warning("PriceFeed: aiohttp not installed, skipping historical trades")
             return 0
@@ -438,34 +483,35 @@ class PriceFeed:
             LOGGER.warning("PriceFeed: historical trades load failed: %s", exc)
             return 0
 
-        if not isinstance(data, list):
+        if not all_trades:
             return 0
 
         count = 0
         dq = self._ticks.setdefault(sym, deque(maxlen=_MAX_TICK_HISTORY))
         dq_bs = self._buy_sells.setdefault(sym, deque(maxlen=_MAX_TICK_HISTORY))
-        for trade in data:
-            # Binance aggTrades format:
-            # {"a":id, "p":"price", "q":"qty", "f":first_id, "l":last_id, "T":timestamp, "m":is_buyer_maker}
+        for trade in all_trades:
+            # OKX trade format: {"instId":"BTC-USDT","tradeId":"...",
+            #   "px":"97500","sz":"0.001","side":"buy","ts":"1700000000000"}
             try:
-                ts = float(trade["T"]) / 1000.0
-                price = float(trade["p"])
-                qty = float(trade["q"])
-                is_buyer_maker = trade.get("m")
+                ts = float(trade["ts"]) / 1000.0
+                price = float(trade["px"])
+                qty = float(trade["sz"])
+                side = trade.get("side", "").lower()
             except (KeyError, ValueError, TypeError):
                 continue
 
+            # OKX side: "buy" = taker bought → is_buyer_maker=False
+            #           "sell" = taker sold → is_buyer_maker=True
+            is_buyer_maker = side == "sell"
             tick = PriceTick(symbol=sym, price=price, timestamp=ts, volume=qty, is_buyer_maker=is_buyer_maker)
             dq.append(tick)
             self._current_price[sym] = price
 
-            if isinstance(is_buyer_maker, bool):
-                is_buy = not is_buyer_maker
-                dq_bs.append((ts, qty, is_buy))
-
+            is_buy = not is_buyer_maker
+            dq_bs.append((ts, qty, is_buy))
             count += 1
 
-        LOGGER.info("PriceFeed: loaded %d historical trades for %s", count, sym)
+        LOGGER.info("PriceFeed: loaded %d historical trades for %s from OKX", count, sym)
         return count
 
     def inject_tick(self, tick: PriceTick) -> None:
@@ -560,9 +606,11 @@ class PriceFeed:
             self.inject_tick(tick)
 
     async def connect_agg_trades_ws(self) -> None:
-        """Connect to Binance aggTrade WebSocket stream for all symbols.
+        """Connect to OKX public trades WebSocket for all symbols.
 
-        Reconnects automatically on disconnection.
+        Uses OKX instead of Binance US because Binance US has near-zero
+        trade volume, causing VPIN to go stale.  Reconnects automatically
+        on disconnection with timeout and ping keepalive.
         """
         try:
             import websockets  # type: ignore[import-untyped]
@@ -570,22 +618,50 @@ class PriceFeed:
             LOGGER.warning("PriceFeed: websockets not installed, aggTrades WS disabled")
             return
 
-        streams = "/".join(f"{s}@aggTrade" for s in sorted(self._symbols_set))
-        url = f"wss://stream.binance.us:9443/stream?streams={streams}"
-        LOGGER.info("PriceFeed: connecting aggTrades WS: %s", url)
+        # Map Binance symbols to OKX instrument IDs
+        okx_instruments = []
+        for sym in sorted(self._symbols_set):
+            okx_id = _BINANCE_TO_OKX_SPOT.get(sym)
+            if okx_id:
+                okx_instruments.append(okx_id)
+        if not okx_instruments:
+            LOGGER.warning("PriceFeed: no OKX instrument mappings for %s", self._symbols_set)
+            return
+
+        url = "wss://ws.okx.com:8443/ws/v5/public"
+        LOGGER.info("PriceFeed: connecting OKX trades WS for %s", okx_instruments)
+
+        # Ensure _running is True so the reconnect loop works.
+        # connect_agg_trades_ws() can be called as a standalone task without start().
+        self._running = True
 
         while self._running:
             try:
-                async with websockets.connect(url) as ws:
-                    LOGGER.info("PriceFeed: aggTrades WS connected")
-                    async for raw_msg in ws:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                    # Subscribe to trades for all instruments
+                    sub_msg = {
+                        "op": "subscribe",
+                        "args": [{"channel": "trades", "instId": inst} for inst in okx_instruments],
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    LOGGER.info("PriceFeed: OKX trades WS connected, subscribed to %s", okx_instruments)
+
+                    while self._running:
+                        try:
+                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                        except asyncio.TimeoutError:
+                            # No message in 30s — send ping to verify connection
+                            await ws.ping()
+                            LOGGER.debug("PriceFeed: OKX trades WS ping (no message in 30s)")
+                            continue
                         data = json.loads(raw_msg)
-                        payload = data.get("data", data)
-                        self._handle_agg_trade_message(payload)
+                        # OKX sends {"event":"subscribe",...} for confirmations
+                        if "data" in data:
+                            self._handle_okx_trade_message(data)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                LOGGER.warning("PriceFeed: aggTrades WS error: %s, reconnecting in 5s", exc)
+                LOGGER.warning("PriceFeed: OKX trades WS error: %s, reconnecting in 5s", exc)
                 await asyncio.sleep(5)
 
     # ── internal ───────────────────────────────────────────────────
@@ -602,20 +678,36 @@ class PriceFeed:
                 await asyncio.sleep(5)
 
     async def _connect_and_stream(self) -> None:
-        """Connect to Binance combined streams and process messages."""
+        """Connect to OKX public trades WebSocket and process messages."""
         try:
             import websockets  # type: ignore[import-untyped]
         except ImportError:
             LOGGER.warning("PriceFeed: websockets not installed, WS disabled")
             return
 
-        streams = "/".join(f"{s}@trade" for s in self._symbols)
-        url = f"{self._ws_url}/{streams}"
-        LOGGER.info("PriceFeed: connecting to %s", url)
+        # Map Binance symbols to OKX instruments
+        okx_instruments = []
+        for sym in self._symbols:
+            okx_id = _BINANCE_TO_OKX_SPOT.get(sym)
+            if okx_id:
+                okx_instruments.append(okx_id)
+        if not okx_instruments:
+            LOGGER.warning("PriceFeed: no OKX mappings for %s", self._symbols)
+            return
 
-        async with websockets.connect(url) as ws:
+        url = self._ws_url
+        LOGGER.info("PriceFeed: connecting to OKX WS %s for %s", url, okx_instruments)
+
+        async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
             self._ws = ws
-            LOGGER.info("PriceFeed: connected")
+            # Subscribe to trades
+            sub_msg = {
+                "op": "subscribe",
+                "args": [{"channel": "trades", "instId": inst} for inst in okx_instruments],
+            }
+            await ws.send(json.dumps(sub_msg))
+            LOGGER.info("PriceFeed: OKX WS connected, subscribed to %s", okx_instruments)
+
             while self._running:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
@@ -623,7 +715,9 @@ class PriceFeed:
                     # Send ping to keep alive
                     await ws.ping()
                     continue
-                self._handle_message(raw)
+                data = json.loads(raw)
+                if "data" in data:
+                    self._handle_okx_trade_message(data)
 
     def _handle_message(self, raw: str | bytes) -> None:
         """Parse a Binance trade message and record the tick."""

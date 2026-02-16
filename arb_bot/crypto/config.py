@@ -43,12 +43,12 @@ class CryptoSettings:
     # ── Kalshi crypto series to trade ──────────────────────────────
     symbols: List[str] = field(default_factory=lambda: ["KXBTC", "KXETH"])
 
-    # ── Price feed (Binance) ───────────────────────────────────────
-    price_feed_url: str = "wss://stream.binance.com:9443/ws"
+    # ── Price feed (OKX) ────────────────────────────────────────────
+    price_feed_url: str = "wss://ws.okx.com:8443/ws/v5/public"
     price_feed_symbols: List[str] = field(
         default_factory=lambda: ["btcusdt", "ethusdt"],
     )
-    price_feed_snapshot_url: str = "https://api.binance.com/api/v3/klines"
+    price_feed_snapshot_url: str = "https://www.okx.com/api/v5/market/candles"
     price_history_minutes: int = 60
 
     # ── Monte Carlo model ──────────────────────────────────────────
@@ -208,7 +208,7 @@ class CryptoSettings:
     funding_rate_extreme_threshold: float = 0.0005
     funding_rate_drift_weight: float = 0.5
     funding_rate_api_url: str = "https://www.okx.com/api/v5/public/funding-rate"
-    funding_rate_history_url: str = "https://fapi.binance.com/fapi/v1/fundingRate"
+    funding_rate_history_url: str = "https://www.okx.com/api/v5/public/funding-rate-history"
 
     # ── VPIN (Volume-Synchronized Probability of Informed Trading) ──
     vpin_enabled: bool = True
@@ -367,13 +367,13 @@ def load_crypto_settings() -> CryptoSettings:
         symbols=_as_csv(os.getenv("ARB_CRYPTO_SYMBOLS")) or ["KXBTC", "KXETH"],
         price_feed_url=os.getenv(
             "ARB_CRYPTO_PRICE_FEED_URL",
-            "wss://stream.binance.com:9443/ws",
+            "wss://ws.okx.com:8443/ws/v5/public",
         ),
         price_feed_symbols=_as_csv(os.getenv("ARB_CRYPTO_PRICE_FEED_SYMBOLS"))
         or ["btcusdt", "ethusdt"],
         price_feed_snapshot_url=os.getenv(
             "ARB_CRYPTO_PRICE_FEED_SNAPSHOT_URL",
-            "https://api.binance.com/api/v3/klines",
+            "https://www.okx.com/api/v5/market/candles",
         ),
         price_history_minutes=_as_int(os.getenv("ARB_CRYPTO_PRICE_HISTORY_MINUTES"), 60),
         mc_num_paths=_as_int(os.getenv("ARB_CRYPTO_MC_NUM_PATHS"), 1000),
@@ -477,7 +477,7 @@ def load_crypto_settings() -> CryptoSettings:
         funding_rate_extreme_threshold=_as_float(os.getenv("ARB_CRYPTO_FUNDING_RATE_EXTREME_THRESHOLD"), 0.0005),
         funding_rate_drift_weight=_as_float(os.getenv("ARB_CRYPTO_FUNDING_RATE_DRIFT_WEIGHT"), 0.5),
         funding_rate_api_url=os.getenv("ARB_CRYPTO_FUNDING_RATE_API_URL", "https://www.okx.com/api/v5/public/funding-rate"),
-        funding_rate_history_url=os.getenv("ARB_CRYPTO_FUNDING_RATE_HISTORY_URL", "https://fapi.binance.com/fapi/v1/fundingRate"),
+        funding_rate_history_url=os.getenv("ARB_CRYPTO_FUNDING_RATE_HISTORY_URL", "https://www.okx.com/api/v5/public/funding-rate-history"),
         vpin_enabled=_as_bool(os.getenv("ARB_CRYPTO_VPIN_ENABLED"), True),
         vpin_bucket_volume=_as_float(os.getenv("ARB_CRYPTO_VPIN_BUCKET_VOLUME"), 0.0),
         vpin_num_buckets=_as_int(os.getenv("ARB_CRYPTO_VPIN_NUM_BUCKETS"), 50),

@@ -39,9 +39,11 @@ from arb_bot.crypto.price_model import PriceModel
 LOGGER = logging.getLogger(__name__)
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
-BINANCE_KLINES = "https://api.binance.us/api/v3/klines"
-BINANCE_PRICE = "https://api.binance.us/api/v3/ticker/price"
-BINANCE_AGG_TRADES = "https://api.binance.us/api/v3/aggTrades"
+
+# OKX REST API endpoints (primary data source — no geo-blocking, high volume)
+OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
+OKX_TICKER_URL = "https://www.okx.com/api/v5/market/ticker"
+OKX_TRADES_URL = "https://www.okx.com/api/v5/market/trades"
 
 # Map underlying to Kalshi series tickers
 _SERIES_MAP = {
@@ -50,83 +52,103 @@ _SERIES_MAP = {
     "SOL": ["KXSOL15M", "KXSOLD"],
 }
 
+# Binance-style symbols used internally as keys (engine, price feed, etc.)
 _BINANCE_MAP = {
     "BTC": "BTCUSDT",
     "ETH": "ETHUSDT",
     "SOL": "SOLUSDT",
 }
 
-OKX_TRADES_URL = "https://www.okx.com/api/v5/market/trades"
+# OKX instrument IDs
 _OKX_MAP = {"BTC": "BTC-USDT", "ETH": "ETH-USDT", "SOL": "SOL-USDT"}
 
+# Reverse: Binance symbol -> OKX instrument ID
+_BINANCE_TO_OKX = {v: _OKX_MAP[k] for k, v in _BINANCE_MAP.items()}
 
-# ── Binance REST price feed ────────────────────────────────────────
 
-async def fetch_binance_prices(
+# ── OKX REST price feed ────────────────────────────────────────────
+
+async def fetch_okx_prices(
     symbols: list[str],
     client: httpx.AsyncClient,
 ) -> dict[str, float]:
-    """Fetch current prices from Binance US REST API."""
+    """Fetch current prices from OKX REST API.
+
+    *symbols* are Binance-style uppercase symbols (e.g. "BTCUSDT").
+    Returns a dict mapping lowercase symbols to prices.
+    """
     prices: dict[str, float] = {}
     for sym in symbols:
+        okx_inst = _BINANCE_TO_OKX.get(sym)
+        if not okx_inst:
+            continue
         try:
             resp = await client.get(
-                BINANCE_PRICE,
-                params={"symbol": sym},
+                OKX_TICKER_URL,
+                params={"instId": okx_inst},
                 timeout=5.0,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                prices[sym.lower()] = float(data["price"])
+                body = resp.json()
+                data_list = body.get("data", [])
+                if data_list:
+                    prices[sym.lower()] = float(data_list[0]["last"])
         except Exception as exc:
-            LOGGER.debug("Binance price fetch %s failed: %s", sym, exc)
+            LOGGER.debug("OKX price fetch %s failed: %s", okx_inst, exc)
     return prices
 
 
-async def fetch_binance_klines(
+async def fetch_okx_klines(
     symbol: str,
     minutes: int,
     client: httpx.AsyncClient,
 ) -> list[tuple[float, float]]:
-    """Fetch 1-minute klines (timestamp, close) from Binance US."""
-    try:
-        resp = await client.get(
-            BINANCE_KLINES,
-            params={
-                "symbol": symbol,
-                "interval": "1m",
-                "limit": min(minutes, 1000),
-            },
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return [(float(k[0]) / 1000.0, float(k[4])) for k in data]
-    except Exception as exc:
-        LOGGER.warning("Binance klines %s failed: %s", symbol, exc)
-    return []
+    """Fetch 1-minute candles (timestamp, close) from OKX.
 
+    *symbol* is a Binance-style symbol (e.g. "BTCUSDT").
+    OKX returns max 100 candles per request, so we paginate if needed.
+    """
+    okx_inst = _BINANCE_TO_OKX.get(symbol)
+    if not okx_inst:
+        return []
 
-async def fetch_binance_agg_trades(
-    symbol: str,
-    limit: int,
-    client: httpx.AsyncClient,
-) -> list[dict]:
-    """Fetch recent aggregate trades from Binance US for OFI bootstrap."""
+    all_candles: list[tuple[float, float]] = []
+    after: str | None = None  # OKX uses "after" for pagination (older data)
+
     try:
-        resp = await client.get(
-            BINANCE_AGG_TRADES,
-            params={
-                "symbol": symbol,
-                "limit": min(limit, 1000),
-            },
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            return resp.json()
+        remaining = min(minutes, 300)  # Cap at 5 hours of 1m candles
+        while remaining > 0:
+            batch = min(remaining, 100)
+            params: dict[str, str] = {
+                "instId": okx_inst,
+                "bar": "1m",
+                "limit": str(batch),
+            }
+            if after:
+                params["after"] = after
+            resp = await client.get(OKX_CANDLES_URL, params=params, timeout=10.0)
+            if resp.status_code != 200:
+                break
+            body = resp.json()
+            data_list = body.get("data", [])
+            if not data_list:
+                break
+            for candle in data_list:
+                # OKX format: [ts_ms, open, high, low, close, vol, volCcy, ...]
+                ts = float(candle[0]) / 1000.0
+                close = float(candle[4])
+                all_candles.append((ts, close))
+            # OKX returns newest first; "after" = oldest timestamp for next page
+            after = data_list[-1][0]
+            remaining -= len(data_list)
+            if len(data_list) < batch:
+                break  # No more data
     except Exception as exc:
-        LOGGER.warning("Binance aggTrades %s failed: %s", symbol, exc)
-    return []
+        LOGGER.warning("OKX klines %s failed: %s", okx_inst, exc)
+
+    # OKX returns newest-first; reverse for chronological order
+    all_candles.reverse()
+    return all_candles
 
 
 async def fetch_okx_trades(
@@ -134,7 +156,7 @@ async def fetch_okx_trades(
     limit: int,
     client: httpx.AsyncClient,
 ) -> list[dict]:
-    """Fetch recent trades from OKX for OFI bootstrap (higher volume than Binance US)."""
+    """Fetch recent trades from OKX (high volume, no geo-blocking)."""
     try:
         resp = await client.get(
             OKX_TRADES_URL,
@@ -150,6 +172,11 @@ async def fetch_okx_trades(
     except Exception as exc:
         LOGGER.warning("OKX trades %s failed: %s", okx_symbol, exc)
     return []
+
+
+# Legacy aliases for backward compatibility
+fetch_binance_prices = fetch_okx_prices
+fetch_binance_klines = fetch_okx_klines
 
 
 # ── Kalshi market parsing ──────────────────────────────────────────
@@ -614,10 +641,10 @@ async def run_paper_test(
         if engine._funding_tracker is not None:
             await engine._funding_tracker.start(client)
 
-        # 1. Bootstrap with Binance klines
-        print("Loading historical prices from Binance US REST API...")
+        # 1. Bootstrap with OKX klines
+        print("Loading historical prices from OKX REST API...")
         for sym in binance_symbols:
-            klines = await fetch_binance_klines(sym, 60, client)
+            klines = await fetch_okx_klines(sym, 60, client)
             if klines:
                 for ts, close in klines:
                     engine.price_feed.inject_tick(
@@ -628,8 +655,8 @@ async def run_paper_test(
                 print(f"   {sym}: no data (API may be unavailable)")
 
         # 2. Fetch current prices
-        print("\nFetching current prices...")
-        prices = await fetch_binance_prices(binance_symbols, client)
+        print("\nFetching current prices from OKX...")
+        prices = await fetch_okx_prices(binance_symbols, client)
         for sym, price in prices.items():
             engine.price_feed.inject_tick(
                 PriceTick(symbol=sym, price=price, timestamp=time.time(), volume=0)
@@ -637,7 +664,7 @@ async def run_paper_test(
             print(f"   {sym.upper()}: ${price:,.2f}")
 
         if not prices:
-            print("   WARNING: No Binance prices available. Using historical data only.")
+            print("   WARNING: No OKX prices available. Using historical data only.")
 
         # 2b. Bootstrap OFI data from OKX trades
         print("\nBootstrapping OFI data from OKX trades...")
@@ -718,13 +745,14 @@ async def run_paper_test(
             else:
                 print(f"   {sym.upper()}: insufficient data for vol estimate")
 
-        # 4. Start OKX trades WebSocket for continuous OFI data
+        # 4. Start OKX trades WebSocket for continuous OFI/VPIN data
         agg_trades_task = None
+        _ws_restart_count = 0
         if settings.agg_trades_ws_enabled:
             agg_trades_task = asyncio.create_task(
                 engine.price_feed.connect_agg_trades_ws()
             )
-            print("\nStarted OKX trades WebSocket stream for continuous OFI data")
+            print("\nStarted OKX trades WebSocket stream for continuous OFI/VPIN data")
 
         # 5. Set up per-cycle CSV logger
         log_path = f"arb_bot/output/paper_v3_{int(time.time())}.csv"
@@ -747,14 +775,27 @@ async def run_paper_test(
             print(f"Cycle {cycle} ({elapsed:.1f}m / {duration_minutes}m)")
             print(f"{'─'*50}")
 
-            # Refresh prices + trade flow for OFI
-            new_prices = await fetch_binance_prices(binance_symbols, client)
+            # Health check: auto-restart dead WebSocket task
+            if agg_trades_task is not None and agg_trades_task.done():
+                exc = agg_trades_task.exception() if not agg_trades_task.cancelled() else None
+                _ws_restart_count += 1
+                LOGGER.warning(
+                    "OKX trades WS task died (restart #%d): %s",
+                    _ws_restart_count, exc,
+                )
+                print(f"   ⚠ OKX trades WS died (restart #{_ws_restart_count}): {exc}")
+                agg_trades_task = asyncio.create_task(
+                    engine.price_feed.connect_agg_trades_ws()
+                )
+
+            # Refresh prices from OKX REST
+            new_prices = await fetch_okx_prices(binance_symbols, client)
             for sym, price in new_prices.items():
                 engine.price_feed.inject_tick(
                     PriceTick(symbol=sym, price=price, timestamp=time.time(), volume=0)
                 )
 
-            # OFI data now comes via aggTrades WebSocket (no per-cycle REST poll)
+            # OFI/VPIN data comes via OKX trades WebSocket (no per-cycle REST poll)
 
             for sym in [s.lower() for s in binance_symbols]:
                 p = engine.price_feed.get_current_price(sym)
@@ -763,7 +804,13 @@ async def run_paper_test(
                 if settings.vpin_enabled and sym in engine._vpin_calculators:
                     calc = engine._vpin_calculators[sym]
                     v = calc.get_vpin()
-                    vpin_str = f"  VPIN={v:.3f}" if v is not None else "  VPIN=None"
+                    if v is not None:
+                        vpin_str = f"  VPIN={v:.3f}"
+                    elif hasattr(calc, "is_stale") and calc.is_stale:
+                        age = calc.seconds_since_last_trade
+                        vpin_str = f"  VPIN=stale({age:.0f}s)"
+                    else:
+                        vpin_str = "  VPIN=None"
                 if p:
                     print(f"   {sym.upper()}: ${p:,.2f}  OFI={ofi:+.3f}{vpin_str}")
 

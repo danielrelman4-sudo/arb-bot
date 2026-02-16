@@ -861,11 +861,14 @@ class CryptoEngine:
         _vpin_halted_symbols: set = set()   # Symbols above ceiling — fully halted
         _vpin_momentum_symbols: set = set() # Symbols in momentum zone
         _vpin_normal_symbols: set = set()   # Symbols below momentum floor — model-path ok
+        _vpin_stale_symbols: set = set()    # Symbols with stale VPIN (treated as normal)
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
                 if vpin_val is None:
                     _vpin_normal_symbols.add(sym)
+                    if hasattr(calc, "is_stale") and calc.is_stale:
+                        _vpin_stale_symbols.add(sym)
                     continue
                 if self._settings.momentum_enabled:
                     if vpin_val > self._settings.momentum_vpin_ceiling:
@@ -881,16 +884,28 @@ class CryptoEngine:
                         _vpin_normal_symbols.add(sym)
 
             # Log per-symbol VPIN status
+            if _vpin_stale_symbols:
+                stale_details = ", ".join(
+                    f"{s}(stale {self._vpin_calculators[s].seconds_since_last_trade:.0f}s)"
+                    if hasattr(self._vpin_calculators[s], "seconds_since_last_trade")
+                    else s
+                    for s in sorted(_vpin_stale_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN stale (treated as normal): %s", stale_details)
             if _vpin_halted_symbols:
                 halted_details = ", ".join(
-                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_halted_symbols)
+                    f"{s}={v:.3f}" for s in sorted(_vpin_halted_symbols)
+                    if (v := self._vpin_calculators[s].get_vpin()) is not None
                 )
-                LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
+                if halted_details:
+                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
             if _vpin_momentum_symbols:
                 mom_details = ", ".join(
-                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_momentum_symbols)
+                    f"{s}={v:.3f}" for s in sorted(_vpin_momentum_symbols)
+                    if (v := self._vpin_calculators[s].get_vpin()) is not None
                 )
-                LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
+                if mom_details:
+                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
                 _momentum_zone = True
 
             # Only skip entire cycle if ALL symbols are halted
@@ -1301,11 +1316,14 @@ class CryptoEngine:
         _vpin_halted_symbols: set = set()
         _vpin_momentum_symbols: set = set()
         _vpin_normal_symbols: set = set()
+        _vpin_stale_symbols: set = set()
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
                 if vpin_val is None:
                     _vpin_normal_symbols.add(sym)
+                    if hasattr(calc, "is_stale") and calc.is_stale:
+                        _vpin_stale_symbols.add(sym)
                     continue
                 if self._settings.momentum_enabled:
                     if vpin_val > self._settings.momentum_vpin_ceiling:
@@ -1320,16 +1338,28 @@ class CryptoEngine:
                     else:
                         _vpin_normal_symbols.add(sym)
 
+            if _vpin_stale_symbols:
+                stale_details = ", ".join(
+                    f"{s}(stale {self._vpin_calculators[s].seconds_since_last_trade:.0f}s)"
+                    if hasattr(self._vpin_calculators[s], "seconds_since_last_trade")
+                    else s
+                    for s in sorted(_vpin_stale_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN stale (treated as normal): %s", stale_details)
             if _vpin_halted_symbols:
                 halted_details = ", ".join(
-                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_halted_symbols)
+                    f"{s}={v:.3f}" for s in sorted(_vpin_halted_symbols)
+                    if (v := self._vpin_calculators[s].get_vpin()) is not None
                 )
-                LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
+                if halted_details:
+                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
             if _vpin_momentum_symbols:
                 mom_details = ", ".join(
-                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_momentum_symbols)
+                    f"{s}={v:.3f}" for s in sorted(_vpin_momentum_symbols)
+                    if (v := self._vpin_calculators[s].get_vpin()) is not None
                 )
-                LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
+                if mom_details:
+                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
                 _momentum_zone = True
 
             if _vpin_halted_symbols and not _vpin_momentum_symbols and not _vpin_normal_symbols:
@@ -2086,7 +2116,7 @@ class CryptoEngine:
                     binance_sym, interval_seconds=60,
                     window_minutes=self._settings.mc_vol_window_minutes,
                 )
-                vol_stderr = self._price_model.estimate_vol_stderr(vol_returns, 60)
+                vol_stderr = self._price_model.estimate_vol_stderr(vol_returns)
 
                 if direction == "above" and strike is not None:
                     st_prob = self._price_model.probability_above_student_t(

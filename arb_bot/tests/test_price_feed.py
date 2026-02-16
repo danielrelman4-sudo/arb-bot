@@ -326,7 +326,7 @@ def _make_mock_aiohttp(mock_data, status=200):
 
 class TestLoadHistoricalTrades:
     def test_load_historical_trades_populates_data(self) -> None:
-        """Historical aggTrades should populate buy/sell volume tracking."""
+        """Historical OKX trades should populate buy/sell volume tracking."""
         import asyncio
         import sys
         from unittest.mock import patch
@@ -334,11 +334,12 @@ class TestLoadHistoricalTrades:
         feed = PriceFeed(symbols=["btcusdt"])
         now_ms = int(time.time() * 1000)
 
-        mock_data = [
-            {"a": 1, "p": "70000.00", "q": "1.5", "f": 1, "l": 1, "T": now_ms, "m": False},
-            {"a": 2, "p": "70001.00", "q": "0.5", "f": 2, "l": 2, "T": now_ms + 100, "m": True},
-            {"a": 3, "p": "70002.00", "q": "2.0", "f": 3, "l": 3, "T": now_ms + 200, "m": False},
-        ]
+        # OKX trade format: {"px": price, "sz": qty, "ts": ms, "side": "buy"|"sell", "tradeId": "..."}
+        mock_data = {"data": [
+            {"tradeId": "1", "px": "70000.00", "sz": "1.5", "ts": str(now_ms), "side": "buy"},
+            {"tradeId": "2", "px": "70001.00", "sz": "0.5", "ts": str(now_ms + 100), "side": "sell"},
+            {"tradeId": "3", "px": "70002.00", "sz": "2.0", "ts": str(now_ms + 200), "side": "buy"},
+        ]}
 
         mock_aiohttp, _ = _make_mock_aiohttp(mock_data)
 
@@ -396,12 +397,12 @@ class TestLoadHistoricalTrades:
         feed = PriceFeed(symbols=["btcusdt"])
         now_ms = int(time.time() * 1000)
 
-        mock_data = [
-            {"a": 1, "p": "70000.00", "q": "1.5", "f": 1, "l": 1, "T": now_ms, "m": False},
-            {"a": 2, "p": "bad_price", "q": "0.5", "f": 2, "l": 2, "T": now_ms + 100, "m": True},
+        mock_data = {"data": [
+            {"tradeId": "1", "px": "70000.00", "sz": "1.5", "ts": str(now_ms), "side": "buy"},
+            {"tradeId": "2", "px": "bad_price", "sz": "0.5", "ts": str(now_ms + 100), "side": "sell"},
             {},  # empty record
-            {"a": 4, "p": "70002.00", "q": "2.0", "f": 4, "l": 4, "T": now_ms + 300, "m": False},
-        ]
+            {"tradeId": "4", "px": "70002.00", "sz": "2.0", "ts": str(now_ms + 300), "side": "buy"},
+        ]}
 
         mock_aiohttp, _ = _make_mock_aiohttp(mock_data)
 
@@ -413,22 +414,22 @@ class TestLoadHistoricalTrades:
         # Only 2 valid records (1 and 4), records 2 and 3 are malformed
         assert count == 2
 
-    def test_load_historical_trades_limits_to_1000(self) -> None:
-        """Limit parameter should be capped at 1000."""
+    def test_load_historical_trades_limits_per_request(self) -> None:
+        """OKX limit per request should be capped at 100."""
         import asyncio
         import sys
         from unittest.mock import patch
 
         feed = PriceFeed(symbols=["btcusdt"])
-        mock_aiohttp, mock_session = _make_mock_aiohttp([])
+        mock_aiohttp, mock_session = _make_mock_aiohttp({"data": []})
 
         with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
             async def _run():
                 return await feed.load_historical_trades("btcusdt", limit=5000)
             count = asyncio.run(_run())
 
-        # Verify URL contains limit=1000 (capped), not 5000
+        # Verify URL contains limit=100 (OKX max per request), not 5000
         get_call = mock_session.get.call_args
         url_arg = get_call[0][0]
-        assert "limit=1000" in url_arg
+        assert "limit=100" in url_arg
         assert count == 0
