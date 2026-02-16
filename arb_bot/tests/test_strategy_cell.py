@@ -9,6 +9,7 @@ import pytest
 
 from arb_bot.crypto.config import CryptoSettings
 from arb_bot.crypto.edge_detector import blend_probabilities
+from arb_bot.crypto.price_model import PriceModel
 from arb_bot.crypto.strategy_cell import (
     CellConfig,
     StrategyCell,
@@ -53,6 +54,8 @@ class TestGetCellConfig:
 
         assert cfg.model_weight == s.cell_yes_15min_model_weight
         assert cfg.prob_haircut == s.cell_yes_15min_prob_haircut
+        assert cfg.vol_dampening == s.cell_yes_15min_vol_dampening
+        assert cfg.uncertainty_multiplier == s.cell_yes_15min_uncertainty_mult
         assert cfg.empirical_window_minutes == s.cell_yes_15min_empirical_window
         assert cfg.min_edge_pct == s.cell_yes_15min_min_edge_pct
         assert cfg.require_ofi_alignment is True
@@ -69,6 +72,8 @@ class TestGetCellConfig:
 
         assert cfg.model_weight == s.cell_yes_daily_model_weight
         assert cfg.prob_haircut == s.cell_yes_daily_prob_haircut
+        assert cfg.vol_dampening == s.cell_yes_daily_vol_dampening
+        assert cfg.uncertainty_multiplier == s.cell_yes_daily_uncertainty_mult
         assert cfg.empirical_window_minutes == s.cell_yes_daily_empirical_window
         assert cfg.min_edge_pct == s.cell_yes_daily_min_edge_pct
         assert cfg.require_ofi_alignment is False
@@ -85,6 +90,8 @@ class TestGetCellConfig:
 
         assert cfg.model_weight == s.cell_no_15min_model_weight
         assert cfg.prob_haircut == s.cell_no_15min_prob_haircut
+        assert cfg.vol_dampening == s.cell_no_15min_vol_dampening
+        assert cfg.uncertainty_multiplier == s.cell_no_15min_uncertainty_mult
         assert cfg.empirical_window_minutes == s.cell_no_15min_empirical_window
         assert cfg.min_edge_pct == s.cell_no_15min_min_edge_pct
         assert cfg.require_ofi_alignment is False
@@ -99,6 +106,8 @@ class TestGetCellConfig:
 
         assert cfg.model_weight == s.cell_no_daily_model_weight
         assert cfg.prob_haircut == s.cell_no_daily_prob_haircut
+        assert cfg.vol_dampening == s.cell_no_daily_vol_dampening
+        assert cfg.uncertainty_multiplier == s.cell_no_daily_uncertainty_mult
         assert cfg.empirical_window_minutes == s.cell_no_daily_empirical_window
         assert cfg.min_edge_pct == s.cell_no_daily_min_edge_pct
         assert cfg.require_ofi_alignment is False
@@ -124,6 +133,8 @@ class TestCellConfigDefaults:
         expected = {
             "model_weight",
             "prob_haircut",
+            "vol_dampening",
+            "uncertainty_multiplier",
             "empirical_window_minutes",
             "min_edge_pct",
             "require_ofi_alignment",
@@ -142,13 +153,13 @@ class TestCellConfigDefaults:
 # ═══════════════════════════════════════════════════════════════════
 
 class TestModelAdjustments:
-    """Test that per-cell blending weight, haircut, and empirical window
-    produce the expected behavioural differences."""
+    """Test that per-cell blending weight, haircut, vol dampening, and
+    empirical window produce the expected behavioural differences."""
 
-    def test_yes_daily_blending_weight_is_0_4(self) -> None:
-        """YES/daily defaults to 0.4 (heavy market deference)."""
+    def test_yes_daily_blending_weight(self) -> None:
+        """YES/daily defaults to 0.55 (moderate market deference)."""
         cfg = get_cell_config(StrategyCell.YES_DAILY, _default_settings())
-        assert cfg.model_weight == pytest.approx(0.4)
+        assert cfg.model_weight == pytest.approx(0.55)
 
     def test_no_daily_blending_weight_is_0_75(self) -> None:
         """NO/daily defaults to 0.75 (model underconfident => boost)."""
@@ -156,7 +167,7 @@ class TestModelAdjustments:
         assert cfg.model_weight == pytest.approx(0.75)
 
     def test_yes_daily_prob_haircut_reduces_blended(self) -> None:
-        """YES/daily 0.85 haircut reduces the blended probability."""
+        """YES/daily 0.92 haircut reduces the blended probability."""
         cfg = get_cell_config(StrategyCell.YES_DAILY, _default_settings())
         model_prob, market_prob, uncertainty = 0.70, 0.50, 0.05
         blended = blend_probabilities(
@@ -165,7 +176,7 @@ class TestModelAdjustments:
         )
         haircut_blended = blended * cfg.prob_haircut
         assert haircut_blended < blended
-        assert cfg.prob_haircut == pytest.approx(0.85)
+        assert cfg.prob_haircut == pytest.approx(0.92)
 
     def test_no_daily_no_haircut(self) -> None:
         """NO/daily haircut is 1.0 — no adjustment."""
@@ -177,27 +188,6 @@ class TestModelAdjustments:
         )
         haircut_blended = blended * cfg.prob_haircut
         assert haircut_blended == pytest.approx(blended)
-
-    def test_haircut_kills_marginal_yes_edge(self) -> None:
-        """A marginal YES/daily edge flips negative after haircut.
-
-        If market_implied is 0.50 and blended prob is only slightly above
-        the buy price, the 0.85 haircut should push it below, killing the edge.
-        """
-        cfg = get_cell_config(StrategyCell.YES_DAILY, _default_settings())
-        # model barely above market => small edge
-        model_prob, market_prob, uncertainty = 0.58, 0.50, 0.05
-        blended = blend_probabilities(
-            model_prob, market_prob, uncertainty,
-            base_model_weight=cfg.model_weight,
-        )
-        buy_price = 0.50  # yes buy price
-        # blended should be above buy_price before haircut
-        assert blended > buy_price, f"Pre-haircut blended {blended} should exceed {buy_price}"
-        # After haircut, edge should be killed
-        haircut_prob = blended * cfg.prob_haircut
-        edge_after = haircut_prob - buy_price
-        assert edge_after < 0.0, f"Haircut edge {edge_after} should be negative"
 
     def test_15min_empirical_window_override(self) -> None:
         """15-min cells override empirical window to 30 minutes."""
@@ -216,7 +206,7 @@ class TestModelAdjustments:
         assert cfg_nd.empirical_window_minutes == 0
 
     def test_blending_yes_daily_less_model_than_no_daily(self) -> None:
-        """YES/daily (0.4) should produce a lower model weight than NO/daily (0.75)
+        """YES/daily (0.55) should produce a lower model weight than NO/daily (0.75)
         in the blend, meaning YES defers more to market."""
         cfg_yes = get_cell_config(StrategyCell.YES_DAILY, _default_settings())
         cfg_no = get_cell_config(StrategyCell.NO_DAILY, _default_settings())
@@ -232,6 +222,147 @@ class TestModelAdjustments:
         )
         # YES defers more to market (0.50), so blended is lower
         assert blended_yes < blended_no
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4b. Vol dampening — 8 tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestVolDampening:
+    """Test that per-cell vol dampening produces narrower distributions
+    and lower tail probabilities for YES cells."""
+
+    def test_yes_daily_vol_dampening_is_0_75(self) -> None:
+        """YES/daily gets strongest dampening (0.75) — 39pp overconfident."""
+        cfg = get_cell_config(StrategyCell.YES_DAILY, _default_settings())
+        assert cfg.vol_dampening == pytest.approx(0.75)
+
+    def test_yes_15min_vol_dampening_is_0_85(self) -> None:
+        """YES/15min gets moderate dampening (0.85)."""
+        cfg = get_cell_config(StrategyCell.YES_15MIN, _default_settings())
+        assert cfg.vol_dampening == pytest.approx(0.85)
+
+    def test_no_cells_no_dampening(self) -> None:
+        """NO cells keep vol_dampening=1.0 — wider tails help NO bets."""
+        s = _default_settings()
+        for cell in [StrategyCell.NO_15MIN, StrategyCell.NO_DAILY]:
+            cfg = get_cell_config(cell, s)
+            assert cfg.vol_dampening == pytest.approx(1.0), (
+                f"{cell} should have no vol dampening"
+            )
+
+    def test_dampening_reduces_otm_probability(self) -> None:
+        """Vol dampening < 1.0 should reduce P(price > OTM strike).
+
+        With returns dampened, the terminal distribution narrows and
+        fewer paths reach far-OTM strikes.
+        """
+        pm = PriceModel(num_paths=1000, seed=42)
+        # Create synthetic returns: N(0, 0.001) ~ 0.1% per step
+        import numpy as np
+        rng = np.random.default_rng(123)
+        returns = list(rng.normal(0.0, 0.001, size=200))
+
+        current_price = 100.0
+        strike = 102.0  # 2% OTM
+        horizon_steps = 60  # 1 hour of 1-min steps
+
+        # No dampening
+        est_normal = pm.probability_above_empirical(
+            returns, current_price, strike, horizon_steps,
+            bootstrap_paths=5000, min_samples=30,
+            vol_dampening=1.0,
+        )
+        # With dampening
+        est_dampened = pm.probability_above_empirical(
+            returns, current_price, strike, horizon_steps,
+            bootstrap_paths=5000, min_samples=30,
+            vol_dampening=0.75,
+        )
+        # Dampened should give lower prob of reaching OTM strike
+        assert est_dampened.probability < est_normal.probability
+
+    def test_dampening_has_no_effect_at_1_0(self) -> None:
+        """Vol dampening = 1.0 should give same result as no dampening."""
+        pm = PriceModel(num_paths=1000, seed=42)
+        import numpy as np
+        rng = np.random.default_rng(456)
+        returns = list(rng.normal(0.0, 0.001, size=100))
+
+        est_a = pm.probability_above_empirical(
+            returns, 100.0, 101.0, 30,
+            bootstrap_paths=3000, min_samples=30,
+            vol_dampening=1.0,
+        )
+        # Reset RNG to same state for fair comparison
+        pm2 = PriceModel(num_paths=1000, seed=42)
+        est_b = pm2.probability_above_empirical(
+            returns, 100.0, 101.0, 30,
+            bootstrap_paths=3000, min_samples=30,
+            # No vol_dampening parameter (defaults to 1.0)
+        )
+        assert est_a.probability == pytest.approx(est_b.probability, abs=0.01)
+
+    def test_stronger_dampening_reduces_more(self) -> None:
+        """0.60 dampening should reduce P(OTM) more than 0.85 dampening."""
+        pm1 = PriceModel(num_paths=1000, seed=42)
+        pm2 = PriceModel(num_paths=1000, seed=42)
+        import numpy as np
+        rng = np.random.default_rng(789)
+        returns = list(rng.normal(0.0, 0.001, size=200))
+
+        est_mild = pm1.probability_above_empirical(
+            returns, 100.0, 102.0, 60,
+            bootstrap_paths=5000, min_samples=30,
+            vol_dampening=0.85,
+        )
+        est_strong = pm2.probability_above_empirical(
+            returns, 100.0, 102.0, 60,
+            bootstrap_paths=5000, min_samples=30,
+            vol_dampening=0.60,
+        )
+        assert est_strong.probability < est_mild.probability
+
+    def test_dampening_preserves_itm_probability(self) -> None:
+        """For deeply ITM strikes, dampening should have minimal effect.
+
+        If strike is below current price, most paths hit it regardless.
+        """
+        pm = PriceModel(num_paths=1000, seed=42)
+        import numpy as np
+        rng = np.random.default_rng(321)
+        returns = list(rng.normal(0.0, 0.001, size=200))
+
+        current_price = 100.0
+        strike = 98.0  # 2% ITM
+        horizon_steps = 30
+
+        est_normal = pm.probability_above_empirical(
+            returns, current_price, strike, horizon_steps,
+            bootstrap_paths=5000, min_samples=30,
+            vol_dampening=1.0,
+        )
+        pm2 = PriceModel(num_paths=1000, seed=42)
+        est_dampened = pm2.probability_above_empirical(
+            returns, current_price, strike, horizon_steps,
+            bootstrap_paths=5000, min_samples=30,
+            vol_dampening=0.75,
+        )
+        # Both should be high (ITM), dampened slightly higher
+        # (narrower distribution stays above ITM strike)
+        assert est_normal.probability > 0.5
+        assert est_dampened.probability > 0.5
+        # Difference should be small for ITM strikes
+        assert abs(est_normal.probability - est_dampened.probability) < 0.15
+
+    def test_per_cell_uncertainty_multiplier(self) -> None:
+        """YES cells should have higher uncertainty multiplier than NO cells."""
+        s = _default_settings()
+        cfg_yes_d = get_cell_config(StrategyCell.YES_DAILY, s)
+        cfg_no_d = get_cell_config(StrategyCell.NO_DAILY, s)
+        assert cfg_yes_d.uncertainty_multiplier > cfg_no_d.uncertainty_multiplier
+        assert cfg_yes_d.uncertainty_multiplier == pytest.approx(2.5)
+        assert cfg_no_d.uncertainty_multiplier == pytest.approx(1.5)
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -631,6 +631,7 @@ class PriceModel:
         bootstrap_paths: int = 2000,
         min_samples: int = 30,
         min_uncertainty: float = 0.02,
+        vol_dampening: float = 1.0,
     ) -> ProbabilityEstimate:
         """Estimate P(S > K) via empirical bootstrap of historical returns.
 
@@ -656,6 +657,17 @@ class PriceModel:
             ``ProbabilityEstimate(0.5, 0, 1, 0.5, 0)`` if insufficient.
         min_uncertainty:
             Floor on reported uncertainty.
+        vol_dampening:
+            Scale factor applied to each resampled return.  1.0 = no change
+            (standard IID bootstrap).  Values < 1.0 shrink each return toward
+            zero, modelling mean-reversion that the IID bootstrap ignores.
+            This reduces the width of the terminal price distribution and
+            lowers tail probabilities.
+
+            Typical values:
+            - 1.0: NO cells (vol fade benefits from wider tails)
+            - 0.75-0.85: YES/daily cells (corrects overconfidence)
+            - 0.80-0.90: YES/15min cells (moderate correction)
 
         Returns
         -------
@@ -675,6 +687,13 @@ class PriceModel:
         # Draw (bootstrap_paths x horizon_steps) random returns
         indices = rng.integers(0, len(arr), size=(bootstrap_paths, horizon_steps))
         sampled = arr[indices]  # shape: (bootstrap_paths, horizon_steps)
+
+        # Apply vol dampening: shrink each return toward zero to model
+        # mean-reversion that the IID bootstrap ignores.  When vol_dampening
+        # < 1.0, the terminal distribution narrows, reducing the probability
+        # of reaching far-OTM strikes.
+        if vol_dampening != 1.0:
+            sampled = sampled * vol_dampening
 
         # Cumulative log returns -> terminal prices
         cum_log_returns = np.sum(sampled, axis=1)  # shape: (bootstrap_paths,)

@@ -125,7 +125,49 @@ def _compute_momentum_size(
     dollar_amount = min(dollar_amount, bankroll)
     if buy_price <= 0:
         return 0
-    return int(dollar_amount / buy_price)
+    contracts = int(dollar_amount / buy_price)
+    return min(contracts, settings.momentum_max_contracts)
+
+
+def _update_ofi_streak(
+    streaks: dict,
+    last_dirs: dict,
+    symbol: str,
+    ofi_direction: int,
+    ofi_alignment: float,
+    min_alignment: float,
+) -> int:
+    """Update and return the OFI direction streak for a symbol.
+
+    Streak increments when direction is consistent and alignment is above
+    threshold. Resets to 0 on direction flip or alignment drop.
+    """
+    prev_dir = last_dirs.get(symbol)
+    last_dirs[symbol] = ofi_direction
+
+    if ofi_alignment < min_alignment:
+        streaks[symbol] = 0
+        return 0
+
+    if prev_dir is None or ofi_direction != prev_dir:
+        streaks[symbol] = 1 if prev_dir is None else 0
+        return streaks[symbol]
+
+    streaks[symbol] = streaks.get(symbol, 0) + 1
+    return streaks[symbol]
+
+
+def _check_ofi_acceleration(ofi_multiscale: dict) -> bool:
+    """Check if OFI flow is accelerating (short-term stronger than medium-term).
+
+    Compares |OFI at 30s| vs |OFI at 120s|. Returns True if short-term
+    flow is stronger (momentum building) or if data is missing (permissive).
+    """
+    ofi_30 = ofi_multiscale.get(30)
+    ofi_120 = ofi_multiscale.get(120)
+    if ofi_30 is None or ofi_120 is None:
+        return True  # Permissive when data missing
+    return abs(ofi_30) > abs(ofi_120)
 
 
 # ── Trade records ──────────────────────────────────────────────────
@@ -256,6 +298,8 @@ class CryptoEngine:
 
         # Momentum cooldowns (v18)
         self._momentum_cooldowns: Dict[str, float] = {}  # binance_sym -> last settle time
+        self._ofi_direction_streak: Dict[str, int] = {}
+        self._ofi_last_direction: Dict[str, int] = {}
 
         # Staleness detector (A1)
         if settings.staleness_enabled:
@@ -2434,11 +2478,17 @@ class CryptoEngine:
     def _apply_cell_model_adjustments(
         self, edges: list[CryptoEdge],
     ) -> list[CryptoEdge]:
-        """Apply per-cell model adjustments: blending weight + prob haircut.
+        """Apply per-cell model adjustments: vol dampening, blending, haircut.
 
-        Classifies each edge into a strategy cell, re-blends with per-cell
-        model weight, applies probability haircut, and recalculates edge.
-        Edges whose edge flips negative after correction are dropped.
+        Three-layer per-cell model correction:
+        1. Vol dampening: Recompute empirical bootstrap with dampened returns
+           (fixes root cause of YES overconfidence — IID bootstrap ignores
+           mean-reversion in 1-min returns).
+        2. Re-blend with per-cell model weight (adjusts market vs model deference).
+        3. Probability haircut (residual correction).
+
+        Classifies each edge into a strategy cell, applies corrections,
+        and recalculates edge.  Edges that flip negative are dropped.
 
         Modifies edges in-place via ``object.__setattr__`` (frozen dataclass).
         """
@@ -2457,24 +2507,46 @@ class CryptoEngine:
             # Tag edge with cell label (for feature store + logging)
             object.__setattr__(edge, "strategy_cell", cell.value)
 
-            # Skip re-blending if cell uses defaults (no correction needed)
+            # Determine if any correction is needed
+            needs_vol_dampening = abs(cell_cfg.vol_dampening - 1.0) > 0.001
             needs_reblend = (
                 abs(cell_cfg.model_weight - 0.7) > 0.001
                 or abs(cell_cfg.prob_haircut - 1.0) > 0.001
             )
-            if not needs_reblend:
+
+            if not needs_vol_dampening and not needs_reblend:
                 adjusted.append(edge)
                 continue
 
-            # Re-blend with per-cell model weight
+            # ── Layer 1: Vol dampening (recompute probability) ──
+            model_prob = edge.model_prob.probability
+            model_unc = edge.model_uncertainty
+
+            if needs_vol_dampening:
+                dampened = self._recompute_with_vol_dampening(
+                    edge, cell_cfg.vol_dampening,
+                    cell_cfg.uncertainty_multiplier,
+                )
+                if dampened is not None:
+                    model_prob = dampened.probability
+                    model_unc = dampened.uncertainty
+                    LOGGER.info(
+                        "CryptoEngine: vol dampening %s (%.2f): "
+                        "prob %.1f%%→%.1f%%, unc %.3f→%.3f",
+                        edge.market.ticker, cell_cfg.vol_dampening,
+                        edge.model_prob.probability * 100, model_prob * 100,
+                        edge.model_uncertainty, model_unc,
+                    )
+
+            # ── Layer 2: Re-blend with per-cell weight ──
             new_blended = blend_probabilities(
-                model_prob=edge.model_prob.probability,
+                model_prob=model_prob,
                 market_prob=edge.market_implied_prob,
-                model_uncertainty=edge.model_uncertainty,
+                model_uncertainty=model_unc,
                 base_model_weight=cell_cfg.model_weight,
             )
 
-            # Apply probability haircut
+            # ── Layer 3: Probability haircut ──
             new_blended *= cell_cfg.prob_haircut
             new_blended = max(0.01, min(0.99, new_blended))
 
@@ -2488,10 +2560,12 @@ class CryptoEngine:
             if new_edge <= 0:
                 LOGGER.info(
                     "CryptoEngine: cell model correction killed edge on %s "
-                    "(%s: blended %.1f%%→%.1f%%, edge %.1f%%→%.1f%%)",
+                    "(%s: blended %.1f%%→%.1f%%, edge %.1f%%→%.1f%%, "
+                    "dampening=%.2f)",
                     edge.market.ticker, cell.value,
                     edge.blended_probability * 100, new_blended * 100,
                     edge.edge_cents * 100, new_edge * 100,
+                    cell_cfg.vol_dampening,
                 )
                 continue
 
@@ -2504,6 +2578,88 @@ class CryptoEngine:
             adjusted.append(edge)
 
         return adjusted
+
+    def _recompute_with_vol_dampening(
+        self,
+        edge: CryptoEdge,
+        vol_dampening: float,
+        uncertainty_multiplier: float,
+    ) -> Optional[ProbabilityEstimate]:
+        """Recompute empirical probability with vol-dampened returns.
+
+        Re-runs the bootstrap with each resampled return scaled by
+        ``vol_dampening`` to model mean-reversion the IID bootstrap misses.
+
+        Returns ``None`` if recomputation isn't possible (missing data).
+        """
+        meta = edge.market.meta
+        underlying = meta.underlying
+        direction = meta.direction
+        strike = meta.strike
+
+        # Map Kalshi underlying to Binance symbol
+        binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+        if not binance_sym:
+            return None
+
+        # Get current price
+        current_price = self._price_feed.get_current_price(binance_sym)
+        if current_price is None or current_price <= 0:
+            return None
+
+        # Get returns (regime-adjusted)
+        emp_returns = self._get_regime_adjusted_empirical_returns(binance_sym)
+        if len(emp_returns) < self._settings.empirical_min_samples:
+            return None
+
+        # Compute horizon steps
+        horizon = edge.time_to_expiry_minutes
+        interval_sec = self._settings.empirical_return_interval_seconds
+        horizon_steps = max(1, round(horizon * 60 / interval_sec))
+
+        # Determine effective strike for up/down contracts
+        effective_strike = strike
+        if direction in ("up", "down"):
+            effective_strike = current_price
+            if meta.interval_start_time is not None:
+                start_ts = meta.interval_start_time.timestamp()
+                looked_up = self._price_feed.get_price_at_time(
+                    binance_sym, start_ts,
+                )
+                if looked_up is not None:
+                    effective_strike = looked_up
+
+        if effective_strike is None or effective_strike <= 0:
+            return None
+
+        # Run vol-dampened empirical bootstrap
+        raw_est = self._price_model.probability_above_empirical(
+            emp_returns, current_price, effective_strike, horizon_steps,
+            bootstrap_paths=self._settings.empirical_bootstrap_paths,
+            min_samples=self._settings.empirical_min_samples,
+            min_uncertainty=self._settings.empirical_min_uncertainty,
+            vol_dampening=vol_dampening,
+        )
+
+        # For below/down, invert
+        if direction in ("below", "down"):
+            raw_est = ProbabilityEstimate(
+                probability=1.0 - raw_est.probability,
+                ci_lower=1.0 - raw_est.ci_upper,
+                ci_upper=1.0 - raw_est.ci_lower,
+                uncertainty=raw_est.uncertainty,
+                num_paths=raw_est.num_paths,
+            )
+
+        # Apply per-cell uncertainty multiplier
+        scaled_unc = raw_est.uncertainty * uncertainty_multiplier
+        return ProbabilityEstimate(
+            probability=raw_est.probability,
+            ci_lower=max(0.0, raw_est.probability - scaled_unc),
+            ci_upper=min(1.0, raw_est.probability + scaled_unc),
+            uncertainty=scaled_unc,
+            num_paths=raw_est.num_paths,
+        )
 
     def _passes_cell_signal_gates(
         self,
@@ -3001,6 +3157,31 @@ class CryptoEngine:
             ofi_direction_raw = weighted_sum / weight_total if weight_total > 0 else 0.0
             ofi_magnitude = abs(ofi_direction_raw)
             ofi_direction = 1 if ofi_direction_raw > 0 else -1
+
+            # OFI confirmation streak: require N consecutive aligned cycles
+            streak = _update_ofi_streak(
+                self._ofi_direction_streak,
+                self._ofi_last_direction,
+                binance_sym,
+                ofi_direction=ofi_direction,
+                ofi_alignment=ofi_alignment,
+                min_alignment=self._settings.momentum_ofi_alignment_min,
+            )
+            if streak < self._settings.momentum_min_ofi_streak:
+                LOGGER.debug(
+                    "CryptoEngine: momentum skip %s — OFI streak %d < %d",
+                    binance_sym, streak, self._settings.momentum_min_ofi_streak,
+                )
+                continue
+
+            # OFI acceleration filter: skip if flow is fading (short < medium)
+            if self._settings.momentum_require_ofi_acceleration:
+                if not _check_ofi_acceleration(ofi_multi):
+                    LOGGER.debug(
+                        "CryptoEngine: momentum skip %s — OFI decelerating",
+                        binance_sym,
+                    )
+                    continue
 
             # Trigger checks
             if ofi_alignment < self._settings.momentum_ofi_alignment_min:

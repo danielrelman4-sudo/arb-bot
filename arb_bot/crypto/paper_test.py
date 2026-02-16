@@ -423,7 +423,7 @@ async def run_paper_test(
         max_position_per_market=50.0,
         max_concurrent_positions=10,
         max_positions_per_underlying=3,
-        kelly_fraction_cap=0.10,
+        kelly_fraction_cap=0.06,
         scan_interval_seconds=scan_interval,
         paper_slippage_cents=0.5,
         confidence_level=0.95,
@@ -538,7 +538,10 @@ async def run_paper_test(
         regime_kelly_trending_down=0.5,
         regime_kelly_high_vol=0.3,  # Was 0.0; zero blocks ALL trades in high-vol (common in crypto)
         # Tier 1: Regime min edge thresholds
-        regime_min_edge_enabled=False,  # Per-cell logic handles edge thresholds; regime filter is redundant
+        regime_min_edge_enabled=True,
+        regime_min_edge_mean_reverting=0.12,
+        regime_min_edge_trending=0.12,
+        regime_min_edge_high_vol=0.12,
         # Tier 1: VPIN halt gate
         vpin_halt_enabled=True,
         vpin_halt_threshold=0.85,
@@ -571,6 +574,10 @@ async def run_paper_test(
         momentum_max_position=25.0,
         momentum_max_concurrent=2,
         momentum_cooldown_seconds=120.0,
+        # v19: OFI streak + acceleration filters
+        momentum_min_ofi_streak=3,
+        momentum_require_ofi_acceleration=True,
+        momentum_max_contracts=100,
     )
 
     engine = CryptoEngine(settings)
@@ -960,6 +967,10 @@ async def run_paper_test(
                 print(f"    {ticker}: not yet settled (skipping — no simulated fallback)")
         if unsettled_count:
             print(f"  ⚠ {unsettled_count} positions remain unsettled (markets still open)")
+
+    # Flush remaining feature store entries
+    if hasattr(engine, '_feature_store') and engine._feature_store is not None:
+        engine._feature_store.flush()
 
     # Close cycle logger and recorder
     logger.close()

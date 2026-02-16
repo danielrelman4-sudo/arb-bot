@@ -37,14 +37,24 @@ class CellConfig:
     """Per-cell trading parameters loaded from CryptoSettings.
 
     Three layers of adjustment:
-    1. Model — blending weight, probability haircut, empirical window
+    1. Model — vol dampening, blending weight, probability haircut,
+       empirical window, uncertainty multiplier
     2. Filtering — signal gates (OFI, trend, price-past-strike)
     3. Sizing — Kelly multiplier, max position
+
+    Vol dampening addresses the ROOT CAUSE of YES overconfidence: the IID
+    bootstrap ignores mean-reversion in 1-minute returns, inflating tail
+    probabilities.  Each resampled return is multiplied by ``vol_dampening``
+    before accumulation.  Values < 1.0 shrink returns toward zero, narrowing
+    the terminal distribution and reducing the probability of reaching
+    far-OTM strikes.
     """
 
     # Model adjustments (addresses root cause: model overconfidence)
     model_weight: float             # Blending weight (0-1), replaces global 0.7
     prob_haircut: float             # Multiply blended prob by this (1.0=no haircut)
+    vol_dampening: float            # Scale resampled returns (1.0=no change, <1.0=shrink)
+    uncertainty_multiplier: float   # Per-cell uncertainty multiplier (replaces global)
     empirical_window_minutes: int   # Empirical CDF lookback (0=use global)
 
     # Filtering gates
@@ -83,6 +93,8 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
         return CellConfig(
             model_weight=settings.cell_yes_15min_model_weight,
             prob_haircut=settings.cell_yes_15min_prob_haircut,
+            vol_dampening=settings.cell_yes_15min_vol_dampening,
+            uncertainty_multiplier=settings.cell_yes_15min_uncertainty_mult,
             empirical_window_minutes=settings.cell_yes_15min_empirical_window,
             min_edge_pct=settings.cell_yes_15min_min_edge_pct,
             require_ofi_alignment=settings.cell_yes_15min_require_ofi,
@@ -97,6 +109,8 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
         return CellConfig(
             model_weight=settings.cell_yes_daily_model_weight,
             prob_haircut=settings.cell_yes_daily_prob_haircut,
+            vol_dampening=settings.cell_yes_daily_vol_dampening,
+            uncertainty_multiplier=settings.cell_yes_daily_uncertainty_mult,
             empirical_window_minutes=settings.cell_yes_daily_empirical_window,
             min_edge_pct=settings.cell_yes_daily_min_edge_pct,
             require_ofi_alignment=False,
@@ -111,6 +125,8 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
         return CellConfig(
             model_weight=settings.cell_no_15min_model_weight,
             prob_haircut=settings.cell_no_15min_prob_haircut,
+            vol_dampening=settings.cell_no_15min_vol_dampening,
+            uncertainty_multiplier=settings.cell_no_15min_uncertainty_mult,
             empirical_window_minutes=settings.cell_no_15min_empirical_window,
             min_edge_pct=settings.cell_no_15min_min_edge_pct,
             require_ofi_alignment=False,
@@ -125,6 +141,8 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
         return CellConfig(
             model_weight=settings.cell_no_daily_model_weight,
             prob_haircut=settings.cell_no_daily_prob_haircut,
+            vol_dampening=settings.cell_no_daily_vol_dampening,
+            uncertainty_multiplier=settings.cell_no_daily_uncertainty_mult,
             empirical_window_minutes=settings.cell_no_daily_empirical_window,
             min_edge_pct=settings.cell_no_daily_min_edge_pct,
             require_ofi_alignment=False,

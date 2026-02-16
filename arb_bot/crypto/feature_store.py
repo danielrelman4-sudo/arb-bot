@@ -139,9 +139,12 @@ class FeatureStore:
         self,
         path: str = "feature_store.csv",
         min_samples_for_classifier: int = 200,
+        flush_interval: int = 50,
     ) -> None:
         self._path = Path(path)
         self._min_samples = min_samples_for_classifier
+        self._flush_interval = flush_interval
+        self._write_buffer: list[dict] = []
         self._entries: dict[str, FeatureVector] = {}  # ticker -> pending FV
         self._ensure_file()
 
@@ -164,7 +167,8 @@ class FeatureStore:
     def record_entry(self, fv: FeatureVector) -> None:
         """Record a feature vector at trade entry.
 
-        The feature vector is written to CSV with outcome=-1 (unsettled).
+        The feature vector is buffered in memory and flushed to CSV when
+        the buffer reaches ``flush_interval`` entries.
         Also stored in memory for later labeling.
         """
         if not fv.ticker:
@@ -173,13 +177,24 @@ class FeatureStore:
 
         self._entries[fv.ticker] = fv
 
-        # Append to CSV
+        # Buffer the row for periodic flush
         row = self._fv_to_row(fv)
-        with open(self._path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=ALL_COLUMNS)
-            writer.writerow(row)
+        self._write_buffer.append(row)
+
+        if len(self._write_buffer) >= self._flush_interval:
+            self.flush()
 
         LOGGER.debug("FeatureStore: recorded entry for %s", fv.ticker)
+
+    def flush(self) -> None:
+        """Write buffered entries to CSV."""
+        if not self._write_buffer:
+            return
+        with open(self._path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=ALL_COLUMNS)
+            for row in self._write_buffer:
+                writer.writerow(row)
+        self._write_buffer.clear()
 
     def record_outcome(self, ticker: str, won: bool) -> None:
         """Update the outcome label for a settled trade.

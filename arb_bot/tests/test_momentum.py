@@ -10,7 +10,12 @@ import pytest
 
 from arb_bot.crypto.config import CryptoSettings
 from arb_bot.crypto.market_scanner import CryptoMarket, CryptoMarketMeta, CryptoMarketQuote
-from arb_bot.crypto.engine import _select_momentum_contract, _compute_momentum_size
+from arb_bot.crypto.engine import (
+    _select_momentum_contract,
+    _compute_momentum_size,
+    _update_ofi_streak,
+    _check_ofi_acceleration,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -550,10 +555,126 @@ class TestMomentumIntegration:
         q_cheap = _make_quote(ticker="CHEAP", strike=68000.0, direction="above", no_buy=0.10)
         q_ok = _make_quote(ticker="OK", strike=68000.0, direction="above", no_buy=0.25)
         q_expensive = _make_quote(ticker="EXP", strike=68000.0, direction="above", no_buy=0.50)
-        
+
         # Only q_ok should be selected
         result = _select_momentum_contract([q_cheap, q_ok, q_expensive], spot, -1, self._make_settings())
         assert result is not None
         quote, side = result
         assert quote.market.ticker == "OK"
         assert side == "no"
+
+
+# ── 7. OFI confirmation streak ────────────────────────────────────
+
+
+class TestOFIStreak:
+    """Test _update_ofi_streak helper."""
+
+    def test_streak_builds_on_consistent_direction(self):
+        """Consecutive same-direction, above-alignment cycles increment streak."""
+        streaks: dict = {}
+        last_dirs: dict = {}
+        # First call: no previous direction → streak = 1 (initial)
+        s = _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        assert s == 1
+        # Second: same direction → streak = 2
+        s = _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        assert s == 2
+        # Third: same direction → streak = 3
+        s = _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        assert s == 3
+
+    def test_streak_resets_on_direction_flip(self):
+        """Flipping OFI direction resets streak to 0."""
+        streaks: dict = {}
+        last_dirs: dict = {}
+        _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        # Flip direction
+        s = _update_ofi_streak(streaks, last_dirs, "btcusdt", -1, 0.8, 0.6)
+        assert s == 0
+
+    def test_streak_resets_on_low_alignment(self):
+        """Alignment below threshold resets streak to 0."""
+        streaks: dict = {}
+        last_dirs: dict = {}
+        _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        # Low alignment
+        s = _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.3, 0.6)
+        assert s == 0
+
+    def test_streak_per_symbol_independent(self):
+        """Different symbols track independent streaks."""
+        streaks: dict = {}
+        last_dirs: dict = {}
+        _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        _update_ofi_streak(streaks, last_dirs, "btcusdt", 1, 0.8, 0.6)
+        _update_ofi_streak(streaks, last_dirs, "solusdt", -1, 0.9, 0.6)
+        assert streaks["btcusdt"] == 2
+        assert streaks["solusdt"] == 1
+
+
+# ── 8. OFI acceleration filter ──────────────────────────────────
+
+
+class TestOFIAcceleration:
+    """Test _check_ofi_acceleration helper."""
+
+    def test_accelerating_flow_returns_true(self):
+        """Short-term OFI stronger than medium → accelerating."""
+        assert _check_ofi_acceleration({30: 500.0, 120: 300.0}) is True
+
+    def test_decelerating_flow_returns_false(self):
+        """Short-term OFI weaker than medium → decelerating."""
+        assert _check_ofi_acceleration({30: 200.0, 120: 400.0}) is False
+
+    def test_negative_ofi_uses_absolute_values(self):
+        """Magnitude comparison uses abs() regardless of sign."""
+        assert _check_ofi_acceleration({30: -500.0, 120: -300.0}) is True
+        assert _check_ofi_acceleration({30: -200.0, 120: -400.0}) is False
+
+    def test_missing_30s_permissive(self):
+        """Missing 30s data → permissive (True)."""
+        assert _check_ofi_acceleration({120: 300.0}) is True
+
+    def test_missing_120s_permissive(self):
+        """Missing 120s data → permissive (True)."""
+        assert _check_ofi_acceleration({30: 300.0}) is True
+
+    def test_equal_magnitude_returns_false(self):
+        """Equal magnitude (not strictly >) → False."""
+        assert _check_ofi_acceleration({30: 300.0, 120: 300.0}) is False
+
+
+# ── 9. Max contracts cap ───────────────────────────────────────
+
+
+class TestMaxContractsCap:
+    """Test momentum_max_contracts cap in _compute_momentum_size."""
+
+    def test_max_contracts_caps_large_position(self):
+        """Large bankroll with high alignment should be capped at momentum_max_contracts."""
+        settings = CryptoSettings(
+            momentum_enabled=True,
+            momentum_kelly_fraction=0.03,
+            momentum_max_position=500.0,
+            momentum_max_contracts=100,
+        )
+        # 10000 * 0.03 * 1.0 = 300, min(300, 500, 10000) = 300
+        # 300 / 0.20 = 1500 → capped at 100
+        contracts = _compute_momentum_size(10000.0, 0.20, 1.0, settings)
+        assert contracts == 100
+
+    def test_below_cap_not_affected(self):
+        """Position below cap should not be affected."""
+        settings = CryptoSettings(
+            momentum_enabled=True,
+            momentum_kelly_fraction=0.03,
+            momentum_max_position=25.0,
+            momentum_max_contracts=100,
+        )
+        # 500 * 0.03 * 0.8 = 12, min(12, 25, 500) = 12
+        # 12 / 0.25 = 48 → below 100 cap
+        contracts = _compute_momentum_size(500.0, 0.25, 0.8, settings)
+        assert contracts == 48

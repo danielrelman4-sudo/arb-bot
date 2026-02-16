@@ -308,23 +308,36 @@ class CryptoSettings:
     momentum_max_contracts: int = 100          # Hard cap on contracts per momentum trade
 
     # ── Strategy cell parameters (model path) ──────────────────────
+    #
+    # Per-cell vol dampening addresses the ROOT CAUSE of YES overconfidence:
+    # the IID bootstrap ignores mean-reversion in 1-minute returns, inflating
+    # tail probabilities.  By shrinking each resampled return toward zero,
+    # we model the autocorrelation the bootstrap misses.
+    #
+    # With vol dampening fixing the model, we can relax the downstream
+    # corrections (model_weight, haircut, min_edge) to achievable levels.
+
     # YES/15min — microstructure-confirmed
-    cell_yes_15min_model_weight: float = 0.5         # Defer more to market (less confident)
-    cell_yes_15min_prob_haircut: float = 0.90         # 10% haircut on P(YES)
+    cell_yes_15min_model_weight: float = 0.60        # Moderate market deference
+    cell_yes_15min_prob_haircut: float = 0.95         # Light haircut (vol dampening does heavy lifting)
+    cell_yes_15min_vol_dampening: float = 0.85        # MODEL: shrink returns 15% for mean-reversion
+    cell_yes_15min_uncertainty_mult: float = 2.0      # Higher uncertainty for YES (model misspec)
     cell_yes_15min_empirical_window: int = 30         # Shorter lookback for short contracts
-    cell_yes_15min_min_edge_pct: float = 0.12         # Same as current
-    cell_yes_15min_kelly_multiplier: float = 0.5      # Half-size (unproven)
+    cell_yes_15min_min_edge_pct: float = 0.10         # Achievable edge bar
+    cell_yes_15min_kelly_multiplier: float = 0.5      # Half-size (less proven)
     cell_yes_15min_max_position: float = 25.0
     cell_yes_15min_require_ofi: bool = True           # Require OFI alignment
     cell_yes_15min_ofi_min: float = 0.3               # OFI magnitude floor
     cell_yes_15min_require_price_past_strike: bool = True  # Price already past strike
 
     # YES/daily — momentum-confirmed directional
-    cell_yes_daily_model_weight: float = 0.4          # Heavy market deference (39pp overconfident)
-    cell_yes_daily_prob_haircut: float = 0.85          # 15% haircut (biggest correction)
+    cell_yes_daily_model_weight: float = 0.55         # Moderate market deference (was 0.4 — too harsh)
+    cell_yes_daily_prob_haircut: float = 0.92          # Light haircut (was 0.85 — too harsh)
+    cell_yes_daily_vol_dampening: float = 0.75         # MODEL: strongest shrinkage (39pp overconfident)
+    cell_yes_daily_uncertainty_mult: float = 2.5       # Highest uncertainty (longest horizon, most error)
     cell_yes_daily_empirical_window: int = 0           # Use global (2hr ok for daily)
-    cell_yes_daily_min_edge_pct: float = 0.18          # Higher bar (was 0.15)
-    cell_yes_daily_kelly_multiplier: float = 0.5       # Half-size (poor track record)
+    cell_yes_daily_min_edge_pct: float = 0.12          # Achievable (was 0.18 — impossible)
+    cell_yes_daily_kelly_multiplier: float = 0.5       # Half-size (still cautious)
     cell_yes_daily_max_position: float = 25.0
     cell_yes_daily_require_trend: bool = True          # Require recent price trend toward strike
     cell_yes_daily_trend_window_minutes: float = 10.0
@@ -332,6 +345,8 @@ class CryptoSettings:
     # NO/15min — short-term vol fade
     cell_no_15min_model_weight: float = 0.7            # Keep current (no correction needed)
     cell_no_15min_prob_haircut: float = 1.0             # No haircut
+    cell_no_15min_vol_dampening: float = 1.0            # MODEL: no dampening (wider tails help NO)
+    cell_no_15min_uncertainty_mult: float = 1.5         # Standard uncertainty
     cell_no_15min_empirical_window: int = 30            # Shorter lookback for short contracts
     cell_no_15min_min_edge_pct: float = 0.10            # Lower bar (vol fade = tighter edge ok)
     cell_no_15min_kelly_multiplier: float = 0.7
@@ -340,6 +355,8 @@ class CryptoSettings:
     # NO/daily — big-move fade (proven alpha)
     cell_no_daily_model_weight: float = 0.75            # Slight boost (model underconfident here)
     cell_no_daily_prob_haircut: float = 1.0             # No haircut (model works for NO)
+    cell_no_daily_vol_dampening: float = 1.0            # MODEL: no dampening (wider tails help NO)
+    cell_no_daily_uncertainty_mult: float = 1.5         # Standard uncertainty
     cell_no_daily_empirical_window: int = 0             # Use global
     cell_no_daily_min_edge_pct: float = 0.12            # Keep current — this cell works
     cell_no_daily_kelly_multiplier: float = 1.0         # Full size — proven alpha
@@ -563,31 +580,39 @@ def load_crypto_settings() -> CryptoSettings:
         momentum_require_ofi_acceleration=_as_bool(os.getenv("ARB_CRYPTO_MOMENTUM_REQUIRE_OFI_ACCELERATION"), True),
         momentum_max_contracts=_as_int(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_CONTRACTS"), 100),
         # Strategy cell parameters
-        cell_yes_15min_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MODEL_WEIGHT"), 0.5),
-        cell_yes_15min_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_PROB_HAIRCUT"), 0.90),
+        cell_yes_15min_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MODEL_WEIGHT"), 0.60),
+        cell_yes_15min_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_PROB_HAIRCUT"), 0.95),
+        cell_yes_15min_vol_dampening=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_VOL_DAMPENING"), 0.85),
+        cell_yes_15min_uncertainty_mult=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_UNCERTAINTY_MULT"), 2.0),
         cell_yes_15min_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_EMPIRICAL_WINDOW"), 30),
-        cell_yes_15min_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MIN_EDGE_PCT"), 0.12),
+        cell_yes_15min_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MIN_EDGE_PCT"), 0.10),
         cell_yes_15min_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_KELLY_MULTIPLIER"), 0.5),
         cell_yes_15min_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MAX_POSITION"), 25.0),
         cell_yes_15min_require_ofi=_as_bool(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_REQUIRE_OFI"), True),
         cell_yes_15min_ofi_min=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_OFI_MIN"), 0.3),
         cell_yes_15min_require_price_past_strike=_as_bool(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_REQUIRE_PRICE_PAST_STRIKE"), True),
-        cell_yes_daily_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MODEL_WEIGHT"), 0.4),
-        cell_yes_daily_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_PROB_HAIRCUT"), 0.85),
+        cell_yes_daily_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MODEL_WEIGHT"), 0.55),
+        cell_yes_daily_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_PROB_HAIRCUT"), 0.92),
+        cell_yes_daily_vol_dampening=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_VOL_DAMPENING"), 0.75),
+        cell_yes_daily_uncertainty_mult=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_UNCERTAINTY_MULT"), 2.5),
         cell_yes_daily_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_EMPIRICAL_WINDOW"), 0),
-        cell_yes_daily_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MIN_EDGE_PCT"), 0.18),
+        cell_yes_daily_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MIN_EDGE_PCT"), 0.12),
         cell_yes_daily_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_KELLY_MULTIPLIER"), 0.5),
         cell_yes_daily_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MAX_POSITION"), 25.0),
         cell_yes_daily_require_trend=_as_bool(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_REQUIRE_TREND"), True),
         cell_yes_daily_trend_window_minutes=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_TREND_WINDOW_MINUTES"), 10.0),
         cell_no_15min_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_MODEL_WEIGHT"), 0.7),
         cell_no_15min_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_PROB_HAIRCUT"), 1.0),
+        cell_no_15min_vol_dampening=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_VOL_DAMPENING"), 1.0),
+        cell_no_15min_uncertainty_mult=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_UNCERTAINTY_MULT"), 1.5),
         cell_no_15min_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_EMPIRICAL_WINDOW"), 30),
         cell_no_15min_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_MIN_EDGE_PCT"), 0.10),
         cell_no_15min_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_KELLY_MULTIPLIER"), 0.7),
         cell_no_15min_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_MAX_POSITION"), 30.0),
         cell_no_daily_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_MODEL_WEIGHT"), 0.75),
         cell_no_daily_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_PROB_HAIRCUT"), 1.0),
+        cell_no_daily_vol_dampening=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_VOL_DAMPENING"), 1.0),
+        cell_no_daily_uncertainty_mult=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_UNCERTAINTY_MULT"), 1.5),
         cell_no_daily_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_EMPIRICAL_WINDOW"), 0),
         cell_no_daily_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_MIN_EDGE_PCT"), 0.12),
         cell_no_daily_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_KELLY_MULTIPLIER"), 1.0),
