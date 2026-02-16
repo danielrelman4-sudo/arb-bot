@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -504,7 +505,7 @@ async def run_paper_test(
         # ── Regime-conditional improvements ──────────────────────────
         # Tier 1: Regime Kelly multiplier
         regime_sizing_enabled=True,
-        regime_kelly_mean_reverting=1.0,
+        regime_kelly_mean_reverting=1.5,
         regime_kelly_trending_up=0.4,
         regime_kelly_trending_down=0.5,
         regime_kelly_high_vol=0.0,
@@ -524,11 +525,14 @@ async def run_paper_test(
         regime_empirical_window_high_vol=30,
         regime_empirical_window_trending=60,
         # Tier 2: Mean-reverting size boost
-        regime_kelly_cap_boost_mean_reverting=1.25,
+        regime_kelly_cap_boost_mean_reverting=1.5,
         # Tier 3: Conditional trend drift
         regime_conditional_drift=True,
         # Tier 3: Transition caution zone
         regime_transition_sizing_multiplier=0.3,
+        # ── Cycle recorder ──────────────────────────────────────────
+        cycle_recorder_enabled=True,
+        cycle_recorder_db_dir="arb_bot/output/recordings",
     )
 
     engine = CryptoEngine(settings)
@@ -569,7 +573,22 @@ async def run_paper_test(
     print(f"  Classifier:     {'ON' if settings.classifier_enabled else 'OFF (collecting data)'}")
     print(f"  Volume clock:   ON (short=300s, baseline=4hr)")
     print(f"  Hawkes jumps:   ON (α=5.0, β=0.00115, threshold=3.0σ)")
+    if settings.cycle_recorder_enabled:
+        rec_db_path = os.path.join(settings.cycle_recorder_db_dir, f"session_{int(time.time())}.db")
+        print(f"  Recorder:       ON → {rec_db_path}")
+    else:
+        rec_db_path = None
+        print(f"  Recorder:       OFF")
     print(f"{'='*70}\n")
+
+    # Wire up cycle recorder if enabled
+    cycle_recorder = None
+    if settings.cycle_recorder_enabled and rec_db_path:
+        os.makedirs(settings.cycle_recorder_db_dir, exist_ok=True)
+        from arb_bot.crypto.cycle_recorder import CycleRecorder
+        cycle_recorder = CycleRecorder(rec_db_path, settings)
+        cycle_recorder.open()
+        engine.set_cycle_recorder(cycle_recorder)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
         # Wire up HTTP client for real Kalshi settlement
@@ -858,8 +877,11 @@ async def run_paper_test(
         if unsettled_count:
             print(f"  ⚠ {unsettled_count} positions remain unsettled (markets still open)")
 
-    # Close cycle logger
+    # Close cycle logger and recorder
     logger.close()
+    if cycle_recorder is not None:
+        cycle_recorder.close()
+        print(f"  Cycle recorder saved: {rec_db_path}")
 
     # Final summary
     print(f"\n{'='*70}")

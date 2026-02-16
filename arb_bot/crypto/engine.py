@@ -41,6 +41,7 @@ from arb_bot.crypto.market_scanner import (
 from arb_bot.crypto.price_feed import PriceFeed, PriceTick
 from arb_bot.crypto.price_model import PriceModel, ProbabilityEstimate
 from arb_bot.crypto.regime_detector import RegimeDetector, RegimeSnapshot, MarketRegime
+from arb_bot.crypto.cycle_recorder import FilterResult
 from arb_bot.crypto.staleness_detector import StalenessDetector
 
 LOGGER = logging.getLogger(__name__)
@@ -164,6 +165,9 @@ class CryptoEngine:
 
         # Cycle logger (optional, for offline calibration)
         self._cycle_logger: Optional[CycleLogger] = None
+
+        # Cycle recorder (optional, for offline replay / Monte Carlo sim)
+        self._cycle_recorder = None
 
         # OFI calibration cache (S1/S3: avoid recalibrating every quote)
         from arb_bot.crypto.ofi_calibrator import OFICalibrationResult
@@ -682,6 +686,10 @@ class CryptoEngine:
         """Set a cycle logger for per-cycle data recording."""
         self._cycle_logger = logger
 
+    def set_cycle_recorder(self, recorder) -> None:
+        """Set a cycle recorder for full-state offline replay."""
+        self._cycle_recorder = recorder
+
     def _log_cycle(self, edges_count: int) -> None:
         """Log per-cycle data to CSV if a logger is configured."""
         if self._cycle_logger is None:
@@ -746,6 +754,7 @@ class CryptoEngine:
         """Single scan → model → detect → size → execute cycle."""
         self._cycle_count += 1
         cycle_start = time.monotonic()
+        _rec_cycle_start = time.time()
 
         # 0. Update Hawkes intensity from recent returns
         self._update_hawkes_from_returns()
@@ -785,8 +794,34 @@ class CryptoEngine:
         # 2b. Classify market regime
         self._update_regime()
 
+        # ── Cycle recorder Hook 1: market snapshots ──
+        _rec_cycle_id = None
+        _filter_results: Dict[str, FilterResult] = {}
+        if self._cycle_recorder is not None:
+            _rec_cycle_id = self._cycle_recorder.begin_cycle(self._cycle_count, _rec_cycle_start)
+            _rec_spots: Dict[str, float] = {}
+            _rec_vpins: Dict[str, tuple] = {}
+            _rec_ofis: Dict[str, Dict[int, float]] = {}
+            _rec_returns: Dict[str, list] = {}
+            for sym in self._settings.price_feed_symbols:
+                _rec_spots[sym] = self._price_feed.get_current_price(sym) or 0.0
+                if self._settings.vpin_enabled and sym in self._vpin_calculators:
+                    calc = self._vpin_calculators[sym]
+                    _rec_vpins[sym] = (calc.get_vpin() or 0.0, calc.get_signed_vpin() or 0.0, calc.get_vpin_trend() or 0.0)
+                if self._settings.ofi_enabled:
+                    _rec_ofis[sym] = self._price_feed.get_ofi_multiscale(sym, [30, 60, 120, 300])
+                _rec_returns[sym] = list(self._price_feed.get_returns(sym, interval_seconds=60, window_minutes=self._settings.mc_vol_window_minutes))
+            self._cycle_recorder.record_market_snapshots(
+                _rec_cycle_id, market_quotes, _rec_spots, _rec_vpins, _rec_ofis, _rec_returns,
+            )
+
         # 3. Detect edges
         edges = self._edge_detector.detect_edges(market_quotes, model_probs)
+
+        # ── Cycle recorder Hook 2: snapshot raw edges ──
+        all_raw_edges = list(edges)
+        if _rec_cycle_id is not None:
+            _filter_results = {e.market.ticker: FilterResult() for e in edges}
 
         # 3-regime. Regime min edge filter
         if self._settings.regime_min_edge_enabled and self._current_regime is not None:
@@ -799,6 +834,7 @@ class CryptoEngine:
             }
             regime_min = _regime_min_edges.get(regime, 0.0)
             if regime_min > 0:
+                pre_filter_tickers = {e.market.ticker for e in edges}
                 pre_count = len(edges)
                 edges = [e for e in edges if e.edge_cents >= regime_min]
                 if len(edges) < pre_count:
@@ -806,9 +842,21 @@ class CryptoEngine:
                         "CryptoEngine: regime min_edge filter (%s, min=%.2f) removed %d/%d edges",
                         regime, regime_min, pre_count - len(edges), pre_count,
                     )
+                # ── Cycle recorder Hook 3: regime filter tracking ──
+                if _rec_cycle_id is not None:
+                    post_filter_tickers = {e.market.ticker for e in edges}
+                    for ticker in pre_filter_tickers - post_filter_tickers:
+                        if ticker in _filter_results:
+                            _filter_results[ticker].passed_regime_min_edge = False
+                            if _filter_results[ticker].reject_reason is None:
+                                _filter_results[ticker].reject_reason = "regime_min_edge"
+                    for ticker in post_filter_tickers:
+                        if ticker in _filter_results:
+                            _filter_results[ticker].passed_regime_min_edge = True
 
         # 3-zscore. Z-score reachability post-edge filter
         if self._settings.zscore_filter_enabled:
+            pre_zscore_tickers = {e.market.ticker for e in edges}
             zscore_filtered = []
             for edge in edges:
                 underlying = edge.market.meta.underlying
@@ -840,6 +888,9 @@ class CryptoEngine:
                 if local_vol <= 0:
                     local_vol = 0.50
                 z = self._compute_zscore(spot, z_strike, local_vol, edge.time_to_expiry_minutes)
+                # ── Cycle recorder: capture zscore value ──
+                if _rec_cycle_id is not None and edge.market.ticker in _filter_results:
+                    _filter_results[edge.market.ticker].zscore_value = z
                 if z > self._settings.zscore_max:
                     LOGGER.info(
                         "CryptoEngine: Z-score reject edge %s: Z=%.2f > %.2f",
@@ -848,12 +899,24 @@ class CryptoEngine:
                     continue
                 zscore_filtered.append(edge)
             edges = zscore_filtered
+            # ── Cycle recorder Hook 3: zscore filter tracking ──
+            if _rec_cycle_id is not None:
+                post_zscore_tickers = {e.market.ticker for e in edges}
+                for ticker in pre_zscore_tickers - post_zscore_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_zscore = False
+                        if _filter_results[ticker].reject_reason is None:
+                            _filter_results[ticker].reject_reason = "zscore"
+                for ticker in post_zscore_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_zscore = True
 
         # 3-ofi. Counter-trend OFI filter: skip trades opposing the trend in trending regimes
         if (self._settings.regime_skip_counter_trend
             and self._current_regime is not None
             and self._current_regime.is_trending
             and self._current_regime.confidence >= self._settings.regime_skip_counter_trend_min_conf):
+            pre_ct_tickers = {e.market.ticker for e in edges}
             trend_dir = self._current_regime.trend_direction  # 1=up, -1=down
             ofi_filtered = []
             for edge in edges:
@@ -871,6 +934,23 @@ class CryptoEngine:
                     continue
                 ofi_filtered.append(edge)
             edges = ofi_filtered
+            # ── Cycle recorder Hook 3: counter-trend filter tracking ──
+            if _rec_cycle_id is not None:
+                post_ct_tickers = {e.market.ticker for e in edges}
+                for ticker in pre_ct_tickers - post_ct_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_counter_trend = False
+                        if _filter_results[ticker].reject_reason is None:
+                            _filter_results[ticker].reject_reason = "counter_trend"
+                for ticker in post_ct_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_counter_trend = True
+
+        # ── Cycle recorder: mark survivors ──
+        if _rec_cycle_id is not None:
+            for e in edges:
+                if e.market.ticker in _filter_results:
+                    _filter_results[e.market.ticker].survived_all = True
 
         # 3a. Compute staleness scores for detected edges
         if self._staleness_detector is not None:
@@ -913,6 +993,18 @@ class CryptoEngine:
                     )
             edges = scored_edges
 
+        # ── Cycle recorder Hook 3b: record edges with filter results ──
+        _rec_edge_id_map: Dict[str, int] = {}
+        if self._cycle_recorder is not None and _rec_cycle_id is not None:
+            _rec_edge_id_map = self._cycle_recorder.record_edges(
+                _rec_cycle_id, all_raw_edges, _filter_results,
+            )
+
+        # ── Set temporary attrs for trade recording in _execute_paper_trade ──
+        self._rec_cycle_id_current = _rec_cycle_id
+        self._rec_edge_id_map = _rec_edge_id_map
+        self._rec_filter_results_current = _filter_results
+
         # 4. Size and execute edges
         trades_opened = 0
         for edge in edges:
@@ -949,6 +1041,27 @@ class CryptoEngine:
             self._session_pnl,
             elapsed_ms,
         )
+
+        # ── Cycle recorder Hook 5: end cycle ──
+        if self._cycle_recorder is not None and _rec_cycle_id is not None:
+            _rec_elapsed_ms = (time.time() - _rec_cycle_start) * 1000
+            self._cycle_recorder.end_cycle(
+                _rec_cycle_id,
+                elapsed_ms=_rec_elapsed_ms,
+                regime=self._current_regime.regime if self._current_regime else None,
+                regime_confidence=self._current_regime.confidence if self._current_regime else None,
+                regime_is_transitioning=(
+                    self._current_regime.is_transitioning
+                    if self._current_regime and hasattr(self._current_regime, 'is_transitioning')
+                    else None
+                ),
+                num_quotes=len(market_quotes),
+                num_edges_raw=len(all_raw_edges),
+                num_edges_final=len(edges),
+                num_trades=trades_opened,
+                session_pnl=self._session_pnl,
+                bankroll=self._bankroll,
+            )
 
     # ── Market data ───────────────────────────────────────────────
 
@@ -1010,6 +1123,7 @@ class CryptoEngine:
     ) -> list[CryptoEdge]:
         """Run a single cycle with provided quotes. For testing."""
         self._cycle_count += 1
+        _rec_cycle_start = time.time()
 
         # Update Hawkes intensity from recent returns
         self._update_hawkes_from_returns()
@@ -1039,7 +1153,33 @@ class CryptoEngine:
         # Classify market regime
         self._update_regime()
 
+        # ── Cycle recorder Hook 1: market snapshots ──
+        _rec_cycle_id = None
+        _filter_results: Dict[str, FilterResult] = {}
+        if self._cycle_recorder is not None:
+            _rec_cycle_id = self._cycle_recorder.begin_cycle(self._cycle_count, _rec_cycle_start)
+            _rec_spots: Dict[str, float] = {}
+            _rec_vpins: Dict[str, tuple] = {}
+            _rec_ofis: Dict[str, Dict[int, float]] = {}
+            _rec_returns: Dict[str, list] = {}
+            for sym in self._settings.price_feed_symbols:
+                _rec_spots[sym] = self._price_feed.get_current_price(sym) or 0.0
+                if self._settings.vpin_enabled and sym in self._vpin_calculators:
+                    calc = self._vpin_calculators[sym]
+                    _rec_vpins[sym] = (calc.get_vpin() or 0.0, calc.get_signed_vpin() or 0.0, calc.get_vpin_trend() or 0.0)
+                if self._settings.ofi_enabled:
+                    _rec_ofis[sym] = self._price_feed.get_ofi_multiscale(sym, [30, 60, 120, 300])
+                _rec_returns[sym] = list(self._price_feed.get_returns(sym, interval_seconds=60, window_minutes=self._settings.mc_vol_window_minutes))
+            self._cycle_recorder.record_market_snapshots(
+                _rec_cycle_id, quotes, _rec_spots, _rec_vpins, _rec_ofis, _rec_returns,
+            )
+
         edges = self._edge_detector.detect_edges(quotes, model_probs)
+
+        # ── Cycle recorder Hook 2: snapshot raw edges ──
+        all_raw_edges = list(edges)
+        if _rec_cycle_id is not None:
+            _filter_results = {e.market.ticker: FilterResult() for e in edges}
 
         # Regime min edge filter
         if self._settings.regime_min_edge_enabled and self._current_regime is not None:
@@ -1052,6 +1192,7 @@ class CryptoEngine:
             }
             regime_min = _regime_min_edges.get(regime, 0.0)
             if regime_min > 0:
+                pre_filter_tickers = {e.market.ticker for e in edges}
                 pre_count = len(edges)
                 edges = [e for e in edges if e.edge_cents >= regime_min]
                 if len(edges) < pre_count:
@@ -1059,9 +1200,21 @@ class CryptoEngine:
                         "CryptoEngine: regime min_edge filter (%s, min=%.2f) removed %d/%d edges",
                         regime, regime_min, pre_count - len(edges), pre_count,
                     )
+                # ── Cycle recorder Hook 3: regime filter tracking ──
+                if _rec_cycle_id is not None:
+                    post_filter_tickers = {e.market.ticker for e in edges}
+                    for ticker in pre_filter_tickers - post_filter_tickers:
+                        if ticker in _filter_results:
+                            _filter_results[ticker].passed_regime_min_edge = False
+                            if _filter_results[ticker].reject_reason is None:
+                                _filter_results[ticker].reject_reason = "regime_min_edge"
+                    for ticker in post_filter_tickers:
+                        if ticker in _filter_results:
+                            _filter_results[ticker].passed_regime_min_edge = True
 
         # Z-score reachability post-edge filter
         if self._settings.zscore_filter_enabled:
+            pre_zscore_tickers = {e.market.ticker for e in edges}
             zscore_filtered = []
             for edge in edges:
                 underlying = edge.market.meta.underlying
@@ -1093,6 +1246,9 @@ class CryptoEngine:
                 if local_vol <= 0:
                     local_vol = 0.50
                 z = self._compute_zscore(spot, z_strike, local_vol, edge.time_to_expiry_minutes)
+                # ── Cycle recorder: capture zscore value ──
+                if _rec_cycle_id is not None and edge.market.ticker in _filter_results:
+                    _filter_results[edge.market.ticker].zscore_value = z
                 if z > self._settings.zscore_max:
                     LOGGER.info(
                         "CryptoEngine: Z-score reject edge %s: Z=%.2f > %.2f",
@@ -1101,12 +1257,24 @@ class CryptoEngine:
                     continue
                 zscore_filtered.append(edge)
             edges = zscore_filtered
+            # ── Cycle recorder Hook 3: zscore filter tracking ──
+            if _rec_cycle_id is not None:
+                post_zscore_tickers = {e.market.ticker for e in edges}
+                for ticker in pre_zscore_tickers - post_zscore_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_zscore = False
+                        if _filter_results[ticker].reject_reason is None:
+                            _filter_results[ticker].reject_reason = "zscore"
+                for ticker in post_zscore_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_zscore = True
 
         # Counter-trend OFI filter: skip trades opposing the trend in trending regimes
         if (self._settings.regime_skip_counter_trend
             and self._current_regime is not None
             and self._current_regime.is_trending
             and self._current_regime.confidence >= self._settings.regime_skip_counter_trend_min_conf):
+            pre_ct_tickers = {e.market.ticker for e in edges}
             trend_dir = self._current_regime.trend_direction  # 1=up, -1=down
             ofi_filtered = []
             for edge in edges:
@@ -1124,6 +1292,23 @@ class CryptoEngine:
                     continue
                 ofi_filtered.append(edge)
             edges = ofi_filtered
+            # ── Cycle recorder Hook 3: counter-trend filter tracking ──
+            if _rec_cycle_id is not None:
+                post_ct_tickers = {e.market.ticker for e in edges}
+                for ticker in pre_ct_tickers - post_ct_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_counter_trend = False
+                        if _filter_results[ticker].reject_reason is None:
+                            _filter_results[ticker].reject_reason = "counter_trend"
+                for ticker in post_ct_tickers:
+                    if ticker in _filter_results:
+                        _filter_results[ticker].passed_counter_trend = True
+
+        # ── Cycle recorder: mark survivors ──
+        if _rec_cycle_id is not None:
+            for e in edges:
+                if e.market.ticker in _filter_results:
+                    _filter_results[e.market.ticker].survived_all = True
 
         # Compute staleness scores for detected edges
         if self._staleness_detector is not None:
@@ -1166,6 +1351,18 @@ class CryptoEngine:
                     )
             edges = scored_edges
 
+        # ── Cycle recorder Hook 3b: record edges with filter results ──
+        _rec_edge_id_map: Dict[str, int] = {}
+        if self._cycle_recorder is not None and _rec_cycle_id is not None:
+            _rec_edge_id_map = self._cycle_recorder.record_edges(
+                _rec_cycle_id, all_raw_edges, _filter_results,
+            )
+
+        # ── Set temporary attrs for trade recording in _execute_paper_trade ──
+        self._rec_cycle_id_current = _rec_cycle_id
+        self._rec_edge_id_map = _rec_edge_id_map
+        self._rec_filter_results_current = _filter_results
+
         trades_opened = 0
         for edge in edges:
             if len(self._positions) >= self._settings.max_concurrent_positions:
@@ -1185,6 +1382,28 @@ class CryptoEngine:
 
         await self._settle_expired_positions()
         self._log_cycle(len(edges))
+
+        # ── Cycle recorder Hook 5: end cycle ──
+        if self._cycle_recorder is not None and _rec_cycle_id is not None:
+            _rec_elapsed_ms = (time.time() - _rec_cycle_start) * 1000
+            self._cycle_recorder.end_cycle(
+                _rec_cycle_id,
+                elapsed_ms=_rec_elapsed_ms,
+                regime=self._current_regime.regime if self._current_regime else None,
+                regime_confidence=self._current_regime.confidence if self._current_regime else None,
+                regime_is_transitioning=(
+                    self._current_regime.is_transitioning
+                    if self._current_regime and hasattr(self._current_regime, 'is_transitioning')
+                    else None
+                ),
+                num_quotes=len(quotes),
+                num_edges_raw=len(all_raw_edges),
+                num_edges_final=len(edges),
+                num_trades=trades_opened,
+                session_pnl=self._session_pnl,
+                bankroll=self._bankroll,
+            )
+
         return edges
 
     # ── Regime detection ─────────────────────────────────────────
@@ -2171,6 +2390,22 @@ class CryptoEngine:
             edge.time_to_expiry_minutes,
         )
 
+        # ── Cycle recorder Hook 4: record trade ──
+        if (self._cycle_recorder is not None
+                and hasattr(self, '_rec_cycle_id_current')
+                and self._rec_cycle_id_current is not None):
+            edge_id = self._rec_edge_id_map.get(edge.market.ticker)
+            if edge_id is not None:
+                self._cycle_recorder.record_trade(
+                    self._rec_cycle_id_current, edge_id, edge.market.ticker,
+                    edge.side, contracts, entry_price,
+                )
+            if (hasattr(self, '_rec_filter_results_current')
+                    and edge.market.ticker in self._rec_filter_results_current):
+                fr = self._rec_filter_results_current[edge.market.ticker]
+                fr.contracts_sized = contracts
+                fr.was_traded = True
+
     async def _settle_expired_positions(self) -> None:
         """Settle positions whose markets have expired.
 
@@ -2216,6 +2451,11 @@ class CryptoEngine:
                     pos.side.upper(), ticker, pos.contracts,
                     pos.entry_price * 100, pnl,
                 )
+                # ── Cycle recorder: settlement hook (simulated) ──
+                if self._cycle_recorder is not None:
+                    self._cycle_recorder.record_settlement(
+                        ticker, "simulated", pnl, time.time(),
+                    )
                 continue
 
             # Try real settlement from Kalshi API
@@ -2271,6 +2511,11 @@ class CryptoEngine:
                     pos.entry_price * 100, pnl,
                     "YES" if settled_yes else "NO",
                 )
+                # ── Cycle recorder: settlement hook (real) ──
+                if self._cycle_recorder is not None:
+                    self._cycle_recorder.record_settlement(
+                        ticker, "yes" if settled_yes else "no", pnl, time.time(),
+                    )
             else:
                 # Not yet settled — check grace period
                 first_check = self._pending_settlement.get(ticker)
