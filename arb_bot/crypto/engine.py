@@ -2250,6 +2250,15 @@ class CryptoEngine:
                 emp_returns = self._get_regime_adjusted_empirical_returns(binance_sym)
                 interval_sec = self._settings.empirical_return_interval_seconds
                 horizon_steps = max(1, round(horizon * 60 / interval_sec))
+                if len(emp_returns) < self._settings.empirical_min_samples:
+                    LOGGER.info(
+                        "CryptoEngine: empirical fallback for %s: "
+                        "only %d returns (need %d), regime=%s",
+                        ticker, len(emp_returns),
+                        self._settings.empirical_min_samples,
+                        getattr(self._current_regime, 'regime', 'none')
+                        if self._current_regime else 'none',
+                    )
 
                 if direction == "above" and strike is not None:
                     emp_prob = self._price_model.probability_above_empirical(
