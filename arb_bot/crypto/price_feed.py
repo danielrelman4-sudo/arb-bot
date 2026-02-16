@@ -21,6 +21,14 @@ LOGGER = logging.getLogger(__name__)
 # Maximum ticks to keep in memory per symbol (60 min at ~1 tick/sec = 3600).
 _MAX_TICK_HISTORY = 7200
 
+# Binance symbol <-> OKX spot instrument mapping
+_BINANCE_TO_OKX_SPOT: dict[str, str] = {
+    "btcusdt": "BTC-USDT",
+    "ethusdt": "ETH-USDT",
+    "solusdt": "SOL-USDT",
+}
+_OKX_TO_BINANCE_SPOT: dict[str, str] = {v: k for k, v in _BINANCE_TO_OKX_SPOT.items()}
+
 
 @dataclass(frozen=True)
 class PriceTick:
@@ -71,6 +79,7 @@ class PriceFeed:
         self._ws: Any = None  # websockets connection
         self._running = False
         self._ws_task: Optional[asyncio.Task[None]] = None
+        self._vpin_calculators: Dict[str, Any] = {}  # symbol -> VPINCalculator
 
     # ── public API ─────────────────────────────────────────────────
 
@@ -201,6 +210,82 @@ class PriceFeed:
         if total <= 0:
             return 0.0
         return (buy_vol - sell_vol) / total
+
+    def get_ofi_multiscale(
+        self,
+        symbol: str,
+        windows: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Order flow imbalance computed at multiple time windows.
+
+        Parameters
+        ----------
+        symbol:
+            Lowercase symbol (e.g. ``"btcusdt"``).
+        windows:
+            List of window durations in seconds. Defaults to
+            ``[30, 60, 120, 300]``.
+
+        Returns
+        -------
+        dict mapping window_seconds -> OFI value in [-1, 1].
+        """
+        if windows is None:
+            windows = [30, 60, 120, 300]
+        return {w: self.get_ofi(symbol, window_seconds=w) for w in windows}
+
+    def get_aggressor_ratio(
+        self,
+        symbol: str,
+        window_seconds: int = 300,
+    ) -> float:
+        """Fraction of volume that was buy-initiated.
+
+        Returns 0.5 if no data.
+        """
+        buy_vol, sell_vol = self.get_buy_sell_volume(symbol, window_seconds)
+        total = buy_vol + sell_vol
+        if total <= 0:
+            return 0.5
+        return buy_vol / total
+
+    def get_volume_acceleration(
+        self,
+        symbol: str,
+        short_window: int = 30,
+        long_window: int = 300,
+    ) -> float:
+        """Ratio of recent volume rate to long-term volume rate.
+
+        > 1.0 means recent activity is above normal, < 1.0 means below.
+        Returns 1.0 if insufficient data.
+        """
+        sym = symbol.lower()
+        ticks = self._ticks.get(sym)
+        if not ticks:
+            return 1.0
+
+        now = time.time()
+        short_cutoff = now - short_window
+        long_cutoff = now - long_window
+
+        short_vol = 0.0
+        long_vol = 0.0
+        for t in ticks:
+            if t.timestamp >= long_cutoff:
+                long_vol += t.volume
+            if t.timestamp >= short_cutoff:
+                short_vol += t.volume
+
+        if long_vol <= 0 or long_window <= 0 or short_window <= 0:
+            return 1.0
+
+        short_rate = short_vol / short_window
+        long_rate = long_vol / long_window
+
+        if long_rate <= 0:
+            return 1.0
+        return short_rate / long_rate
 
     def get_volume_flow_rate(self, symbol: str, window_seconds: int = 300) -> float:
         """Average volume per minute over the last window_seconds.
@@ -393,6 +478,20 @@ class PriceFeed:
             is_buy = not tick.is_buyer_maker
             dq_bs = self._buy_sells.setdefault(sym, deque(maxlen=_MAX_TICK_HISTORY))
             dq_bs.append((tick.timestamp, tick.volume, is_buy))
+            # Forward to VPIN calculator if registered
+            vpin_calc = self._vpin_calculators.get(sym)
+            if vpin_calc is not None:
+                vpin_calc.process_trade(
+                    tick.price, tick.volume, is_buy, tick.timestamp,
+                )
+
+    def register_vpin(self, symbol: str, calculator: Any) -> None:
+        """Register a VPINCalculator for the given symbol."""
+        self._vpin_calculators[symbol.lower()] = calculator
+
+    def get_vpin_calculator(self, symbol: str) -> Any:
+        """Get the VPINCalculator for the given symbol, or None."""
+        return self._vpin_calculators.get(symbol.lower())
 
     # ── aggTrade WebSocket ──────────────────────────────────────────
 
@@ -414,6 +513,51 @@ class PriceFeed:
             volume=qty, is_buyer_maker=is_buyer_maker,
         )
         self.inject_tick(tick)
+
+    def _handle_okx_trade_message(self, msg: dict) -> None:
+        """Parse an OKX trade WebSocket message and inject as tick.
+
+        Expected format::
+
+            {
+                "data": [
+                    {
+                        "instId": "BTC-USDT",
+                        "px": "97500.00",
+                        "sz": "0.15",
+                        "ts": "1700000000000",
+                        "side": "buy"   // or "sell"
+                    }
+                ]
+            }
+        """
+        data_list = msg.get("data")
+        if not data_list:
+            return
+        for entry in data_list:
+            try:
+                inst_id = entry.get("instId", "")
+                binance_sym = _OKX_TO_BINANCE_SPOT.get(inst_id)
+                if not binance_sym or binance_sym not in self._symbols_set:
+                    continue
+                price = float(entry["px"])
+                qty = float(entry["sz"])
+                ts = float(entry["ts"]) / 1000.0  # ms -> sec
+                side = entry.get("side", "").lower()
+                # OKX side: "buy" = taker bought -> is_buyer_maker=False
+                #           "sell" = taker sold -> is_buyer_maker=True
+                is_buyer_maker = side == "sell"
+            except (KeyError, ValueError, TypeError):
+                continue
+
+            tick = PriceTick(
+                symbol=binance_sym,
+                price=price,
+                timestamp=ts,
+                volume=qty,
+                is_buyer_maker=is_buyer_maker,
+            )
+            self.inject_tick(tick)
 
     async def connect_agg_trades_ws(self) -> None:
         """Connect to Binance aggTrade WebSocket stream for all symbols.

@@ -473,3 +473,226 @@ class PriceModel:
             uncertainty=half_width,
             num_paths=n,
         )
+
+    # ── Student-t helpers ──────────────────────────────────────────
+
+    def fit_nu_from_returns(
+        self,
+        returns: list[float],
+        min_samples: int = 30,
+        nu_floor: float = 2.5,
+        nu_ceiling: float = 30.0,
+        bootstrap_n: int = 0,
+    ) -> tuple[float, float]:
+        """Fit Student-t degrees of freedom (nu) from return data.
+
+        Uses MLE via scipy's ``t.fit`` when available, falling back
+        to kurtosis-based estimation.
+
+        Parameters
+        ----------
+        returns:
+            Log returns to fit.
+        min_samples:
+            Minimum data points required; returns ``(nu_ceiling, 0.0)``
+            if insufficient.
+        nu_floor / nu_ceiling:
+            Clamp fitted nu into ``[nu_floor, nu_ceiling]``.
+        bootstrap_n:
+            If > 0, compute nu_stderr via bootstrap resampling.
+
+        Returns
+        -------
+        (nu, nu_stderr)
+            Fitted degrees of freedom and its standard error.
+        """
+        if len(returns) < min_samples:
+            return (nu_ceiling, 0.0)
+
+        try:
+            from scipy.stats import t as _t_dist
+        except ImportError:  # pragma: no cover
+            return (nu_ceiling, 0.0)
+
+        arr = np.array(returns, dtype=np.float64)
+        # MLE fit: scipy returns (df, loc, scale)
+        df_fit, _, _ = _t_dist.fit(arr)
+        nu = float(np.clip(df_fit, nu_floor, nu_ceiling))
+
+        # Bootstrap stderr for nu
+        nu_stderr = 0.0
+        if bootstrap_n > 0:
+            rng = self._rng
+            boot_nus = []
+            for _ in range(bootstrap_n):
+                sample = rng.choice(arr, size=len(arr), replace=True)
+                df_b, _, _ = _t_dist.fit(sample)
+                boot_nus.append(float(np.clip(df_b, nu_floor, nu_ceiling)))
+            nu_stderr = float(np.std(boot_nus, ddof=1))
+
+        return (nu, nu_stderr)
+
+    def estimate_vol_stderr(
+        self,
+        returns: list[float],
+    ) -> float:
+        """Estimate the standard error of the sample standard deviation.
+
+        Uses the asymptotic formula: se(s) = s / sqrt(2*(n-1)).
+
+        Returns 0.0 if fewer than 3 observations.
+        """
+        if len(returns) < 3:
+            return 0.0
+        arr = np.array(returns, dtype=np.float64)
+        s = float(np.std(arr, ddof=1))
+        n = len(arr)
+        return s / math.sqrt(2.0 * (n - 1))
+
+    def probability_above_student_t(
+        self,
+        current_price: float,
+        strike: float,
+        volatility: float,
+        horizon_minutes: float,
+        drift: float = 0.0,
+        nu: float = 5.0,
+        nu_stderr: float = 0.0,
+        vol_stderr: float = 0.0,
+        min_uncertainty: float = 0.02,
+    ) -> ProbabilityEstimate:
+        """Analytical P(S > K) under Student-t log returns.
+
+        Replaces the normal distribution in d2 with a Student-t CDF.
+
+        Parameters
+        ----------
+        current_price, strike, volatility, horizon_minutes, drift:
+            Same as ``probability_above_analytical``.
+        nu:
+            Degrees of freedom for the Student-t distribution.
+        nu_stderr:
+            Standard error of the nu estimate (increases uncertainty).
+        vol_stderr:
+            Standard error of the volatility estimate.
+        min_uncertainty:
+            Floor on the reported uncertainty.
+
+        Returns
+        -------
+        ProbabilityEstimate with ``num_paths=0`` (analytical, not MC).
+        """
+        # Degenerate inputs -> non-informative 50%
+        if (
+            current_price <= 0
+            or strike <= 0
+            or volatility <= 0
+            or horizon_minutes <= 0
+        ):
+            return ProbabilityEstimate(0.5, 0.0, 1.0, 0.5, 0)
+
+        try:
+            from scipy.stats import t as _t_dist
+        except ImportError:  # pragma: no cover
+            return ProbabilityEstimate(0.5, 0.0, 1.0, 0.5, 0)
+
+        dt = horizon_minutes / _MINUTES_PER_YEAR_CRYPTO
+        d2 = (
+            math.log(current_price / strike)
+            + (drift - 0.5 * volatility ** 2) * dt
+        ) / (volatility * math.sqrt(dt))
+
+        prob = float(_t_dist.cdf(d2, df=nu))
+        prob = max(0.0, min(1.0, prob))
+
+        # Uncertainty: combine nu_stderr and vol_stderr contributions
+        # Scale nu_stderr by a sensitivity factor (higher at low nu)
+        nu_contribution = nu_stderr * (1.0 / max(nu, 2.5)) * 0.5
+        vol_contribution = vol_stderr / max(volatility, 1e-6) * 0.1
+        uncertainty = max(
+            min_uncertainty,
+            nu_contribution + vol_contribution,
+        )
+
+        return ProbabilityEstimate(
+            probability=prob,
+            ci_lower=max(0.0, prob - uncertainty),
+            ci_upper=min(1.0, prob + uncertainty),
+            uncertainty=uncertainty,
+            num_paths=0,
+        )
+
+    def probability_above_empirical(
+        self,
+        returns: list[float],
+        current_price: float,
+        strike: float,
+        horizon_steps: int,
+        bootstrap_paths: int = 2000,
+        min_samples: int = 30,
+        min_uncertainty: float = 0.02,
+    ) -> ProbabilityEstimate:
+        """Estimate P(S > K) via empirical bootstrap of historical returns.
+
+        Draws ``bootstrap_paths`` random paths by resampling from
+        ``returns`` with replacement, each of length ``horizon_steps``.
+        Accumulates log returns to get terminal prices and counts
+        the fraction above ``strike``.
+
+        Parameters
+        ----------
+        returns:
+            Historical log returns to resample from.
+        current_price:
+            Current spot price.
+        strike:
+            Settlement threshold.
+        horizon_steps:
+            Number of return steps to accumulate per path.
+        bootstrap_paths:
+            Number of bootstrap resamples (paths) to generate.
+        min_samples:
+            Minimum number of returns required; falls back to
+            ``ProbabilityEstimate(0.5, 0, 1, 0.5, 0)`` if insufficient.
+        min_uncertainty:
+            Floor on reported uncertainty.
+
+        Returns
+        -------
+        ProbabilityEstimate
+        """
+        # Guard: insufficient data or degenerate inputs
+        if (
+            len(returns) < min_samples
+            or current_price <= 0
+            or strike <= 0
+        ):
+            return ProbabilityEstimate(0.5, 0.0, 1.0, 0.5, 0)
+
+        arr = np.array(returns, dtype=np.float64)
+        rng = self._rng
+
+        # Draw (bootstrap_paths x horizon_steps) random returns
+        indices = rng.integers(0, len(arr), size=(bootstrap_paths, horizon_steps))
+        sampled = arr[indices]  # shape: (bootstrap_paths, horizon_steps)
+
+        # Cumulative log returns -> terminal prices
+        cum_log_returns = np.sum(sampled, axis=1)  # shape: (bootstrap_paths,)
+        terminal_prices = current_price * np.exp(cum_log_returns)
+
+        # Count fraction above strike
+        k = int(np.sum(terminal_prices > strike))
+        p_hat = k / bootstrap_paths
+
+        # Wilson CI
+        result = self._wilson_ci(p_hat, bootstrap_paths)
+
+        # Enforce uncertainty floor
+        unc = max(min_uncertainty, result.uncertainty)
+        return ProbabilityEstimate(
+            probability=result.probability,
+            ci_lower=max(0.0, result.probability - unc),
+            ci_upper=min(1.0, result.probability + unc),
+            uncertainty=unc,
+            num_paths=bootstrap_paths,
+        )

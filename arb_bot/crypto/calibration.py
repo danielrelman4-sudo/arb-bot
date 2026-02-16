@@ -55,14 +55,21 @@ class ModelCalibrator:
         self,
         min_samples_for_calibration: int = 50,
         recalibrate_every: int = 20,
+        method: str = "platt",
+        isotonic_min_samples: int = 20,
     ) -> None:
         self._min_samples = min_samples_for_calibration
         self._recalibrate_every = recalibrate_every
+        self._method = method  # "platt" or "isotonic"
+        self._isotonic_min_samples = isotonic_min_samples
         self._records: List[CalibrationRecord] = []
         self._platt_a: float = 1.0  # Identity mapping by default
         self._platt_b: float = 0.0
         self._is_calibrated: bool = False
         self._samples_since_calibration: int = 0
+        # Isotonic regression state
+        self._isotonic_x: Optional[np.ndarray] = None  # breakpoint x values
+        self._isotonic_y: Optional[np.ndarray] = None  # breakpoint y values
 
     @property
     def is_calibrated(self) -> bool:
@@ -95,22 +102,112 @@ class ModelCalibrator:
         self._samples_since_calibration += 1
 
         # Re-calibrate if we have enough data
-        if (len(self._records) >= self._min_samples
-                and self._samples_since_calibration >= self._recalibrate_every):
-            self._fit_platt()
+        if self._method == "isotonic":
+            if (len(self._records) >= self._isotonic_min_samples
+                    and self._samples_since_calibration >= self._recalibrate_every):
+                self._fit_isotonic()
+        else:
+            if (len(self._records) >= self._min_samples
+                    and self._samples_since_calibration >= self._recalibrate_every):
+                self._fit_platt()
 
     def calibrate(self, raw_prob: float) -> float:
-        """Apply Platt scaling to a raw model probability.
+        """Apply calibration (Platt or isotonic) to a raw model probability.
 
         Returns calibrated probability, or raw_prob if not yet calibrated.
         """
         if not self._is_calibrated:
             return raw_prob
+
+        if self._method == "isotonic" and self._isotonic_x is not None:
+            return self._interpolate_isotonic(raw_prob)
+
         # Platt sigmoid: 1 / (1 + exp(-a*x - b))
         z = self._platt_a * raw_prob + self._platt_b
         # Clamp to avoid overflow
         z = max(-20.0, min(20.0, z))
         return 1.0 / (1.0 + math.exp(-z))
+
+    def _interpolate_isotonic(self, raw_prob: float) -> float:
+        """Linearly interpolate the isotonic calibration curve."""
+        assert self._isotonic_x is not None and self._isotonic_y is not None
+        x = self._isotonic_x
+        y = self._isotonic_y
+        # Clamp to breakpoint range
+        clamped = max(float(x[0]), min(float(x[-1]), raw_prob))
+        result = float(np.interp(clamped, x, y))
+        return max(0.0, min(1.0, result))
+
+    def _fit_isotonic(self) -> None:
+        """Fit isotonic regression (PAVA) from accumulated records."""
+        if len(self._records) < self._isotonic_min_samples:
+            return
+
+        x = np.array([r.predicted_prob for r in self._records])
+        y = np.array([1.0 if r.outcome else 0.0 for r in self._records])
+
+        # Sort by predicted prob
+        order = np.argsort(x)
+        x_sorted = x[order]
+        y_sorted = y[order]
+
+        # Group by unique x values (average y for ties)
+        unique_x, inverse = np.unique(x_sorted, return_inverse=True)
+        grouped_y = np.zeros(len(unique_x))
+        counts = np.zeros(len(unique_x))
+        for i, idx in enumerate(inverse):
+            grouped_y[idx] += y_sorted[i]
+            counts[idx] += 1
+        grouped_y /= counts
+
+        # PAVA (Pool Adjacent Violators Algorithm)
+        iso_y = self._pava(grouped_y)
+
+        self._isotonic_x = unique_x
+        self._isotonic_y = iso_y
+        self._is_calibrated = True
+        self._samples_since_calibration = 0
+
+        LOGGER.info(
+            "ModelCalibrator: fitted isotonic with %d breakpoints from %d samples",
+            len(unique_x), len(self._records),
+        )
+
+    @staticmethod
+    def _pava(y: np.ndarray) -> np.ndarray:
+        """Pool Adjacent Violators Algorithm for isotonic regression.
+
+        Produces a monotonically non-decreasing sequence that minimizes
+        the sum of squared deviations from the input.
+        """
+        n = len(y)
+        result = y.astype(float).copy()
+        # Weighted PAVA
+        w = np.ones(n, dtype=float)
+
+        i = 0
+        while i < n - 1:
+            if result[i] > result[i + 1]:
+                # Pool: merge i and i+1
+                total_w = w[i] + w[i + 1]
+                result[i] = (w[i] * result[i] + w[i + 1] * result[i + 1]) / total_w
+                result[i + 1] = result[i]
+                w[i] = total_w
+                w[i + 1] = total_w
+                # Check backwards
+                j = i
+                while j > 0 and result[j - 1] > result[j]:
+                    total_w = w[j - 1] + w[j]
+                    result[j - 1] = (w[j - 1] * result[j - 1] + w[j] * result[j]) / total_w
+                    result[j] = result[j - 1]
+                    w[j - 1] = total_w
+                    w[j] = total_w
+                    j -= 1
+                i = j + 1
+            else:
+                i += 1
+
+        return result
 
     def _fit_platt(self) -> None:
         """Fit Platt scaling parameters using Newton's method.
