@@ -722,7 +722,7 @@ async def run_paper_test(
         agg_trades_task = None
         if settings.agg_trades_ws_enabled:
             agg_trades_task = asyncio.create_task(
-                engine.price_feed.connect_okx_trades_ws()
+                engine.price_feed.connect_agg_trades_ws()
             )
             print("\nStarted OKX trades WebSocket stream for continuous OFI data")
 

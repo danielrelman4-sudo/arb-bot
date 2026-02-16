@@ -856,37 +856,47 @@ class CryptoEngine:
         # 1c. Maybe retrain classifier (C2)
         self._maybe_retrain_classifier()
 
-        # 1d. VPIN halt gate: tiered gate with momentum zone (v18)
+        # 1d. VPIN gate: per-symbol tiered gate with momentum zone (v18/v20)
         _momentum_zone = False
+        _vpin_halted_symbols: set = set()   # Symbols above ceiling — fully halted
+        _vpin_momentum_symbols: set = set() # Symbols in momentum zone
+        _vpin_normal_symbols: set = set()   # Symbols below momentum floor — model-path ok
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
-            max_vpin = 0.0
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
-                if vpin_val is not None and vpin_val > max_vpin:
-                    max_vpin = vpin_val
+                if vpin_val is None:
+                    _vpin_normal_symbols.add(sym)
+                    continue
+                if self._settings.momentum_enabled:
+                    if vpin_val > self._settings.momentum_vpin_ceiling:
+                        _vpin_halted_symbols.add(sym)
+                    elif vpin_val >= self._settings.momentum_vpin_floor:
+                        _vpin_momentum_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
+                else:
+                    if vpin_val > self._settings.vpin_halt_threshold:
+                        _vpin_halted_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
 
-            if self._settings.momentum_enabled:
-                if max_vpin > self._settings.momentum_vpin_ceiling:
-                    LOGGER.info(
-                        "CryptoEngine: VPIN full halt — max VPIN=%.3f > %.3f, skipping cycle",
-                        max_vpin, self._settings.momentum_vpin_ceiling,
-                    )
-                    return
-                elif max_vpin >= self._settings.momentum_vpin_floor:
-                    _momentum_zone = True
-                    LOGGER.info(
-                        "CryptoEngine: VPIN momentum zone — max VPIN=%.3f (%.3f–%.3f)",
-                        max_vpin, self._settings.momentum_vpin_floor,
-                        self._settings.momentum_vpin_ceiling,
-                    )
-            else:
-                if max_vpin > self._settings.vpin_halt_threshold:
-                    LOGGER.info(
-                        "CryptoEngine: VPIN halt — %s VPIN=%.3f > %.3f, skipping cycle",
-                        max(self._vpin_calculators.keys(), key=lambda s: self._vpin_calculators[s].get_vpin() or 0),
-                        max_vpin, self._settings.vpin_halt_threshold,
-                    )
-                    return
+            # Log per-symbol VPIN status
+            if _vpin_halted_symbols:
+                halted_details = ", ".join(
+                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_halted_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
+            if _vpin_momentum_symbols:
+                mom_details = ", ".join(
+                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_momentum_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
+                _momentum_zone = True
+
+            # Only skip entire cycle if ALL symbols are halted
+            if _vpin_halted_symbols and not _vpin_momentum_symbols and not _vpin_normal_symbols:
+                LOGGER.info("CryptoEngine: VPIN full halt — all symbols above ceiling, skipping cycle")
+                return
 
         # 2. Generate MC paths for each underlying/horizon combination
         model_probs = self._compute_model_probabilities(market_quotes)
@@ -894,13 +904,17 @@ class CryptoEngine:
         # 2b. Classify market regime
         self._update_regime()
 
-        # 2c. Momentum path (v18): if in momentum zone, try momentum trades instead of model
+        # 2c. Momentum path (v18/v20): try momentum trades for momentum-zone symbols
         if _momentum_zone and self._settings.momentum_enabled:
-            await self._try_momentum_trades(market_quotes)
+            await self._try_momentum_trades(market_quotes, momentum_symbols=_vpin_momentum_symbols)
+
+        # If no symbols are in normal zone, skip model-path trades
+        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols):
             await self._settle_expired_positions()
             cycle_elapsed = time.monotonic() - cycle_start
             if cycle_elapsed > 1.0:
-                LOGGER.info("CryptoEngine: momentum cycle %d took %.1fs", self._cycle_count, cycle_elapsed)
+                LOGGER.info("CryptoEngine: no normal-VPIN symbols, cycle %d took %.1fs",
+                            self._cycle_count, cycle_elapsed)
             return
 
         # ── Cycle recorder Hook 1: market snapshots ──
@@ -926,6 +940,20 @@ class CryptoEngine:
 
         # 3. Detect edges
         edges = self._edge_detector.detect_edges(market_quotes, model_probs)
+
+        # 3-vpin. Filter edges for symbols in halted or momentum zone (model-path only)
+        if _vpin_halted_symbols or _vpin_momentum_symbols:
+            blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
+            pre_count = len(edges)
+            edges = [
+                e for e in edges
+                if _KALSHI_TO_BINANCE.get(e.market.meta.underlying, "") not in blocked_syms
+            ]
+            if len(edges) < pre_count:
+                LOGGER.info(
+                    "CryptoEngine: VPIN symbol filter removed %d/%d model-path edges (halted/momentum symbols)",
+                    pre_count - len(edges), pre_count,
+                )
 
         # ── Cycle recorder Hook 2: snapshot raw edges ──
         all_raw_edges = list(edges)
@@ -1268,46 +1296,57 @@ class CryptoEngine:
                     mq.no_buy_price,
                 )
 
-        # VPIN halt gate: tiered gate with momentum zone (v18)
+        # VPIN gate: per-symbol tiered gate with momentum zone (v18/v20)
         _momentum_zone = False
+        _vpin_halted_symbols: set = set()
+        _vpin_momentum_symbols: set = set()
+        _vpin_normal_symbols: set = set()
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
-            max_vpin = 0.0
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
-                if vpin_val is not None and vpin_val > max_vpin:
-                    max_vpin = vpin_val
+                if vpin_val is None:
+                    _vpin_normal_symbols.add(sym)
+                    continue
+                if self._settings.momentum_enabled:
+                    if vpin_val > self._settings.momentum_vpin_ceiling:
+                        _vpin_halted_symbols.add(sym)
+                    elif vpin_val >= self._settings.momentum_vpin_floor:
+                        _vpin_momentum_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
+                else:
+                    if vpin_val > self._settings.vpin_halt_threshold:
+                        _vpin_halted_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
 
-            if self._settings.momentum_enabled:
-                if max_vpin > self._settings.momentum_vpin_ceiling:
-                    LOGGER.info(
-                        "CryptoEngine: VPIN full halt — max VPIN=%.3f > %.3f, skipping cycle",
-                        max_vpin, self._settings.momentum_vpin_ceiling,
-                    )
-                    return []
-                elif max_vpin >= self._settings.momentum_vpin_floor:
-                    _momentum_zone = True
-                    LOGGER.info(
-                        "CryptoEngine: VPIN momentum zone — max VPIN=%.3f (%.3f–%.3f)",
-                        max_vpin, self._settings.momentum_vpin_floor,
-                        self._settings.momentum_vpin_ceiling,
-                    )
-            else:
-                if max_vpin > self._settings.vpin_halt_threshold:
-                    LOGGER.info(
-                        "CryptoEngine: VPIN halt — %s VPIN=%.3f > %.3f, skipping cycle",
-                        max(self._vpin_calculators.keys(), key=lambda s: self._vpin_calculators[s].get_vpin() or 0),
-                        max_vpin, self._settings.vpin_halt_threshold,
-                    )
-                    return []
+            if _vpin_halted_symbols:
+                halted_details = ", ".join(
+                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_halted_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
+            if _vpin_momentum_symbols:
+                mom_details = ", ".join(
+                    f"{s}={self._vpin_calculators[s].get_vpin():.3f}" for s in sorted(_vpin_momentum_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
+                _momentum_zone = True
+
+            if _vpin_halted_symbols and not _vpin_momentum_symbols and not _vpin_normal_symbols:
+                LOGGER.info("CryptoEngine: VPIN full halt — all symbols above ceiling, skipping cycle")
+                return []
 
         model_probs = self._compute_model_probabilities(quotes)
 
         # Classify market regime
         self._update_regime()
 
-        # Momentum path (v18): if in momentum zone, try momentum trades instead of model
+        # Momentum path (v18/v20): try momentum trades for momentum-zone symbols
         if _momentum_zone and self._settings.momentum_enabled:
-            await self._try_momentum_trades(quotes)
+            await self._try_momentum_trades(quotes, momentum_symbols=_vpin_momentum_symbols)
+
+        # If no symbols are in normal zone, skip model-path trades
+        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols):
             await self._settle_expired_positions()
             return []
 
@@ -1333,6 +1372,20 @@ class CryptoEngine:
             )
 
         edges = self._edge_detector.detect_edges(quotes, model_probs)
+
+        # Filter edges for symbols in halted or momentum zone (model-path only)
+        if _vpin_halted_symbols or _vpin_momentum_symbols:
+            blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
+            pre_count = len(edges)
+            edges = [
+                e for e in edges
+                if _KALSHI_TO_BINANCE.get(e.market.meta.underlying, "") not in blocked_syms
+            ]
+            if len(edges) < pre_count:
+                LOGGER.info(
+                    "CryptoEngine: VPIN symbol filter removed %d/%d model-path edges (halted/momentum symbols)",
+                    pre_count - len(edges), pre_count,
+                )
 
         # ── Cycle recorder Hook 2: snapshot raw edges ──
         all_raw_edges = list(edges)
@@ -2765,11 +2818,17 @@ class CryptoEngine:
 
     # ── Momentum trading (v18) ───────────────────────────────────
 
-    async def _try_momentum_trades(self, market_quotes: list) -> None:
+    async def _try_momentum_trades(self, market_quotes: list, momentum_symbols: set | None = None) -> None:
         """Attempt momentum trades in VPIN momentum zone.
 
         Uses per-symbol regime classification: each symbol is independently
         checked for high_vol regime and OFI trigger conditions.
+
+        Parameters
+        ----------
+        momentum_symbols : set or None
+            If provided, only consider these symbols for momentum trades.
+            Symbols not in this set are skipped (they may be halted or normal).
         """
         if self._current_regime is None:
             LOGGER.info("CryptoEngine: momentum skip — no regime classified")
@@ -2789,6 +2848,9 @@ class CryptoEngine:
             symbols = [s.strip() for s in symbols.split(",") if s.strip()]
 
         for binance_sym in symbols:
+            # Per-symbol VPIN filter: only trade symbols in momentum zone
+            if momentum_symbols is not None and binance_sym not in momentum_symbols:
+                continue
             # Per-symbol regime check
             sym_snap = self._current_regime.per_symbol.get(binance_sym) if self._current_regime.per_symbol else None
             if sym_snap is None:
