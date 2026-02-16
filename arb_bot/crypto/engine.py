@@ -55,6 +55,79 @@ _KALSHI_TO_BINANCE = {
 }
 
 
+# ── Momentum helpers (v18) ─────────────────────────────────────────
+
+
+def _select_momentum_contract(
+    quotes: list,
+    spot_price: float,
+    ofi_direction: int,
+    settings,
+) -> tuple | None:
+    """Select best momentum contract: nearest OTM in price sweet spot.
+
+    Returns (quote, side) or None if no suitable contract.
+    """
+    candidates = []
+    for q in quotes:
+        meta = q.market.meta
+        if meta.strike is None:
+            continue
+        if meta.direction not in ("above", "below"):
+            continue
+        if q.time_to_expiry_minutes > settings.momentum_max_tte_minutes:
+            continue
+        if q.time_to_expiry_minutes <= 0:
+            continue
+
+        if ofi_direction > 0:  # Bullish
+            if meta.direction == "above" and meta.strike > spot_price:
+                side = "yes"
+                buy_price = q.yes_buy_price
+            elif meta.direction == "below" and meta.strike < spot_price:
+                side = "no"
+                buy_price = q.no_buy_price
+            else:
+                continue
+        else:  # Bearish
+            if meta.direction == "above" and meta.strike < spot_price:
+                side = "no"
+                buy_price = q.no_buy_price
+            elif meta.direction == "below" and meta.strike > spot_price:
+                side = "yes"
+                buy_price = q.yes_buy_price
+            else:
+                continue
+
+        if buy_price < settings.momentum_price_floor:
+            continue
+        if buy_price > settings.momentum_price_ceiling:
+            continue
+
+        strike_distance = abs(meta.strike - spot_price)
+        candidates.append((q, side, buy_price, strike_distance))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[3])
+    return (candidates[0][0], candidates[0][1])
+
+
+def _compute_momentum_size(
+    bankroll: float,
+    buy_price: float,
+    ofi_alignment: float,
+    settings,
+) -> int:
+    """Compute momentum position size: fixed fraction scaled by OFI alignment."""
+    dollar_amount = bankroll * settings.momentum_kelly_fraction * ofi_alignment
+    dollar_amount = min(dollar_amount, settings.momentum_max_position)
+    dollar_amount = min(dollar_amount, bankroll)
+    if buy_price <= 0:
+        return 0
+    return int(dollar_amount / buy_price)
+
+
 # ── Trade records ──────────────────────────────────────────────────
 
 @dataclass
@@ -69,6 +142,7 @@ class CryptoPosition:
     edge: CryptoEdge
     model_prob: float
     market_implied_prob: float
+    strategy: str = "model"
 
 
 @dataclass
@@ -177,6 +251,9 @@ class CryptoEngine:
         # HTTP client for real settlement via Kalshi API
         self._http_client: Any = None  # httpx.AsyncClient when set
         self._pending_settlement: Dict[str, float] = {}  # ticker -> first_check_time
+
+        # Momentum cooldowns (v18)
+        self._momentum_cooldowns: Dict[str, float] = {}  # binance_sym -> last settle time
 
         # Staleness detector (A1)
         if settings.staleness_enabled:
@@ -777,14 +854,35 @@ class CryptoEngine:
         # 1c. Maybe retrain classifier (C2)
         self._maybe_retrain_classifier()
 
-        # 1d. VPIN halt gate: skip entire cycle if any symbol has extreme VPIN
+        # 1d. VPIN halt gate: tiered gate with momentum zone (v18)
+        _momentum_zone = False
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
+            max_vpin = 0.0
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
-                if vpin_val is not None and vpin_val > self._settings.vpin_halt_threshold:
+                if vpin_val is not None and vpin_val > max_vpin:
+                    max_vpin = vpin_val
+
+            if self._settings.momentum_enabled:
+                if max_vpin > self._settings.momentum_vpin_ceiling:
+                    LOGGER.info(
+                        "CryptoEngine: VPIN full halt — max VPIN=%.3f > %.3f, skipping cycle",
+                        max_vpin, self._settings.momentum_vpin_ceiling,
+                    )
+                    return
+                elif max_vpin >= self._settings.momentum_vpin_floor:
+                    _momentum_zone = True
+                    LOGGER.info(
+                        "CryptoEngine: VPIN momentum zone — max VPIN=%.3f (%.3f–%.3f)",
+                        max_vpin, self._settings.momentum_vpin_floor,
+                        self._settings.momentum_vpin_ceiling,
+                    )
+            else:
+                if max_vpin > self._settings.vpin_halt_threshold:
                     LOGGER.info(
                         "CryptoEngine: VPIN halt — %s VPIN=%.3f > %.3f, skipping cycle",
-                        sym, vpin_val, self._settings.vpin_halt_threshold,
+                        max(self._vpin_calculators.keys(), key=lambda s: self._vpin_calculators[s].get_vpin() or 0),
+                        max_vpin, self._settings.vpin_halt_threshold,
                     )
                     return
 
@@ -793,6 +891,15 @@ class CryptoEngine:
 
         # 2b. Classify market regime
         self._update_regime()
+
+        # 2c. Momentum path (v18): if in momentum zone, try momentum trades instead of model
+        if _momentum_zone and self._settings.momentum_enabled:
+            await self._try_momentum_trades(market_quotes)
+            await self._settle_expired_positions()
+            cycle_elapsed = time.monotonic() - cycle_start
+            if cycle_elapsed > 1.0:
+                LOGGER.info("CryptoEngine: momentum cycle %d took %.1fs", self._cycle_count, cycle_elapsed)
+            return
 
         # ── Cycle recorder Hook 1: market snapshots ──
         _rec_cycle_id = None
@@ -1137,14 +1244,35 @@ class CryptoEngine:
                     mq.no_buy_price,
                 )
 
-        # VPIN halt gate: skip entire cycle if any symbol has extreme VPIN
+        # VPIN halt gate: tiered gate with momentum zone (v18)
+        _momentum_zone = False
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
+            max_vpin = 0.0
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
-                if vpin_val is not None and vpin_val > self._settings.vpin_halt_threshold:
+                if vpin_val is not None and vpin_val > max_vpin:
+                    max_vpin = vpin_val
+
+            if self._settings.momentum_enabled:
+                if max_vpin > self._settings.momentum_vpin_ceiling:
+                    LOGGER.info(
+                        "CryptoEngine: VPIN full halt — max VPIN=%.3f > %.3f, skipping cycle",
+                        max_vpin, self._settings.momentum_vpin_ceiling,
+                    )
+                    return []
+                elif max_vpin >= self._settings.momentum_vpin_floor:
+                    _momentum_zone = True
+                    LOGGER.info(
+                        "CryptoEngine: VPIN momentum zone — max VPIN=%.3f (%.3f–%.3f)",
+                        max_vpin, self._settings.momentum_vpin_floor,
+                        self._settings.momentum_vpin_ceiling,
+                    )
+            else:
+                if max_vpin > self._settings.vpin_halt_threshold:
                     LOGGER.info(
                         "CryptoEngine: VPIN halt — %s VPIN=%.3f > %.3f, skipping cycle",
-                        sym, vpin_val, self._settings.vpin_halt_threshold,
+                        max(self._vpin_calculators.keys(), key=lambda s: self._vpin_calculators[s].get_vpin() or 0),
+                        max_vpin, self._settings.vpin_halt_threshold,
                     )
                     return []
 
@@ -1152,6 +1280,12 @@ class CryptoEngine:
 
         # Classify market regime
         self._update_regime()
+
+        # Momentum path (v18): if in momentum zone, try momentum trades instead of model
+        if _momentum_zone and self._settings.momentum_enabled:
+            await self._try_momentum_trades(quotes)
+            await self._settle_expired_positions()
+            return []
 
         # ── Cycle recorder Hook 1: market snapshots ──
         _rec_cycle_id = None
@@ -2406,6 +2540,164 @@ class CryptoEngine:
                 fr.contracts_sized = contracts
                 fr.was_traded = True
 
+    # ── Momentum trading (v18) ───────────────────────────────────
+
+    async def _try_momentum_trades(self, market_quotes: list) -> None:
+        """Attempt momentum trades in VPIN momentum zone."""
+        if self._current_regime is None:
+            return
+        if self._current_regime.regime != "high_vol":
+            LOGGER.debug("CryptoEngine: momentum skip — regime=%s", self._current_regime.regime)
+            return
+        if getattr(self._current_regime, 'is_transitioning', False):
+            LOGGER.debug("CryptoEngine: momentum skip — regime transitioning")
+            return
+
+        momentum_count = sum(
+            1 for p in self._positions.values()
+            if getattr(p, 'strategy', 'model') == 'momentum'
+        )
+        if momentum_count >= self._settings.momentum_max_concurrent:
+            LOGGER.debug("CryptoEngine: momentum skip — %d/%d concurrent",
+                          momentum_count, self._settings.momentum_max_concurrent)
+            return
+
+        symbols = self._settings.price_feed_symbols
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+
+        for binance_sym in symbols:
+            # Cooldown check
+            last_settled = self._momentum_cooldowns.get(binance_sym)
+            if last_settled is not None:
+                if (time.time() - last_settled) < self._settings.momentum_cooldown_seconds:
+                    continue
+
+            # Get OFI data
+            ofi_multi = self._price_feed.get_ofi_multiscale(binance_sym, [30, 60, 120, 300])
+            if not ofi_multi:
+                continue
+
+            # Get per-symbol OFI alignment from regime snapshot
+            ofi_alignment = 0.0
+            if self._current_regime.per_symbol:
+                snap = self._current_regime.per_symbol.get(binance_sym)
+                if snap is not None:
+                    ofi_alignment = snap.ofi_alignment
+
+            # Compute weighted OFI magnitude + direction
+            weights = {30: 4.0, 60: 3.0, 120: 2.0, 300: 1.0}
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for window, ofi_val in ofi_multi.items():
+                w = weights.get(window, 1.0)
+                weighted_sum += ofi_val * w
+                weight_total += w
+            ofi_direction_raw = weighted_sum / weight_total if weight_total > 0 else 0.0
+            ofi_magnitude = abs(ofi_direction_raw)
+            ofi_direction = 1 if ofi_direction_raw > 0 else -1
+
+            # Trigger checks
+            if ofi_alignment < self._settings.momentum_ofi_alignment_min:
+                continue
+            if ofi_magnitude < self._settings.momentum_ofi_magnitude_min:
+                continue
+
+            # Get spot price
+            spot = self._price_feed.get_current_price(binance_sym)
+            if spot is None or spot <= 0:
+                continue
+
+            # Filter quotes to this underlying
+            underlying = binance_sym.replace("usdt", "").upper()
+            sym_quotes = [q for q in market_quotes if q.market.meta.underlying == underlying]
+
+            result = _select_momentum_contract(sym_quotes, spot, ofi_direction, self._settings)
+            if result is None:
+                LOGGER.debug("CryptoEngine: momentum — no contract for %s (dir=%+d)", binance_sym, ofi_direction)
+                continue
+
+            quote, side = result
+
+            if quote.market.ticker in self._positions:
+                continue
+
+            buy_price = quote.yes_buy_price if side == "yes" else quote.no_buy_price
+            contracts = _compute_momentum_size(self._bankroll, buy_price, ofi_alignment, self._settings)
+            if contracts <= 0:
+                continue
+
+            self._execute_momentum_trade(quote, side, contracts, ofi_alignment, ofi_magnitude)
+
+            LOGGER.info(
+                "CryptoEngine: MOMENTUM %s %s %d@%.2f¢ (OFI dir=%+d, align=%.2f, mag=%.0f, tte=%.1fm)",
+                side.upper(), quote.market.ticker, contracts, buy_price * 100,
+                ofi_direction, ofi_alignment, ofi_magnitude, quote.time_to_expiry_minutes,
+            )
+
+            momentum_count += 1
+            if momentum_count >= self._settings.momentum_max_concurrent:
+                break
+
+    def _execute_momentum_trade(self, quote, side: str, contracts: int,
+                                 ofi_alignment: float, ofi_magnitude: float) -> None:
+        """Execute a momentum paper trade."""
+        buy_price = quote.yes_buy_price if side == "yes" else quote.no_buy_price
+        slippage = self._settings.paper_slippage_cents / 100.0
+        entry_price = min(0.99, buy_price + slippage)
+
+        capital_needed = entry_price * contracts
+        if capital_needed > self._bankroll:
+            contracts = int(self._bankroll / entry_price)
+            if contracts <= 0:
+                return
+            capital_needed = entry_price * contracts
+
+        self._bankroll -= capital_needed
+
+        # Synthetic edge for position tracking
+        synthetic_edge = CryptoEdge(
+            market=quote.market,
+            model_prob=ProbabilityEstimate(probability=0.0, uncertainty=1.0, ci_low=0.0, ci_high=1.0),
+            market_implied_prob=quote.implied_probability,
+            edge=0.0,
+            edge_cents=0.0,
+            side=side,
+            recommended_price=buy_price,
+            model_uncertainty=1.0,
+            time_to_expiry_minutes=quote.time_to_expiry_minutes,
+            yes_buy_price=quote.yes_buy_price,
+            no_buy_price=quote.no_buy_price,
+        )
+
+        pos = CryptoPosition(
+            ticker=quote.market.ticker,
+            side=side,
+            contracts=contracts,
+            entry_price=entry_price,
+            entry_time=time.time(),
+            edge=synthetic_edge,
+            model_prob=0.0,
+            market_implied_prob=quote.implied_probability,
+            strategy="momentum",
+        )
+        self._positions[quote.market.ticker] = pos
+
+        if self._feature_store is not None:
+            fv = self._build_feature_vector(synthetic_edge)
+            fv.entry_price = entry_price
+            fv.strategy = "momentum"
+            self._feature_store.record_entry(fv)
+
+        # Cycle recorder hook
+        if (self._cycle_recorder is not None
+                and hasattr(self, '_rec_cycle_id_current')
+                and self._rec_cycle_id_current is not None):
+            self._cycle_recorder.record_trade(
+                self._rec_cycle_id_current, None, quote.market.ticker,
+                side, contracts, entry_price,
+            )
+
     async def _settle_expired_positions(self) -> None:
         """Settle positions whose markets have expired.
 
@@ -2425,6 +2717,12 @@ class CryptoEngine:
             if self._http_client is None:
                 # No HTTP client — fall back to simulated settlement
                 self._positions.pop(ticker)
+                # Record momentum cooldown (v18)
+                if getattr(pos, 'strategy', 'model') == 'momentum':
+                    underlying = pos.edge.market.meta.underlying
+                    binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+                    if binance_sym:
+                        self._momentum_cooldowns[binance_sym] = time.time()
                 pnl = self._simulate_settlement(pos)
                 self._session_pnl += pnl
                 self._bankroll += pos.entry_price * pos.contracts + pnl
@@ -2465,6 +2763,12 @@ class CryptoEngine:
                 # Real outcome available
                 self._positions.pop(ticker)
                 self._pending_settlement.pop(ticker, None)
+                # Record momentum cooldown (v18)
+                if getattr(pos, 'strategy', 'model') == 'momentum':
+                    underlying = pos.edge.market.meta.underlying
+                    binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+                    if binance_sym:
+                        self._momentum_cooldowns[binance_sym] = time.time()
 
                 settled_yes = outcome
                 if pos.side == "yes":
@@ -2529,6 +2833,12 @@ class CryptoEngine:
                         # Grace period exceeded — mark unsettled
                         self._positions.pop(ticker)
                         self._pending_settlement.pop(ticker, None)
+                        # Record momentum cooldown (v18)
+                        if getattr(pos, 'strategy', 'model') == 'momentum':
+                            underlying = pos.edge.market.meta.underlying
+                            binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+                            if binance_sym:
+                                self._momentum_cooldowns[binance_sym] = time.time()
                         self._bankroll += pos.entry_price * pos.contracts  # return capital
 
                         record = CryptoTradeRecord(
