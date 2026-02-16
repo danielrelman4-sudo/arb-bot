@@ -94,7 +94,7 @@ class CryptoSettings:
 
     # ── Edge detection ─────────────────────────────────────────────
     min_edge_pct: float = 0.12
-    min_edge_pct_daily: float = 0.15
+    min_edge_pct_daily: float = 0.12  # Was 0.15; per-cell logic applies stricter thresholds
     min_edge_cents: float = 0.05
     min_edge_pct_no_side: float = 0.12
     dynamic_edge_threshold_enabled: bool = True
@@ -418,7 +418,7 @@ def load_crypto_settings() -> CryptoSettings:
         empirical_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_EMPIRICAL_UNCERTAINTY_MULTIPLIER"), 1.5),
         empirical_return_interval_seconds=_as_int(os.getenv("ARB_CRYPTO_EMPIRICAL_RETURN_INTERVAL_SECONDS"), 60),
         min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.12),
-        min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.15),
+        min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.12),
         min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.05),
         min_edge_pct_no_side=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_NO_SIDE"), 0.12),
         dynamic_edge_threshold_enabled=_as_bool(os.getenv("ARB_CRYPTO_DYNAMIC_EDGE_THRESHOLD_ENABLED"), True),

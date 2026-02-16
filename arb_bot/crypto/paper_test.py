@@ -414,7 +414,7 @@ async def run_paper_test(
         price_feed_symbols=[s.lower() for s in binance_symbols],
         mc_num_paths=mc_paths,
         min_edge_pct=min_edge,
-        min_edge_pct_daily=0.15,
+        min_edge_pct_daily=0.12,  # Was 0.15; per-cell logic applies stricter thresholds downstream
         min_edge_cents=min_edge,
         max_model_uncertainty=0.20,
         model_uncertainty_multiplier=3.0,
@@ -437,7 +437,7 @@ async def run_paper_test(
         trend_drift_decay=5.0,
         trend_drift_max_annualized=5.0,
         # Fix 2: Raised thresholds (min_edge_pct/min_edge_cents from --min-edge arg)
-        # min_edge_pct_daily raised from 0.06 → 0.15
+        # min_edge_pct_daily lowered from 0.15 → 0.12 (per-cell logic applies stricter thresholds)
         # Fix 3: Isotonic calibration (upgraded from Platt)
         calibration_enabled=True,
         calibration_min_samples=20,
@@ -447,7 +447,7 @@ async def run_paper_test(
         # Fix 4: NO-side threshold equalized with YES (was 0.20)
         min_edge_pct_no_side=0.12,
         # Fix 5: Model-market divergence filter
-        min_model_market_divergence=0.12,
+        min_model_market_divergence=0.06,  # Was 0.12; after blending, 0.12 needs 17%+ true divergence
         # Fix 6: Book volume filter
         min_book_volume=10,
         # OFI microstructure drift
