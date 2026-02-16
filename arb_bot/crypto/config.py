@@ -243,7 +243,7 @@ class CryptoSettings:
 
     # Tier 1: Regime Kelly multiplier
     regime_sizing_enabled: bool = False
-    regime_kelly_mean_reverting: float = 1.0
+    regime_kelly_mean_reverting: float = 1.5
     regime_kelly_trending_up: float = 0.4
     regime_kelly_trending_down: float = 0.5
     regime_kelly_high_vol: float = 0.0
@@ -268,13 +268,17 @@ class CryptoSettings:
     regime_empirical_window_trending: int = 60
 
     # Tier 2: Mean-reverting size boost
-    regime_kelly_cap_boost_mean_reverting: float = 1.25
+    regime_kelly_cap_boost_mean_reverting: float = 1.5
 
     # Tier 3: Conditional trend drift (only in trending regimes)
     regime_conditional_drift: bool = True
 
     # Tier 3: Transition caution zone
     regime_transition_sizing_multiplier: float = 0.3
+
+    # ── Cycle recorder ────────────────────────────────────────────────
+    cycle_recorder_enabled: bool = False
+    cycle_recorder_db_dir: str = "recordings"
 
     # ── Feature store ──────────────────────────────────────────────────
     feature_store_enabled: bool = False
@@ -465,6 +469,8 @@ def load_crypto_settings() -> CryptoSettings:
         regime_kelly_cap_boost_mean_reverting=_as_float(os.getenv("ARB_CRYPTO_REGIME_KELLY_CAP_BOOST_MEAN_REVERTING"), 1.25),
         regime_conditional_drift=_as_bool(os.getenv("ARB_CRYPTO_REGIME_CONDITIONAL_DRIFT"), True),
         regime_transition_sizing_multiplier=_as_float(os.getenv("ARB_CRYPTO_REGIME_TRANSITION_SIZING_MULTIPLIER"), 0.3),
+        cycle_recorder_enabled=_as_bool(os.getenv("ARB_CRYPTO_CYCLE_RECORDER_ENABLED"), False),
+        cycle_recorder_db_dir=os.getenv("ARB_CRYPTO_CYCLE_RECORDER_DB_DIR", "recordings"),
         feature_store_enabled=_as_bool(os.getenv("ARB_CRYPTO_FEATURE_STORE_ENABLED"), False),
         feature_store_path=os.getenv("ARB_CRYPTO_FEATURE_STORE_PATH", "feature_store.csv"),
         feature_store_min_samples=_as_int(os.getenv("ARB_CRYPTO_FEATURE_STORE_MIN_SAMPLES"), 200),

@@ -516,3 +516,93 @@ All must be green before Phase 8 Stage 1.
   - Files: `arb_bot/crypto/price_model.py`
 - **C5B.** Replace Wilson CI with Bayesian posterior — full posterior over probability incorporating vol, drift, and MC sampling uncertainty. Directly feeds into Kelly sizing for better risk management.
   - Files: `arb_bot/crypto/price_model.py`, `arb_bot/crypto/engine.py`
+
+---
+
+## CRYPTO PAPER TEST VERSION ROADMAP
+
+### v17 — Defensive Regime Improvements (Tier 1-3) ✅ DEPLOYED
+- Regime Kelly multipliers (high_vol=0, trending=0.4-0.5, mean_reverting=1.5)
+- Regime min edge thresholds (10¢/20¢/30¢ per regime)
+- VPIN halt gate (skip cycle when VPIN > 0.85)
+- Counter-trend OFI filter, vol regime adjustment, mean-reverting size boost
+- Conditional trend drift, transition caution zone, Z-score post-edge filter
+- 4 new feature store columns for classifier training
+
+### v18 — Micro-Momentum (Strategy B)
+- In high-vol regimes (currently Kelly=0), follow OFI direction instead of skipping
+- Signal: |OFI| > threshold AND regime == high_vol → trade in OFI direction
+- Focus on short TTE (5-15 min) where momentum is strongest
+- Reuses existing multi-timescale OFI infrastructure
+- New config: `momentum_enabled`, `momentum_ofi_trigger`, `momentum_max_tte_minutes`
+
+### v19 — Straddle / Long-Vol (Strategy A)
+- Buy deep OTM contracts on both sides when Hawkes intensity spikes
+- Example: BTC at $95k → buy "BTC > $96k" for $0.15 + "BTC < $94k" for $0.15
+- Trigger: Hawkes intensity > threshold (e.g., > 10 jumps/day equivalent)
+- Depends on Kalshi having sufficient liquidity on both OTM sides
+- New module: `arb_bot/crypto/straddle.py`
+
+### v20 — Gamma Scalp (Strategy C)
+- Fade momentum after initial spike stalls (OFI returns to 0 in high-vol)
+- "Reversion within the trend" — highest risk, highest reward
+- Trigger: high_vol regime + large initial move + OFI reverting to neutral
+- Needs substantial v18/v19 data to validate entry/exit signals
+- New config: `gamma_scalp_enabled`, `gamma_scalp_min_move_pct`, `gamma_scalp_ofi_revert_threshold`
+
+---
+
+## POST-v20 EXPLORATION — PROFESSIONAL-GRADE UPGRADES
+
+### P1. L2 Order Book Integration (HIGH PRIORITY)
+- Subscribe to Kalshi L2 WebSocket for full depth-of-book data
+- Track queue position, pull/add dynamics, spoofing patterns
+- Replace trade-print-based microstructure inference with actual book state
+- Enables: better fill probability estimation, queue-aware maker strategy, toxicity detection
+- **Biggest single edge gap vs professional systems**
+
+### P2. Trained Classifier Replacing Rule-Based Filters
+- Train gradient-boosted model (XGBoost/LightGBM) on feature store data
+- Predict win probability directly from 48 features, size off model output
+- Replaces hand-tuned regime Kelly multipliers and edge thresholds
+- Requires: sufficient feature store samples (target 500+ settled trades)
+- Files: `arb_bot/crypto/classifier.py` (exists, currently disabled)
+
+### P3. Cross-Venue Execution (Kalshi + Polymarket + ForecastEx)
+- Wire crypto module into the existing multi-venue arb infrastructure (Phases 0-6)
+- Actual arbitrage between venues, not single-venue directional betting
+- Leverage existing `ExchangeAdapter` ABC, order store, legging controls
+- Requires: mapping equivalent markets across venues
+
+### P4. Historical Backtesting Framework
+- Replay historical Kalshi order book snapshots + Binance tick data deterministically
+- Use replay harness (Phase 5N) with recorded market data
+- Validate strategies on months of data before paper testing
+- Requires: historical data collection pipeline (Kalshi snapshots, Binance klines)
+
+### P5. Portfolio-Level Kelly Optimization
+- Current: size each trade independently
+- Target: optimize portfolio Kelly considering correlation between open positions
+- Prevents concentration risk from correlated BTC/ETH/SOL positions
+- Extends Phase 4H exposure controls with proper covariance matrix
+
+### P6. Market Making Strategy
+- Post limit orders on both sides and collect spread
+- Completely different from directional betting — requires inventory management
+- Where most binary market profits come from at scale
+- Requires: L2 data (P1), low-latency execution, adverse selection model
+
+### P7. Alternative Data Signals
+- Social sentiment (crypto Twitter/Reddit), on-chain whale alerts, Deribit options flow
+- Crypto markets uniquely susceptible to social/on-chain signals
+- New modules: sentiment feed, on-chain monitor, options flow tracker
+
+### P8. Global Macro Regime Model
+- Current regime detector is per-symbol microstructure-based
+- Add macro regime: DXY, rates, equity vol (VIX), cross-asset correlations
+- Better regime classification for longer-duration trades
+
+### P9. Formal Risk Attribution
+- Daily PnL decomposition by factor: regime timing, edge detection, sizing, execution, luck
+- Identify which components contribute to/detract from returns
+- Standard at any prop desk for strategy evaluation
