@@ -2543,14 +2543,13 @@ class CryptoEngine:
     # ── Momentum trading (v18) ───────────────────────────────────
 
     async def _try_momentum_trades(self, market_quotes: list) -> None:
-        """Attempt momentum trades in VPIN momentum zone."""
+        """Attempt momentum trades in VPIN momentum zone.
+
+        Uses per-symbol regime classification: each symbol is independently
+        checked for high_vol regime and OFI trigger conditions.
+        """
         if self._current_regime is None:
-            return
-        if self._current_regime.regime != "high_vol":
-            LOGGER.debug("CryptoEngine: momentum skip — regime=%s", self._current_regime.regime)
-            return
-        if getattr(self._current_regime, 'is_transitioning', False):
-            LOGGER.debug("CryptoEngine: momentum skip — regime transitioning")
+            LOGGER.info("CryptoEngine: momentum skip — no regime classified")
             return
 
         momentum_count = sum(
@@ -2567,6 +2566,19 @@ class CryptoEngine:
             symbols = [s.strip() for s in symbols.split(",") if s.strip()]
 
         for binance_sym in symbols:
+            # Per-symbol regime check
+            sym_snap = self._current_regime.per_symbol.get(binance_sym) if self._current_regime.per_symbol else None
+            if sym_snap is None:
+                LOGGER.info("CryptoEngine: momentum skip %s — no per-symbol regime", binance_sym)
+                continue
+            if sym_snap.regime != "high_vol":
+                LOGGER.info("CryptoEngine: momentum skip %s — regime=%s vol_score=%.2f (need high_vol)",
+                             binance_sym, sym_snap.regime, sym_snap.vol_score)
+                continue
+            if sym_snap.is_transitioning:
+                LOGGER.info("CryptoEngine: momentum skip %s — regime transitioning", binance_sym)
+                continue
+
             # Cooldown check
             last_settled = self._momentum_cooldowns.get(binance_sym)
             if last_settled is not None:
@@ -2578,12 +2590,8 @@ class CryptoEngine:
             if not ofi_multi:
                 continue
 
-            # Get per-symbol OFI alignment from regime snapshot
-            ofi_alignment = 0.0
-            if self._current_regime.per_symbol:
-                snap = self._current_regime.per_symbol.get(binance_sym)
-                if snap is not None:
-                    ofi_alignment = snap.ofi_alignment
+            # Per-symbol OFI alignment
+            ofi_alignment = sym_snap.ofi_alignment
 
             # Compute weighted OFI magnitude + direction
             weights = {30: 4.0, 60: 3.0, 120: 2.0, 300: 1.0}
