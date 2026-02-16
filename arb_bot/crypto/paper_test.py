@@ -414,9 +414,9 @@ async def run_paper_test(
         price_feed_symbols=[s.lower() for s in binance_symbols],
         mc_num_paths=mc_paths,
         min_edge_pct=min_edge,
-        min_edge_pct_daily=0.12,  # Was 0.15; per-cell logic applies stricter thresholds downstream
+        min_edge_pct_daily=min_edge,  # Same as min_edge; per-cell logic applies stricter thresholds
         min_edge_cents=min_edge,
-        max_model_uncertainty=0.20,
+        max_model_uncertainty=0.25,
         model_uncertainty_multiplier=3.0,
         bankroll=500.0,
         max_position_per_market=50.0,
@@ -445,7 +445,7 @@ async def run_paper_test(
         calibration_method="isotonic",
         calibration_isotonic_min_samples=20,
         # Fix 4: NO-side threshold equalized with YES (was 0.20)
-        min_edge_pct_no_side=0.12,
+        min_edge_pct_no_side=0.08,  # Permissive gate; per-cell logic applies real thresholds
         # Fix 5: Model-market divergence filter
         min_model_market_divergence=0.06,  # Was 0.12; after blending, 0.12 needs 17%+ true divergence
         # Fix 6: Book volume filter
@@ -1082,7 +1082,7 @@ def main() -> None:
                         help="How long to run (default: 5)")
     parser.add_argument("--mc-paths", type=int, default=1000,
                         help="Monte Carlo paths (default: 1000)")
-    parser.add_argument("--min-edge", type=float, default=0.12,
+    parser.add_argument("--min-edge", type=float, default=0.08,
                         help="Min edge fraction (default: 0.12 = 12%%)")
     parser.add_argument("--scan-interval", type=float, default=15.0,
                         help="Seconds between scans (default: 15)")
