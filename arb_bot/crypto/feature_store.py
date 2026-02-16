@@ -90,6 +90,9 @@ class FeatureVector:
     side: str = ""                        # "yes" or "no"
     entry_price: float = 0.0
 
+    # Strategy identifier (for classifier training)
+    strategy: str = "model"            # "model" (v17) or "momentum" (v18)
+
     # Label (set at settlement)
     outcome: int = -1                     # -1=unsettled, 0=loss, 1=win
 
@@ -115,7 +118,7 @@ FEATURE_COLUMNS = [
 
 # All CSV columns (features + identifiers + label)
 ALL_COLUMNS = [
-    "ticker", "timestamp", "side", "entry_price",
+    "ticker", "timestamp", "side", "entry_price", "strategy",
 ] + FEATURE_COLUMNS + ["outcome"]
 
 
