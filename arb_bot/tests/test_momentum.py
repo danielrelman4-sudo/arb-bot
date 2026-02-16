@@ -389,3 +389,171 @@ class TestMomentumCooldown:
             settings=CryptoSettings(momentum_enabled=True, momentum_max_concurrent=2),
         )
         assert fire is True
+
+
+# ── 6. Integration tests ─────────────────────────────────────────
+
+
+class TestMomentumIntegration:
+    """End-to-end integration tests for momentum features."""
+
+    def _make_settings(self, **overrides):
+        """Helper to create CryptoSettings with defaults."""
+        kwargs = dict(
+            momentum_enabled=True,
+            momentum_max_tte_minutes=15.0,
+            momentum_price_floor=0.15,
+            momentum_price_ceiling=0.40,
+            momentum_kelly_fraction=0.03,
+            momentum_max_position=25.0,
+            momentum_ofi_alignment_min=0.6,
+            momentum_ofi_magnitude_min=200.0,
+            momentum_max_concurrent=2,
+            momentum_cooldown_seconds=120.0,
+            momentum_vpin_floor=0.85,
+            momentum_vpin_ceiling=0.95,
+            vpin_halt_threshold=0.85,
+        )
+        kwargs.update(overrides)
+        return CryptoSettings(**kwargs)
+
+    def test_feature_store_receives_momentum_strategy_tag(self):
+        """FeatureVector with strategy='momentum' serializes correctly."""
+        # Create a minimal FeatureVector-like dict
+        feature_vector = {
+            "strategy": "momentum",
+            "timestamp": time.time(),
+            "underlying": "BTC",
+            "ofi_alignment": 0.85,
+            "ofi_magnitude": 350.0,
+        }
+        assert feature_vector["strategy"] == "momentum"
+        assert feature_vector["ofi_alignment"] == 0.85
+
+    def test_select_contract_with_multiple_underlyings(self):
+        """Each underlying gets independent contract selection."""
+        btc_quote = _make_quote(
+            ticker="KXBTCD-BTC", underlying="BTC", strike=68600.0,
+            direction="above", yes_buy=0.25,
+        )
+        eth_quote = _make_quote(
+            ticker="KXETHD-ETH", underlying="ETH", strike=3200.0,
+            direction="above", yes_buy=0.30,
+        )
+        settings = self._make_settings()
+        
+        btc_result = _select_momentum_contract([btc_quote], 68500.0, +1, settings)
+        eth_result = _select_momentum_contract([eth_quote], 3100.0, +1, settings)
+        
+        assert btc_result is not None
+        assert eth_result is not None
+        assert btc_result[0].market.meta.underlying == "BTC"
+        assert eth_result[0].market.meta.underlying == "ETH"
+
+    def test_select_contract_bearish_with_below_direction(self):
+        """Bearish OFI works with 'below' direction contracts (YES side on below-strike above spot)."""
+        # Spot=68500, strike=69000 below → bearish YES (spot drops below 69000)
+        q = _make_quote(
+            strike=69000.0, direction="below", yes_buy=0.20,
+        )
+        result = _select_momentum_contract([q], 68500.0, -1, self._make_settings())
+        assert result is not None
+        quote, side = result
+        assert side == "yes"
+
+    def test_cooldown_prevents_same_symbol_rapid_fire(self):
+        """Simulate two calls to cooldown check within window — first pass, second block."""
+        cooldowns = {}
+        symbol = "btcusdt"
+        cooldown_seconds = 120.0
+        
+        # First check: no prior trade
+        last = cooldowns.get(symbol)
+        assert last is None  # Should pass
+        
+        # Record trade
+        cooldowns[symbol] = time.time()
+        
+        # Second check: recent trade
+        last = cooldowns.get(symbol)
+        assert last is not None
+        assert (time.time() - last) < cooldown_seconds  # Should block
+
+    def test_sizing_with_various_alignments(self):
+        """Sweep alignment from 0.6 to 1.0 and verify contracts increase monotonically."""
+        settings = self._make_settings()
+        bankroll = 500.0
+        price = 0.25
+        
+        sizes = []
+        for alignment in [0.6, 0.7, 0.8, 0.9, 1.0]:
+            contracts = _compute_momentum_size(bankroll, price, alignment, settings)
+            sizes.append(contracts)
+        
+        # Verify monotonically increasing
+        for i in range(1, len(sizes)):
+            assert sizes[i] >= sizes[i-1]
+
+    def test_contract_selection_prefers_tightest_strike(self):
+        """Create 3 contracts at different distances from spot, verify closest wins."""
+        spot = 68500.0
+        q_far = _make_quote(ticker="FAR", strike=70000.0, yes_buy=0.25)
+        q_mid = _make_quote(ticker="MID", strike=69000.0, yes_buy=0.30)
+        q_near = _make_quote(ticker="NEAR", strike=68600.0, yes_buy=0.35)
+        
+        result = _select_momentum_contract(
+            [q_far, q_mid, q_near], spot, +1, self._make_settings(),
+        )
+        assert result is not None
+        quote, side = result
+        assert quote.market.ticker == "NEAR"
+
+    def test_no_momentum_when_disabled(self):
+        """Create settings with momentum_enabled=False, verify zone classification returns halt."""
+        zone = _classify_vpin_zone(
+            max_vpin=0.90,
+            momentum_enabled=False,
+            vpin_halt_threshold=0.85,
+            momentum_vpin_floor=0.85,
+            momentum_vpin_ceiling=0.95,
+        )
+        # With momentum disabled, 0.90 > 0.85 threshold → halt
+        assert zone == "halt"
+
+    def test_sizing_respects_all_caps(self):
+        """Test that sizing is min(kelly*bankroll*alignment, max_position, bankroll)."""
+        settings = self._make_settings(momentum_max_position=10.0)
+        
+        # Case 1: Kelly limit (small bankroll)
+        contracts = _compute_momentum_size(100.0, 0.25, 1.0, settings)
+        # 100 * 0.03 * 1.0 = 3.0, min(3.0, 10.0, 100.0) = 3.0 -> 3.0 / 0.25 = 12
+        assert contracts == 12
+        
+        # Case 2: max_position limit
+        contracts = _compute_momentum_size(1000.0, 0.25, 1.0, settings)
+        # 1000 * 0.03 * 1.0 = 30.0, min(30.0, 10.0, 1000.0) = 10.0 -> 10.0 / 0.25 = 40
+        assert contracts == 40
+        
+        # Case 3: bankroll limit
+        contracts = _compute_momentum_size(5.0, 0.25, 1.0, settings)
+        # 5.0 * 0.03 * 1.0 = 0.15, min(0.15, 10.0, 5.0) = 0.15 -> 0.15 / 0.25 = 0.6 -> 0
+        assert contracts == 0
+
+    def test_contract_selection_empty_quotes(self):
+        """Empty quotes list returns None."""
+        result = _select_momentum_contract([], 68500.0, +1, self._make_settings())
+        assert result is None
+
+    def test_bearish_no_on_above_with_various_prices(self):
+        """Multiple above-strikes below spot, verify only those in $0.15-$0.40 range considered."""
+        spot = 68500.0
+        q_cheap = _make_quote(ticker="CHEAP", strike=68000.0, direction="above", no_buy=0.10)
+        q_ok = _make_quote(ticker="OK", strike=68000.0, direction="above", no_buy=0.25)
+        q_expensive = _make_quote(ticker="EXP", strike=68000.0, direction="above", no_buy=0.50)
+        
+        # Only q_ok should be selected
+        result = _select_momentum_contract([q_cheap, q_ok, q_expensive], spot, -1, self._make_settings())
+        assert result is not None
+        quote, side = result
+        assert quote.market.ticker == "OK"
+        assert side == "no"

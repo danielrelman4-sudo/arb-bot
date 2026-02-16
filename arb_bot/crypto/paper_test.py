@@ -533,7 +533,6 @@ async def run_paper_test(
         # ── Cycle recorder ──────────────────────────────────────────
         cycle_recorder_enabled=True,
         cycle_recorder_db_dir="arb_bot/output/recordings",
-    )
         # ── v18: Micro-momentum lane ────────────────────────────────
         momentum_enabled=True,
         momentum_vpin_floor=0.85,
@@ -547,6 +546,7 @@ async def run_paper_test(
         momentum_max_position=25.0,
         momentum_max_concurrent=2,
         momentum_cooldown_seconds=120.0,
+    )
 
     engine = CryptoEngine(settings)
 
