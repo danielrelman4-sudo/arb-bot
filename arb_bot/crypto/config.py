@@ -219,6 +219,20 @@ class CryptoSettings:
     vpin_drift_weight: float = 0.4
     vpin_vol_boost_factor: float = 1.5
 
+    # ── Adaptive VPIN thresholds ───────────────────────────────────
+    # When enabled, the halt/momentum thresholds are derived from a rolling
+    # percentile of recent VPIN readings instead of the hardcoded values.
+    # Falls back to static thresholds until enough VPIN history accumulates.
+    vpin_adaptive_enabled: bool = True
+    vpin_adaptive_history_size: int = 500        # Rolling window of VPIN snapshots
+    vpin_adaptive_min_history: int = 30           # Min readings before adaptive kicks in
+    vpin_adaptive_halt_percentile: float = 90.0   # Percentile for halt threshold
+    vpin_adaptive_momentum_percentile: float = 75.0  # Percentile for momentum floor
+    vpin_adaptive_halt_floor: float = 0.70        # Adaptive halt never below this
+    vpin_adaptive_halt_ceiling: float = 0.98      # Adaptive halt never above this
+    vpin_adaptive_momentum_floor: float = 0.50    # Adaptive momentum floor minimum
+    vpin_adaptive_momentum_ceiling: float = 0.95  # Adaptive momentum floor maximum
+
     # ── Confidence scoring ──────────────────────────────────────────
     confidence_scoring_enabled: bool = False  # Start disabled, enable after testing
     confidence_min_score: float = 0.65
@@ -485,6 +499,15 @@ def load_crypto_settings() -> CryptoSettings:
         vpin_extreme_threshold=_as_float(os.getenv("ARB_CRYPTO_VPIN_EXTREME_THRESHOLD"), 0.7),
         vpin_drift_weight=_as_float(os.getenv("ARB_CRYPTO_VPIN_DRIFT_WEIGHT"), 0.4),
         vpin_vol_boost_factor=_as_float(os.getenv("ARB_CRYPTO_VPIN_VOL_BOOST_FACTOR"), 1.5),
+        vpin_adaptive_enabled=_as_bool(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_ENABLED"), True),
+        vpin_adaptive_history_size=_as_int(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_HISTORY_SIZE"), 500),
+        vpin_adaptive_min_history=_as_int(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_MIN_HISTORY"), 30),
+        vpin_adaptive_halt_percentile=_as_float(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_HALT_PERCENTILE"), 90.0),
+        vpin_adaptive_momentum_percentile=_as_float(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_MOMENTUM_PERCENTILE"), 75.0),
+        vpin_adaptive_halt_floor=_as_float(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_HALT_FLOOR"), 0.70),
+        vpin_adaptive_halt_ceiling=_as_float(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_HALT_CEILING"), 0.98),
+        vpin_adaptive_momentum_floor=_as_float(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_MOMENTUM_FLOOR"), 0.50),
+        vpin_adaptive_momentum_ceiling=_as_float(os.getenv("ARB_CRYPTO_VPIN_ADAPTIVE_MOMENTUM_CEILING"), 0.95),
         confidence_scoring_enabled=_as_bool(os.getenv("ARB_CRYPTO_CONFIDENCE_SCORING_ENABLED"), False),
         confidence_min_score=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_MIN_SCORE"), 0.65),
         confidence_min_agreement=_as_int(os.getenv("ARB_CRYPTO_CONFIDENCE_MIN_AGREEMENT"), 3),

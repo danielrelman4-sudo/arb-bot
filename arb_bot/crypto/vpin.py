@@ -4,6 +4,10 @@ Computes order-flow toxicity using equal-volume buckets rather than
 equal-time windows.  High VPIN (> 0.7) predicts imminent volatility.
 Signed VPIN indicates directional pressure.
 
+Includes adaptive thresholding: instead of hardcoded 0.85, the halt/momentum
+thresholds can be derived from a rolling percentile of recent VPIN readings
+so that gates adapt to current market conditions.
+
 Reference: Easley, Lopez de Prado, O'Hara (2012).
 """
 
@@ -42,6 +46,7 @@ class VPINCalculator:
         bucket_volume: float = 0.0,
         num_buckets: int = 50,
         staleness_seconds: float = 120.0,
+        adaptive_history_size: int = 500,
     ) -> None:
         self._bucket_volume = bucket_volume
         self._num_buckets = num_buckets
@@ -57,6 +62,9 @@ class VPINCalculator:
 
         # Track when we last received a trade for staleness detection
         self._last_trade_time: float = 0.0
+
+        # Rolling VPIN history for adaptive thresholding
+        self._vpin_history: Deque[float] = deque(maxlen=adaptive_history_size)
 
     # -- public properties ------------------------------------------------
 
@@ -126,6 +134,10 @@ class VPINCalculator:
                 self._cur_buy = 0.0
                 self._cur_sell = 0.0
                 self._cur_total = 0.0
+                # Record VPIN snapshot for adaptive thresholding
+                vpin_snap = self._compute_vpin_raw()
+                if vpin_snap is not None:
+                    self._vpin_history.append(vpin_snap)
 
     # -- staleness detection -----------------------------------------------
 
@@ -217,6 +229,114 @@ class VPINCalculator:
         if den == 0:
             return 0.0
         return num / den
+
+    # -- internal VPIN (no staleness check) ----------------------------------
+
+    def _compute_vpin_raw(self) -> Optional[float]:
+        """Unsigned VPIN without staleness check (for internal recording)."""
+        if len(self._buckets) < 5:
+            return None
+        total = 0.0
+        for b in self._buckets:
+            bv = b.buy_volume + b.sell_volume
+            if bv > 0:
+                total += abs(b.buy_volume - b.sell_volume) / bv
+        return total / len(self._buckets)
+
+    # -- adaptive thresholding ------------------------------------------------
+
+    def get_adaptive_threshold(
+        self,
+        percentile: float = 75.0,
+        floor: float = 0.50,
+        ceiling: float = 0.95,
+        min_history: int = 30,
+    ) -> Optional[float]:
+        """Compute an adaptive VPIN threshold from recent VPIN history.
+
+        Instead of a hardcoded threshold like 0.85, this returns a value
+        based on the rolling distribution of VPIN readings.  For example,
+        the 75th percentile means "current VPIN is above 75% of recent
+        readings" — i.e., unusually elevated for THIS market's conditions.
+
+        Parameters
+        ----------
+        percentile:
+            Which percentile of the VPIN distribution to use (0-100).
+            75 = moderate sensitivity, 90 = only extreme readings trigger.
+        floor:
+            Minimum threshold regardless of history (safety floor).
+        ceiling:
+            Maximum threshold — never go above this.
+        min_history:
+            Minimum VPIN readings required before returning a value.
+            Returns ``None`` if fewer readings are available.
+
+        Returns
+        -------
+        The adaptive threshold, or ``None`` if insufficient history.
+        """
+        if len(self._vpin_history) < min_history:
+            return None
+
+        sorted_vals = sorted(self._vpin_history)
+        n = len(sorted_vals)
+        # Percentile index (linear interpolation)
+        idx = (percentile / 100.0) * (n - 1)
+        lo = int(idx)
+        hi = min(lo + 1, n - 1)
+        frac = idx - lo
+        pctl_val = sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+        # Clamp to [floor, ceiling]
+        return max(floor, min(ceiling, pctl_val))
+
+    def get_adaptive_momentum_thresholds(
+        self,
+        halt_percentile: float = 90.0,
+        momentum_percentile: float = 75.0,
+        halt_floor: float = 0.70,
+        halt_ceiling: float = 0.98,
+        momentum_floor: float = 0.50,
+        momentum_ceiling: float = 0.95,
+        min_history: int = 30,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Get adaptive (momentum_floor, halt_ceiling) thresholds.
+
+        Returns a tuple of (momentum_threshold, halt_threshold) derived
+        from the rolling VPIN distribution.  The momentum threshold defines
+        where the momentum zone starts; the halt threshold defines where
+        all trading is halted.
+
+        Returns (None, None) if insufficient history.
+        """
+        if len(self._vpin_history) < min_history:
+            return (None, None)
+
+        momentum = self.get_adaptive_threshold(
+            percentile=momentum_percentile,
+            floor=momentum_floor,
+            ceiling=momentum_ceiling,
+            min_history=min_history,
+        )
+        halt = self.get_adaptive_threshold(
+            percentile=halt_percentile,
+            floor=halt_floor,
+            ceiling=halt_ceiling,
+            min_history=min_history,
+        )
+
+        # Ensure halt > momentum (with at least 0.05 gap)
+        if momentum is not None and halt is not None:
+            if halt <= momentum + 0.05:
+                halt = min(momentum + 0.10, halt_ceiling)
+
+        return (momentum, halt)
+
+    @property
+    def vpin_history_size(self) -> int:
+        """Number of VPIN readings in the adaptive history buffer."""
+        return len(self._vpin_history)
 
     def auto_calibrate_bucket_size(
         self,

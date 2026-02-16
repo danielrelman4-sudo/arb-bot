@@ -303,6 +303,7 @@ class CryptoEngine:
                 calc = VPINCalculator(
                     bucket_volume=settings.vpin_bucket_volume,
                     num_buckets=settings.vpin_num_buckets,
+                    adaptive_history_size=settings.vpin_adaptive_history_size,
                 )
                 self._vpin_calculators[sym] = calc
                 self._price_feed.register_vpin(sym, calc)
@@ -870,15 +871,17 @@ class CryptoEngine:
                     if hasattr(calc, "is_stale") and calc.is_stale:
                         _vpin_stale_symbols.add(sym)
                     continue
+                # Get effective thresholds (adaptive or static)
+                mom_floor, halt_ceil, is_adaptive = self._get_vpin_thresholds(sym)
                 if self._settings.momentum_enabled:
-                    if vpin_val > self._settings.momentum_vpin_ceiling:
+                    if vpin_val > halt_ceil:
                         _vpin_halted_symbols.add(sym)
-                    elif vpin_val >= self._settings.momentum_vpin_floor:
+                    elif vpin_val >= mom_floor:
                         _vpin_momentum_symbols.add(sym)
                     else:
                         _vpin_normal_symbols.add(sym)
                 else:
-                    if vpin_val > self._settings.vpin_halt_threshold:
+                    if vpin_val > halt_ceil:
                         _vpin_halted_symbols.add(sym)
                     else:
                         _vpin_normal_symbols.add(sym)
@@ -893,19 +896,25 @@ class CryptoEngine:
                 )
                 LOGGER.info("CryptoEngine: VPIN stale (treated as normal): %s", stale_details)
             if _vpin_halted_symbols:
-                halted_details = ", ".join(
-                    f"{s}={v:.3f}" for s in sorted(_vpin_halted_symbols)
-                    if (v := self._vpin_calculators[s].get_vpin()) is not None
-                )
+                halted_details = []
+                for s in sorted(_vpin_halted_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        _, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        halted_details.append(f"{s}={v:.3f}(halt@{hc:.3f}/{tag})")
                 if halted_details:
-                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
+                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", ", ".join(halted_details))
             if _vpin_momentum_symbols:
-                mom_details = ", ".join(
-                    f"{s}={v:.3f}" for s in sorted(_vpin_momentum_symbols)
-                    if (v := self._vpin_calculators[s].get_vpin()) is not None
-                )
+                mom_details = []
+                for s in sorted(_vpin_momentum_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        mf, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        mom_details.append(f"{s}={v:.3f}(zone@{mf:.3f}-{hc:.3f}/{tag})")
                 if mom_details:
-                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
+                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", ", ".join(mom_details))
                 _momentum_zone = True
 
             # Only skip entire cycle if ALL symbols are halted
@@ -1325,15 +1334,17 @@ class CryptoEngine:
                     if hasattr(calc, "is_stale") and calc.is_stale:
                         _vpin_stale_symbols.add(sym)
                     continue
+                # Get effective thresholds (adaptive or static)
+                mom_floor, halt_ceil, is_adaptive = self._get_vpin_thresholds(sym)
                 if self._settings.momentum_enabled:
-                    if vpin_val > self._settings.momentum_vpin_ceiling:
+                    if vpin_val > halt_ceil:
                         _vpin_halted_symbols.add(sym)
-                    elif vpin_val >= self._settings.momentum_vpin_floor:
+                    elif vpin_val >= mom_floor:
                         _vpin_momentum_symbols.add(sym)
                     else:
                         _vpin_normal_symbols.add(sym)
                 else:
-                    if vpin_val > self._settings.vpin_halt_threshold:
+                    if vpin_val > halt_ceil:
                         _vpin_halted_symbols.add(sym)
                     else:
                         _vpin_normal_symbols.add(sym)
@@ -1347,19 +1358,25 @@ class CryptoEngine:
                 )
                 LOGGER.info("CryptoEngine: VPIN stale (treated as normal): %s", stale_details)
             if _vpin_halted_symbols:
-                halted_details = ", ".join(
-                    f"{s}={v:.3f}" for s in sorted(_vpin_halted_symbols)
-                    if (v := self._vpin_calculators[s].get_vpin()) is not None
-                )
+                halted_details = []
+                for s in sorted(_vpin_halted_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        _, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        halted_details.append(f"{s}={v:.3f}(halt@{hc:.3f}/{tag})")
                 if halted_details:
-                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", halted_details)
+                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", ", ".join(halted_details))
             if _vpin_momentum_symbols:
-                mom_details = ", ".join(
-                    f"{s}={v:.3f}" for s in sorted(_vpin_momentum_symbols)
-                    if (v := self._vpin_calculators[s].get_vpin()) is not None
-                )
+                mom_details = []
+                for s in sorted(_vpin_momentum_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        mf, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        mom_details.append(f"{s}={v:.3f}(zone@{mf:.3f}-{hc:.3f}/{tag})")
                 if mom_details:
-                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", mom_details)
+                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", ", ".join(mom_details))
                 _momentum_zone = True
 
             if _vpin_halted_symbols and not _vpin_momentum_symbols and not _vpin_normal_symbols:
@@ -1668,6 +1685,50 @@ class CryptoEngine:
             )
 
         return edges
+
+    # ── Adaptive VPIN thresholds ────────────────────────────────
+
+    def _get_vpin_thresholds(self, sym: str) -> tuple:
+        """Get effective (momentum_floor, halt_ceiling) for a symbol.
+
+        When adaptive thresholds are enabled and enough history has
+        accumulated, use percentile-based thresholds from the rolling
+        VPIN distribution.  Otherwise fall back to static config values.
+
+        Returns (momentum_floor, halt_ceiling, is_adaptive).
+        """
+        static_floor = self._settings.momentum_vpin_floor
+        static_ceiling = self._settings.momentum_vpin_ceiling
+        static_halt = self._settings.vpin_halt_threshold
+
+        if not self._settings.vpin_adaptive_enabled:
+            if self._settings.momentum_enabled:
+                return (static_floor, static_ceiling, False)
+            return (static_halt, static_halt, False)
+
+        calc = self._vpin_calculators.get(sym)
+        if calc is None or not hasattr(calc, "get_adaptive_momentum_thresholds"):
+            if self._settings.momentum_enabled:
+                return (static_floor, static_ceiling, False)
+            return (static_halt, static_halt, False)
+
+        momentum_t, halt_t = calc.get_adaptive_momentum_thresholds(
+            halt_percentile=self._settings.vpin_adaptive_halt_percentile,
+            momentum_percentile=self._settings.vpin_adaptive_momentum_percentile,
+            halt_floor=self._settings.vpin_adaptive_halt_floor,
+            halt_ceiling=self._settings.vpin_adaptive_halt_ceiling,
+            momentum_floor=self._settings.vpin_adaptive_momentum_floor,
+            momentum_ceiling=self._settings.vpin_adaptive_momentum_ceiling,
+            min_history=self._settings.vpin_adaptive_min_history,
+        )
+
+        if momentum_t is None or halt_t is None:
+            # Not enough history yet — fall back to static
+            if self._settings.momentum_enabled:
+                return (static_floor, static_ceiling, False)
+            return (static_halt, static_halt, False)
+
+        return (momentum_t, halt_t, True)
 
     # ── Regime detection ─────────────────────────────────────────
 
