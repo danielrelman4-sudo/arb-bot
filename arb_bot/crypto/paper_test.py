@@ -534,6 +534,19 @@ async def run_paper_test(
         cycle_recorder_enabled=True,
         cycle_recorder_db_dir="arb_bot/output/recordings",
     )
+        # ── v18: Micro-momentum lane ────────────────────────────────
+        momentum_enabled=True,
+        momentum_vpin_floor=0.85,
+        momentum_vpin_ceiling=0.95,
+        momentum_ofi_alignment_min=0.6,
+        momentum_ofi_magnitude_min=200.0,
+        momentum_max_tte_minutes=15.0,
+        momentum_price_floor=0.15,
+        momentum_price_ceiling=0.40,
+        momentum_kelly_fraction=0.03,
+        momentum_max_position=25.0,
+        momentum_max_concurrent=2,
+        momentum_cooldown_seconds=120.0,
 
     engine = CryptoEngine(settings)
 
@@ -579,6 +592,9 @@ async def run_paper_test(
     else:
         rec_db_path = None
         print(f"  Recorder:       OFF")
+    print(f"  Momentum:       {'ON' if settings.momentum_enabled else 'OFF'}"
+          f"  VPIN zone: {settings.momentum_vpin_floor:.2f}–{settings.momentum_vpin_ceiling:.2f}"
+          f"  OFI align>{settings.momentum_ofi_alignment_min:.1f} mag>{settings.momentum_ofi_magnitude_min:.0f}")
     print(f"{'='*70}\n")
 
     # Wire up cycle recorder if enabled
