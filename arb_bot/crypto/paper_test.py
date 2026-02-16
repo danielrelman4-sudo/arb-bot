@@ -928,6 +928,22 @@ async def run_paper_test(
                 f"model={t.model_prob_at_entry:.0%} market={t.market_prob_at_entry:.0%} "
                 f"{outcome_tag}"
             )
+        # Per-cell breakdown
+        cell_stats: dict[str, dict] = {}
+        for t in engine.trades:
+            cell = getattr(t, 'strategy_cell', '') or 'unknown'
+            if cell not in cell_stats:
+                cell_stats[cell] = {"trades": 0, "wins": 0, "pnl": 0.0}
+            cell_stats[cell]["trades"] += 1
+            if t.pnl > 0:
+                cell_stats[cell]["wins"] += 1
+            cell_stats[cell]["pnl"] += t.pnl
+        if cell_stats:
+            print(f"\n  Per-cell breakdown:")
+            for cell_name in sorted(cell_stats.keys()):
+                s = cell_stats[cell_name]
+                wr = s["wins"] / s["trades"] * 100 if s["trades"] else 0
+                print(f"    {cell_name:15s}  {s['trades']} trades  {s['wins']} wins ({wr:.0f}%)  PnL=${s['pnl']:+.2f}")
     print(f"\n  Net PnL:        ${engine.session_pnl:+.2f}")
     print(f"  Final bankroll: ${engine.bankroll:.2f}")
     print(f"  Cycle data:     {log_path}")

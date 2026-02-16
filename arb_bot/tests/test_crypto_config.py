@@ -14,7 +14,7 @@ class TestCryptoSettingsDefaults:
         assert s.enabled is False
         assert s.symbols == ["KXBTC", "KXETH"]
         assert s.mc_num_paths == 1000
-        assert s.min_edge_pct == 0.06
+        assert s.min_edge_pct == 0.12
         assert s.paper_mode is True
         assert s.bankroll == 500.0
 

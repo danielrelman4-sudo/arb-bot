@@ -66,7 +66,7 @@ class TestComputeImpliedProbability:
 class TestEdgeDetector:
     def test_positive_edge_buy_yes(self) -> None:
         """Model says prob higher than market → buy YES."""
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01, min_model_market_divergence=0.0)
         quote = _make_quote(yes_price=0.50, no_price=0.50)  # implied ~0.50
         model = ProbabilityEstimate(0.60, 0.55, 0.65, 0.05, 1000)
         edges = detector.detect_edges(
@@ -79,7 +79,7 @@ class TestEdgeDetector:
 
     def test_negative_edge_buy_no(self) -> None:
         """Model says prob lower than market → buy NO."""
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01, min_model_market_divergence=0.0)
         quote = _make_quote(yes_price=0.60, no_price=0.45)  # implied ~0.575
         model = ProbabilityEstimate(0.45, 0.40, 0.50, 0.05, 1000)
         edges = detector.detect_edges(
@@ -91,7 +91,7 @@ class TestEdgeDetector:
         assert edges[0].edge < 0
 
     def test_edge_below_threshold_filtered(self) -> None:
-        detector = EdgeDetector(min_edge_pct=0.10)
+        detector = EdgeDetector(min_edge_pct=0.10, min_model_market_divergence=0.0)
         quote = _make_quote(yes_price=0.50, no_price=0.50)  # implied ~0.50
         model = ProbabilityEstimate(0.55, 0.50, 0.60, 0.05, 1000)  # 5% edge
         edges = detector.detect_edges([quote], {quote.market.ticker: model})
@@ -102,6 +102,7 @@ class TestEdgeDetector:
             min_edge_pct=0.01,
             min_edge_cents=0.01,
             max_model_uncertainty=0.05,
+            min_model_market_divergence=0.0,
         )
         quote = _make_quote(yes_price=0.50, no_price=0.50)
         model = ProbabilityEstimate(0.60, 0.40, 0.80, 0.20, 100)  # high uncertainty
@@ -109,13 +110,13 @@ class TestEdgeDetector:
         assert len(edges) == 0
 
     def test_no_model_for_market_skipped(self) -> None:
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01, min_model_market_divergence=0.0)
         quote = _make_quote()
         edges = detector.detect_edges([quote], {})
         assert len(edges) == 0
 
     def test_sorted_by_absolute_edge(self) -> None:
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01, min_model_market_divergence=0.0)
         q1 = _make_quote(ticker="KXBTCD-26FEB14-T97000", yes_price=0.50, no_price=0.50)
         q2 = _make_quote(ticker="KXBTCD-26FEB14-T98000", yes_price=0.50, no_price=0.50)
 
@@ -130,14 +131,14 @@ class TestEdgeDetector:
         assert abs(edges[0].edge) >= abs(edges[1].edge)
 
     def test_zero_edge_skipped(self) -> None:
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01, min_model_market_divergence=0.0)
         quote = _make_quote(yes_price=0.50, no_price=0.50)  # implied 0.50
         model = ProbabilityEstimate(0.50, 0.45, 0.55, 0.05, 1000)  # exact match
         edges = detector.detect_edges([quote], {quote.market.ticker: model})
         assert len(edges) == 0
 
     def test_edge_fields_populated(self) -> None:
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01, min_model_market_divergence=0.0)
         quote = _make_quote(
             ticker="KXBTCD-26FEB14-T97000",
             yes_price=0.50,
@@ -155,14 +156,14 @@ class TestEdgeDetector:
         assert e.no_buy_price == 0.50
 
     def test_edge_cents_filter(self) -> None:
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.05)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.05, min_model_market_divergence=0.0)
         quote = _make_quote(yes_price=0.50, no_price=0.50)
         model = ProbabilityEstimate(0.53, 0.48, 0.58, 0.05, 1000)  # 3% = $0.03
         edges = detector.detect_edges([quote], {quote.market.ticker: model})
         assert len(edges) == 0  # 0.03 < 0.05 min_edge_cents
 
     def test_multiple_markets(self) -> None:
-        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01)
+        detector = EdgeDetector(min_edge_pct=0.01, min_edge_cents=0.01, min_model_market_divergence=0.0)
         quotes = [
             _make_quote(ticker="KXBTCD-26FEB14-T97000", yes_price=0.50, no_price=0.50),
             _make_quote(ticker="KXBTCD-26FEB14-T98000", yes_price=0.40, no_price=0.60),
@@ -185,6 +186,7 @@ class TestDailyMinEdge:
             min_edge_pct_daily=0.06,
             min_edge_cents=0.01,
             use_blending=False,
+            min_model_market_divergence=0.0,
         )
         # above direction + tte > 30 min => daily threshold applies
         quote = _make_quote(
@@ -206,6 +208,7 @@ class TestDailyMinEdge:
             min_edge_pct_daily=0.06,
             min_edge_cents=0.01,
             use_blending=False,
+            min_model_market_divergence=0.0,
         )
         quote = _make_quote(
             ticker="KXBTCD-26FEB14-T97000",
@@ -227,6 +230,7 @@ class TestDailyMinEdge:
             min_edge_pct_daily=0.06,
             min_edge_cents=0.01,
             use_blending=False,
+            min_model_market_divergence=0.0,
         )
         # tte=10 minutes => not daily, uses base min_edge_pct=0.01
         quote = _make_quote(

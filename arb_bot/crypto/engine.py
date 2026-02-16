@@ -143,6 +143,7 @@ class CryptoPosition:
     model_prob: float
     market_implied_prob: float
     strategy: str = "model"
+    strategy_cell: str = ""  # "yes_15min", "yes_daily", "no_15min", "no_daily"
 
 
 @dataclass
@@ -164,6 +165,7 @@ class CryptoTradeRecord:
     time_to_expiry_minutes: float = 0.0
     settled: bool = False
     actual_outcome: str = "unsettled"  # "yes" / "no" / "unsettled" / "simulated"
+    strategy_cell: str = ""  # "yes_15min", "yes_daily", "no_15min", "no_daily"
 
 
 # ── Engine ─────────────────────────────────────────────────────────
@@ -930,6 +932,9 @@ class CryptoEngine:
         if _rec_cycle_id is not None:
             _filter_results = {e.market.ticker: FilterResult() for e in edges}
 
+        # 3-cell. Per-cell model adjustments (blending weight, prob haircut)
+        edges = self._apply_cell_model_adjustments(edges)
+
         # 3-regime. Regime min edge filter
         if self._settings.regime_min_edge_enabled and self._current_regime is not None:
             regime = self._current_regime.regime
@@ -1112,7 +1117,8 @@ class CryptoEngine:
         self._rec_edge_id_map = _rec_edge_id_map
         self._rec_filter_results_current = _filter_results
 
-        # 4. Size and execute edges
+        # 4. Size and execute edges (with per-cell filtering + sizing)
+        from arb_bot.crypto.strategy_cell import StrategyCell, get_cell_config
         trades_opened = 0
         for edge in edges:
             if len(self._positions) >= self._settings.max_concurrent_positions:
@@ -1123,7 +1129,25 @@ class CryptoEngine:
             if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
                 continue
 
-            contracts = self._compute_position_size(edge)
+            # Per-cell filtering and sizing
+            cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
+            cell_cfg = get_cell_config(cell, self._settings) if cell else None
+
+            # Per-cell edge threshold
+            if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
+                LOGGER.info(
+                    "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
+                    edge.market.ticker, edge.edge_cents * 100,
+                    cell.value, cell_cfg.min_edge_pct * 100,
+                )
+                continue
+
+            # Per-cell signal gates
+            if cell is not None and cell_cfg is not None:
+                if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                    continue
+
+            contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
             if contracts <= 0:
                 continue
 
@@ -1315,6 +1339,9 @@ class CryptoEngine:
         if _rec_cycle_id is not None:
             _filter_results = {e.market.ticker: FilterResult() for e in edges}
 
+        # Per-cell model adjustments (blending weight, prob haircut)
+        edges = self._apply_cell_model_adjustments(edges)
+
         # Regime min edge filter
         if self._settings.regime_min_edge_enabled and self._current_regime is not None:
             regime = self._current_regime.regime
@@ -1497,6 +1524,7 @@ class CryptoEngine:
         self._rec_edge_id_map = _rec_edge_id_map
         self._rec_filter_results_current = _filter_results
 
+        from arb_bot.crypto.strategy_cell import StrategyCell, get_cell_config as _get_cell_config
         trades_opened = 0
         for edge in edges:
             if len(self._positions) >= self._settings.max_concurrent_positions:
@@ -1507,7 +1535,25 @@ class CryptoEngine:
             if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
                 continue
 
-            contracts = self._compute_position_size(edge)
+            # Per-cell filtering and sizing
+            cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
+            cell_cfg = _get_cell_config(cell, self._settings) if cell else None
+
+            # Per-cell edge threshold
+            if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
+                LOGGER.info(
+                    "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
+                    edge.market.ticker, edge.edge_cents * 100,
+                    cell.value, cell_cfg.min_edge_pct * 100,
+                )
+                continue
+
+            # Per-cell signal gates
+            if cell is not None and cell_cfg is not None:
+                if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                    continue
+
+            contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
             if contracts <= 0:
                 continue
 
@@ -2215,9 +2261,175 @@ class CryptoEngine:
 
         return result
 
+    # ── Strategy cell logic ──────────────────────────────────────
+
+    def _apply_cell_model_adjustments(
+        self, edges: list[CryptoEdge],
+    ) -> list[CryptoEdge]:
+        """Apply per-cell model adjustments: blending weight + prob haircut.
+
+        Classifies each edge into a strategy cell, re-blends with per-cell
+        model weight, applies probability haircut, and recalculates edge.
+        Edges whose edge flips negative after correction are dropped.
+
+        Modifies edges in-place via ``object.__setattr__`` (frozen dataclass).
+        """
+        from arb_bot.crypto.strategy_cell import StrategyCell, classify_cell, get_cell_config
+        from arb_bot.crypto.edge_detector import blend_probabilities
+
+        adjusted: list[CryptoEdge] = []
+        for edge in edges:
+            is_daily = (
+                edge.market.meta.direction in ("above", "below")
+                and edge.time_to_expiry_minutes > 30
+            )
+            cell = classify_cell(edge.side, is_daily)
+            cell_cfg = get_cell_config(cell, self._settings)
+
+            # Tag edge with cell label (for feature store + logging)
+            object.__setattr__(edge, "strategy_cell", cell.value)
+
+            # Skip re-blending if cell uses defaults (no correction needed)
+            needs_reblend = (
+                abs(cell_cfg.model_weight - 0.7) > 0.001
+                or abs(cell_cfg.prob_haircut - 1.0) > 0.001
+            )
+            if not needs_reblend:
+                adjusted.append(edge)
+                continue
+
+            # Re-blend with per-cell model weight
+            new_blended = blend_probabilities(
+                model_prob=edge.model_prob.probability,
+                market_prob=edge.market_implied_prob,
+                model_uncertainty=edge.model_uncertainty,
+                base_model_weight=cell_cfg.model_weight,
+            )
+
+            # Apply probability haircut
+            new_blended *= cell_cfg.prob_haircut
+            new_blended = max(0.01, min(0.99, new_blended))
+
+            # Recalculate effective edge
+            if edge.side == "yes":
+                new_edge = new_blended - edge.yes_buy_price
+            else:
+                new_edge = (1.0 - new_blended) - edge.no_buy_price
+
+            # Drop if edge flipped negative
+            if new_edge <= 0:
+                LOGGER.info(
+                    "CryptoEngine: cell model correction killed edge on %s "
+                    "(%s: blended %.1f%%→%.1f%%, edge %.1f%%→%.1f%%)",
+                    edge.market.ticker, cell.value,
+                    edge.blended_probability * 100, new_blended * 100,
+                    edge.edge_cents * 100, new_edge * 100,
+                )
+                continue
+
+            # Update edge fields in-place
+            object.__setattr__(edge, "blended_probability", new_blended)
+            object.__setattr__(edge, "edge_cents", new_edge)
+            object.__setattr__(
+                edge, "edge", new_blended - edge.market_implied_prob,
+            )
+            adjusted.append(edge)
+
+        return adjusted
+
+    def _passes_cell_signal_gates(
+        self,
+        edge: CryptoEdge,
+        cell: "StrategyCell",
+        cell_cfg: "CellConfig",
+    ) -> bool:
+        """Check per-cell signal requirements.
+
+        Returns True if the edge passes all gates for its cell.
+        """
+        underlying = edge.market.meta.underlying
+        binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+
+        # Gate 1: OFI alignment (e.g. YES/15min)
+        if cell_cfg.require_ofi_alignment and binance_sym:
+            ofi = self._price_feed.get_ofi_multiscale(binance_sym, [30, 60, 120])
+            weighted_ofi = (
+                0.5 * ofi.get(30, 0.0)
+                + 0.3 * ofi.get(60, 0.0)
+                + 0.2 * ofi.get(120, 0.0)
+            )
+            # For YES above/up: need positive OFI (buying pressure)
+            # For YES below/down: need negative OFI (selling pressure)
+            direction = edge.market.meta.direction
+            if direction in ("above", "up"):
+                if weighted_ofi < cell_cfg.ofi_alignment_min:
+                    LOGGER.info(
+                        "CryptoEngine: cell OFI reject %s (%s) — OFI=%.2f < %.2f",
+                        edge.market.ticker, cell.value,
+                        weighted_ofi, cell_cfg.ofi_alignment_min,
+                    )
+                    return False
+            elif direction in ("below", "down"):
+                if weighted_ofi > -cell_cfg.ofi_alignment_min:
+                    LOGGER.info(
+                        "CryptoEngine: cell OFI reject %s (%s) — OFI=%.2f > -%.2f",
+                        edge.market.ticker, cell.value,
+                        weighted_ofi, cell_cfg.ofi_alignment_min,
+                    )
+                    return False
+
+        # Gate 2: Price past strike (e.g. YES/15min)
+        if cell_cfg.require_price_past_strike and binance_sym:
+            spot = self._price_feed.get_current_price(binance_sym)
+            strike = edge.market.meta.strike
+            if spot is not None and strike is not None:
+                direction = edge.market.meta.direction
+                # "above" YES: spot should be > strike
+                if direction in ("above", "up") and spot < strike:
+                    LOGGER.info(
+                        "CryptoEngine: cell price-gate reject %s (%s) — "
+                        "spot %.2f < strike %.2f",
+                        edge.market.ticker, cell.value, spot, strike,
+                    )
+                    return False
+                # "below" YES: spot should be < strike
+                if direction in ("below", "down") and spot > strike:
+                    LOGGER.info(
+                        "CryptoEngine: cell price-gate reject %s (%s) — "
+                        "spot %.2f > strike %.2f",
+                        edge.market.ticker, cell.value, spot, strike,
+                    )
+                    return False
+
+        # Gate 3: Trend confirmation (e.g. YES/daily)
+        if cell_cfg.require_trend_confirmation and binance_sym:
+            window_sec = int(cell_cfg.trend_window_minutes * 60)
+            returns = self._price_feed.get_returns(binance_sym, window_sec, 5)
+            if len(returns) >= 2:
+                cumulative_return = sum(returns)
+                direction = edge.market.meta.direction
+                # "above" YES: need positive trend
+                if direction in ("above", "up") and cumulative_return <= 0:
+                    LOGGER.info(
+                        "CryptoEngine: cell trend reject %s (%s) — "
+                        "return=%.4f not positive",
+                        edge.market.ticker, cell.value, cumulative_return,
+                    )
+                    return False
+                # "below" YES: need negative trend
+                if direction in ("below", "down") and cumulative_return >= 0:
+                    LOGGER.info(
+                        "CryptoEngine: cell trend reject %s (%s) — "
+                        "return=%.4f not negative",
+                        edge.market.ticker, cell.value, cumulative_return,
+                    )
+                    return False
+
+        return True
+
     # ── Sizing ────────────────────────────────────────────────────
 
-    def _compute_position_size(self, edge: CryptoEdge) -> int:
+    def _compute_position_size(self, edge: CryptoEdge, cell_cfg: "CellConfig | None" = None) -> int:
         """Compute contracts to trade using simplified Kelly sizing.
 
         Uses: f* = edge / cost, capped by kelly_fraction_cap and max_position.
@@ -2278,9 +2490,17 @@ class CryptoEngine:
                 self._settings.regime_transition_sizing_multiplier,
             )
 
-        # 7. Dollar amount and contract conversion
+        # 7. Per-cell Kelly multiplier (from strategy cell config)
+        if cell_cfg is not None:
+            kelly_f *= cell_cfg.kelly_multiplier
+
+        # 8. Dollar amount and contract conversion
         dollar_amount = kelly_f * self._bankroll
-        dollar_amount = min(dollar_amount, self._settings.max_position_per_market)
+        max_pos = (
+            cell_cfg.max_position if cell_cfg is not None
+            else self._settings.max_position_per_market
+        )
+        dollar_amount = min(dollar_amount, max_pos)
         dollar_amount = min(dollar_amount, self._bankroll)
 
         contracts = int(dollar_amount / cost) if cost > 0 else 0
@@ -2469,6 +2689,7 @@ class CryptoEngine:
             vpin_at_entry=vpin_at_entry_val,
             side=edge.side,
             entry_price=edge.yes_buy_price if edge.side == "yes" else edge.no_buy_price,
+            strategy_cell=edge.strategy_cell,
         )
 
     # ── Execution ─────────────────────────────────────────────────
@@ -2502,6 +2723,7 @@ class CryptoEngine:
             edge=edge,
             model_prob=edge.model_prob.probability,
             market_implied_prob=edge.market_implied_prob,
+            strategy_cell=edge.strategy_cell,
         )
         self._positions[edge.market.ticker] = pos
 
@@ -2513,7 +2735,7 @@ class CryptoEngine:
 
         LOGGER.info(
             "CryptoEngine: PAPER %s %s %d@%.2f¢ (edge=%.1f%%, "
-            "model=%.1f%%, market=%.1f%%, tte=%.1fm)",
+            "model=%.1f%%, market=%.1f%%, tte=%.1fm, cell=%s)",
             edge.side.upper(),
             edge.market.ticker,
             contracts,
@@ -2522,6 +2744,7 @@ class CryptoEngine:
             edge.model_prob.probability * 100,
             edge.market_implied_prob * 100,
             edge.time_to_expiry_minutes,
+            edge.strategy_cell or "unknown",
         )
 
         # ── Cycle recorder Hook 4: record trade ──
@@ -2750,6 +2973,7 @@ class CryptoEngine:
                     time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
                     settled=True,
                     actual_outcome="simulated",
+                    strategy_cell=getattr(pos, 'strategy_cell', ''),
                 )
                 self._trades.append(record)
                 LOGGER.info(
@@ -2815,6 +3039,7 @@ class CryptoEngine:
                     time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
                     settled=True,
                     actual_outcome="yes" if settled_yes else "no",
+                    strategy_cell=getattr(pos, 'strategy_cell', ''),
                 )
                 self._trades.append(record)
                 LOGGER.info(
@@ -2864,6 +3089,7 @@ class CryptoEngine:
                             time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
                             settled=False,
                             actual_outcome="unsettled",
+                            strategy_cell=getattr(pos, 'strategy_cell', ''),
                         )
                         self._trades.append(record)
                         LOGGER.warning(
@@ -2942,6 +3168,7 @@ class CryptoEngine:
             time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
             settled=True,
             actual_outcome="yes" if settled_yes else "no",
+            strategy_cell=getattr(pos, 'strategy_cell', ''),
         )
         self._trades.append(record)
         return record

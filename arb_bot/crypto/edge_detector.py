@@ -34,6 +34,7 @@ class CryptoEdge:
     no_buy_price: float
     blended_probability: float = 0.0  # After market blending
     spread_cost: float = 0.0  # Half-spread in dollar terms
+    strategy_cell: str = ""  # Set by engine: "yes_15min", "yes_daily", "no_15min", "no_daily"
 
 
 def compute_implied_probability(yes_price: float, no_price: float) -> float:
@@ -92,6 +93,16 @@ class EdgeDetector:
         Max Wilson CI half-width to trade.
     use_blending:
         Whether to blend model probability with market implied probability.
+    min_edge_pct_no_side:
+        Higher minimum edge for edges where directional signal is weak.
+    min_model_market_divergence:
+        Minimum absolute divergence between model probability and
+        market implied probability before considering the edge.
+    dynamic_edge_enabled:
+        When True, raise the effective min-edge threshold by
+        ``dynamic_edge_k * model_uncertainty``.
+    dynamic_edge_k:
+        Multiplier for dynamic edge threshold.
     """
 
     def __init__(
@@ -101,12 +112,20 @@ class EdgeDetector:
         min_edge_cents: float = 0.02,
         max_model_uncertainty: float = 0.15,
         use_blending: bool = True,
+        min_edge_pct_no_side: float = 0.12,
+        min_model_market_divergence: float = 0.12,
+        dynamic_edge_enabled: bool = False,
+        dynamic_edge_k: float = 2.0,
     ) -> None:
         self._min_edge_pct = min_edge_pct
         self._min_edge_pct_daily = min_edge_pct_daily
         self._min_edge_cents = min_edge_cents
         self._max_uncertainty = max_model_uncertainty
         self._use_blending = use_blending
+        self._min_edge_pct_no_side = min_edge_pct_no_side
+        self._min_model_market_divergence = min_model_market_divergence
+        self._dynamic_edge_enabled = dynamic_edge_enabled
+        self._dynamic_edge_k = dynamic_edge_k
 
     def detect_edges(
         self,
@@ -185,6 +204,24 @@ class EdgeDetector:
                     ticker, model.uncertainty, self._max_uncertainty,
                 )
                 continue
+
+            # Model-market divergence gate
+            if abs(raw_edge) < self._min_model_market_divergence:
+                LOGGER.debug(
+                    "Edge on %s rejected: divergence %.3f < %.3f",
+                    ticker, abs(raw_edge), self._min_model_market_divergence,
+                )
+                continue
+
+            # Dynamic edge threshold: raise floor by k * uncertainty
+            if self._dynamic_edge_enabled:
+                dynamic_floor = min_edge + self._dynamic_edge_k * model.uncertainty
+                if effective_edge < dynamic_floor:
+                    LOGGER.debug(
+                        "Edge on %s rejected: edge %.3f < dynamic floor %.3f",
+                        ticker, effective_edge, dynamic_floor,
+                    )
+                    continue
 
             # Compute spread cost (half-spread for the traded side)
             if side == "yes":

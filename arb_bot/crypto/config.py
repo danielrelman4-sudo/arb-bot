@@ -290,6 +290,44 @@ class CryptoSettings:
     momentum_max_concurrent: int = 2        # Max open momentum positions
     momentum_cooldown_seconds: float = 120.0  # Per-symbol cooldown
 
+    # ── Strategy cell parameters (model path) ──────────────────────
+    # YES/15min — microstructure-confirmed
+    cell_yes_15min_model_weight: float = 0.5         # Defer more to market (less confident)
+    cell_yes_15min_prob_haircut: float = 0.90         # 10% haircut on P(YES)
+    cell_yes_15min_empirical_window: int = 30         # Shorter lookback for short contracts
+    cell_yes_15min_min_edge_pct: float = 0.12         # Same as current
+    cell_yes_15min_kelly_multiplier: float = 0.5      # Half-size (unproven)
+    cell_yes_15min_max_position: float = 25.0
+    cell_yes_15min_require_ofi: bool = True           # Require OFI alignment
+    cell_yes_15min_ofi_min: float = 0.3               # OFI magnitude floor
+    cell_yes_15min_require_price_past_strike: bool = True  # Price already past strike
+
+    # YES/daily — momentum-confirmed directional
+    cell_yes_daily_model_weight: float = 0.4          # Heavy market deference (39pp overconfident)
+    cell_yes_daily_prob_haircut: float = 0.85          # 15% haircut (biggest correction)
+    cell_yes_daily_empirical_window: int = 0           # Use global (2hr ok for daily)
+    cell_yes_daily_min_edge_pct: float = 0.18          # Higher bar (was 0.15)
+    cell_yes_daily_kelly_multiplier: float = 0.5       # Half-size (poor track record)
+    cell_yes_daily_max_position: float = 25.0
+    cell_yes_daily_require_trend: bool = True          # Require recent price trend toward strike
+    cell_yes_daily_trend_window_minutes: float = 10.0
+
+    # NO/15min — short-term vol fade
+    cell_no_15min_model_weight: float = 0.7            # Keep current (no correction needed)
+    cell_no_15min_prob_haircut: float = 1.0             # No haircut
+    cell_no_15min_empirical_window: int = 30            # Shorter lookback for short contracts
+    cell_no_15min_min_edge_pct: float = 0.10            # Lower bar (vol fade = tighter edge ok)
+    cell_no_15min_kelly_multiplier: float = 0.7
+    cell_no_15min_max_position: float = 30.0
+
+    # NO/daily — big-move fade (proven alpha)
+    cell_no_daily_model_weight: float = 0.75            # Slight boost (model underconfident here)
+    cell_no_daily_prob_haircut: float = 1.0             # No haircut (model works for NO)
+    cell_no_daily_empirical_window: int = 0             # Use global
+    cell_no_daily_min_edge_pct: float = 0.12            # Keep current — this cell works
+    cell_no_daily_kelly_multiplier: float = 1.0         # Full size — proven alpha
+    cell_no_daily_max_position: float = 50.0
+
     # ── Cycle recorder ────────────────────────────────────────────────
     cycle_recorder_enabled: bool = False
     cycle_recorder_db_dir: str = "recordings"
@@ -495,6 +533,36 @@ def load_crypto_settings() -> CryptoSettings:
         momentum_max_position=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_POSITION"), 25.0),
         momentum_max_concurrent=_as_int(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_CONCURRENT"), 2),
         momentum_cooldown_seconds=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_COOLDOWN_SECONDS"), 120.0),
+        # Strategy cell parameters
+        cell_yes_15min_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MODEL_WEIGHT"), 0.5),
+        cell_yes_15min_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_PROB_HAIRCUT"), 0.90),
+        cell_yes_15min_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_EMPIRICAL_WINDOW"), 30),
+        cell_yes_15min_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MIN_EDGE_PCT"), 0.12),
+        cell_yes_15min_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_KELLY_MULTIPLIER"), 0.5),
+        cell_yes_15min_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MAX_POSITION"), 25.0),
+        cell_yes_15min_require_ofi=_as_bool(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_REQUIRE_OFI"), True),
+        cell_yes_15min_ofi_min=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_OFI_MIN"), 0.3),
+        cell_yes_15min_require_price_past_strike=_as_bool(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_REQUIRE_PRICE_PAST_STRIKE"), True),
+        cell_yes_daily_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MODEL_WEIGHT"), 0.4),
+        cell_yes_daily_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_PROB_HAIRCUT"), 0.85),
+        cell_yes_daily_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_EMPIRICAL_WINDOW"), 0),
+        cell_yes_daily_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MIN_EDGE_PCT"), 0.18),
+        cell_yes_daily_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_KELLY_MULTIPLIER"), 0.5),
+        cell_yes_daily_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_MAX_POSITION"), 25.0),
+        cell_yes_daily_require_trend=_as_bool(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_REQUIRE_TREND"), True),
+        cell_yes_daily_trend_window_minutes=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_DAILY_TREND_WINDOW_MINUTES"), 10.0),
+        cell_no_15min_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_MODEL_WEIGHT"), 0.7),
+        cell_no_15min_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_PROB_HAIRCUT"), 1.0),
+        cell_no_15min_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_EMPIRICAL_WINDOW"), 30),
+        cell_no_15min_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_MIN_EDGE_PCT"), 0.10),
+        cell_no_15min_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_KELLY_MULTIPLIER"), 0.7),
+        cell_no_15min_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_15MIN_MAX_POSITION"), 30.0),
+        cell_no_daily_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_MODEL_WEIGHT"), 0.75),
+        cell_no_daily_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_PROB_HAIRCUT"), 1.0),
+        cell_no_daily_empirical_window=_as_int(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_EMPIRICAL_WINDOW"), 0),
+        cell_no_daily_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_MIN_EDGE_PCT"), 0.12),
+        cell_no_daily_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_KELLY_MULTIPLIER"), 1.0),
+        cell_no_daily_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_MAX_POSITION"), 50.0),
         cycle_recorder_enabled=_as_bool(os.getenv("ARB_CRYPTO_CYCLE_RECORDER_ENABLED"), False),
         cycle_recorder_db_dir=os.getenv("ARB_CRYPTO_CYCLE_RECORDER_DB_DIR", "recordings"),
         feature_store_enabled=_as_bool(os.getenv("ARB_CRYPTO_FEATURE_STORE_ENABLED"), False),
