@@ -2254,7 +2254,7 @@ class CryptoEngine:
                     LOGGER.info(
                         "CryptoEngine: empirical fallback for %s: "
                         "only %d returns (need %d), regime=%s",
-                        ticker, len(emp_returns),
+                        mq.market.ticker, len(emp_returns),
                         self._settings.empirical_min_samples,
                         getattr(self._current_regime, 'regime', 'none')
                         if self._current_regime else 'none',
