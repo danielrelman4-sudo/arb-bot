@@ -416,6 +416,7 @@ async def run_paper_test(
         min_edge_pct=min_edge,
         min_edge_pct_daily=min_edge,  # Same as min_edge; per-cell logic applies stricter thresholds
         min_edge_cents=min_edge,
+        dynamic_edge_threshold_enabled=False,  # Per-cell logic applies real thresholds; this extra layer is redundant
         max_model_uncertainty=0.25,
         model_uncertainty_multiplier=3.0,
         bankroll=500.0,
