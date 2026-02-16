@@ -276,6 +276,20 @@ class CryptoSettings:
     # Tier 3: Transition caution zone
     regime_transition_sizing_multiplier: float = 0.3
 
+    # ── Momentum strategy (v18) ──────────────────────────────────────
+    momentum_enabled: bool = False
+    momentum_vpin_floor: float = 0.85       # Lower bound of momentum zone
+    momentum_vpin_ceiling: float = 0.95     # Full halt above this
+    momentum_ofi_alignment_min: float = 0.6 # Min cross-timescale OFI agreement
+    momentum_ofi_magnitude_min: float = 200.0  # Min |weighted OFI|
+    momentum_max_tte_minutes: float = 15.0  # Only short-dated contracts
+    momentum_price_floor: float = 0.15      # Min buy price (avoid dead money)
+    momentum_price_ceiling: float = 0.40    # Max buy price (avoid priced-in)
+    momentum_kelly_fraction: float = 0.03   # Fixed fraction of bankroll
+    momentum_max_position: float = 25.0     # Max dollar per momentum trade
+    momentum_max_concurrent: int = 2        # Max open momentum positions
+    momentum_cooldown_seconds: float = 120.0  # Per-symbol cooldown
+
     # ── Cycle recorder ────────────────────────────────────────────────
     cycle_recorder_enabled: bool = False
     cycle_recorder_db_dir: str = "recordings"
@@ -469,6 +483,18 @@ def load_crypto_settings() -> CryptoSettings:
         regime_kelly_cap_boost_mean_reverting=_as_float(os.getenv("ARB_CRYPTO_REGIME_KELLY_CAP_BOOST_MEAN_REVERTING"), 1.25),
         regime_conditional_drift=_as_bool(os.getenv("ARB_CRYPTO_REGIME_CONDITIONAL_DRIFT"), True),
         regime_transition_sizing_multiplier=_as_float(os.getenv("ARB_CRYPTO_REGIME_TRANSITION_SIZING_MULTIPLIER"), 0.3),
+        momentum_enabled=_as_bool(os.getenv("ARB_CRYPTO_MOMENTUM_ENABLED"), False),
+        momentum_vpin_floor=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_VPIN_FLOOR"), 0.85),
+        momentum_vpin_ceiling=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_VPIN_CEILING"), 0.95),
+        momentum_ofi_alignment_min=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_OFI_ALIGNMENT_MIN"), 0.6),
+        momentum_ofi_magnitude_min=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_OFI_MAGNITUDE_MIN"), 200.0),
+        momentum_max_tte_minutes=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_TTE_MINUTES"), 15.0),
+        momentum_price_floor=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_PRICE_FLOOR"), 0.15),
+        momentum_price_ceiling=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_PRICE_CEILING"), 0.40),
+        momentum_kelly_fraction=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_KELLY_FRACTION"), 0.03),
+        momentum_max_position=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_POSITION"), 25.0),
+        momentum_max_concurrent=_as_int(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_CONCURRENT"), 2),
+        momentum_cooldown_seconds=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_COOLDOWN_SECONDS"), 120.0),
         cycle_recorder_enabled=_as_bool(os.getenv("ARB_CRYPTO_CYCLE_RECORDER_ENABLED"), False),
         cycle_recorder_db_dir=os.getenv("ARB_CRYPTO_CYCLE_RECORDER_DB_DIR", "recordings"),
         feature_store_enabled=_as_bool(os.getenv("ARB_CRYPTO_FEATURE_STORE_ENABLED"), False),
