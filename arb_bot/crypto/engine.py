@@ -2060,14 +2060,29 @@ class CryptoEngine:
 
                 # Auto-calibrate bucket size on first use
                 if vpin_calc.bucket_volume <= 0:
-                    total_vol = self._price_feed.get_total_volume(
-                        binance_sym,
-                        window_seconds=self._settings.vpin_auto_calibrate_window_minutes * 60,
-                    )
-                    vpin_calc.auto_calibrate_bucket_size(
-                        total_volume=total_vol,
-                        window_minutes=float(self._settings.vpin_auto_calibrate_window_minutes),
-                    )
+                    # Per-symbol minimum bucket volumes — ensures each bucket
+                    # contains ~30 trades for meaningful VPIN.
+                    _min_bv = {"btcusdt": 0.10, "ethusdt": 1.0, "solusdt": 50.0}
+                    min_bv = _min_bv.get(binance_sym, 1.0)
+                    # Try trade-size calibration first
+                    buy_sells = self._price_feed._buy_sells.get(binance_sym, [])
+                    trade_sizes = [vol for _, vol, _ in buy_sells]
+                    if len(trade_sizes) >= 10:
+                        vpin_calc.calibrate_from_trades(
+                            trade_sizes=trade_sizes,
+                            trades_per_bucket=30,
+                            min_bucket_volume=min_bv,
+                        )
+                    else:
+                        total_vol = self._price_feed.get_total_volume(
+                            binance_sym,
+                            window_seconds=self._settings.vpin_auto_calibrate_window_minutes * 60,
+                        )
+                        vpin_calc.auto_calibrate_bucket_size(
+                            total_volume=total_vol,
+                            window_minutes=float(self._settings.vpin_auto_calibrate_window_minutes),
+                            min_bucket_volume=min_bv,
+                        )
 
                 vpin = vpin_calc.get_vpin()
                 signed_vpin = vpin_calc.get_signed_vpin()

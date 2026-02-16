@@ -178,6 +178,41 @@ class TestAutoCalibration:
         calc.process_trade(100.0, calc.bucket_volume, True, 2.0)
         assert calc.num_completed_buckets == 1
 
+    def test_auto_calibrate_respects_min_bucket_volume(self):
+        calc = VPINCalculator(bucket_volume=0.0, num_buckets=50)
+        # Total vol would give tiny buckets, but floor prevents it
+        result = calc.auto_calibrate_bucket_size(
+            total_volume=0.5, window_minutes=60.0,
+            target_buckets_per_hour=50, min_bucket_volume=0.10,
+        )
+        assert result >= 0.10  # Floor enforced
+
+    def test_calibrate_from_trades_median(self):
+        calc = VPINCalculator(bucket_volume=0.0, num_buckets=50)
+        # 100 trades with median size 0.005 BTC
+        trade_sizes = [0.005] * 50 + [0.01] * 50
+        result = calc.calibrate_from_trades(
+            trade_sizes=trade_sizes, trades_per_bucket=30, min_bucket_volume=0.001,
+        )
+        # Median is 0.005 (sorted: first 50 are 0.005), bucket = 0.005 * 30 = 0.15
+        # Actually sorted: 50×0.005, 50×0.01 → median at idx 50 → 0.01
+        # So bucket = 0.01 * 30 = 0.30
+        assert result >= 0.15
+
+    def test_calibrate_from_trades_respects_floor(self):
+        calc = VPINCalculator(bucket_volume=0.0, num_buckets=50)
+        # Tiny trades → bucket would be tiny, but floor prevents it
+        trade_sizes = [0.0001] * 50
+        result = calc.calibrate_from_trades(
+            trade_sizes=trade_sizes, trades_per_bucket=30, min_bucket_volume=0.10,
+        )
+        assert result >= 0.10  # Floor enforced
+
+    def test_calibrate_from_trades_empty_fallback(self):
+        calc = VPINCalculator(bucket_volume=0.0, num_buckets=50)
+        result = calc.calibrate_from_trades(trade_sizes=[], min_bucket_volume=0.10)
+        assert result >= 0.10
+
 
 class TestStalenessDetection:
     def test_is_stale_initially(self):

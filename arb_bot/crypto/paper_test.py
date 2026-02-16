@@ -702,22 +702,45 @@ async def run_paper_test(
                     f"OFI={ofi:+.3f}"
                 )
 
-        # 2c. Auto-calibrate VPIN bucket sizes from bootstrap volume data
+        # 2c. Auto-calibrate VPIN bucket sizes from bootstrap trade data.
+        # Key insight: bucket volume must be large enough to contain many
+        # individual trades (~30) so the buy/sell ratio is statistically
+        # meaningful.  Tiny buckets → each bucket filled by 1 trade →
+        # VPIN = 1.0 permanently.  Use per-symbol minimum floors based on
+        # typical trade sizes on OKX spot.
+        _VPIN_MIN_BUCKET = {
+            "btcusdt": 0.10,    # ~$9,700 per bucket at $97k/BTC
+            "ethusdt": 1.0,     # ~$2,700 per bucket at $2,700/ETH
+            "solusdt": 50.0,    # ~$7,500 per bucket at $150/SOL
+        }
         if settings.vpin_enabled:
             print("\nCalibrating VPIN bucket sizes...")
             for sym in [s.lower() for s in binance_symbols]:
                 if sym in engine._vpin_calculators:
                     calc = engine._vpin_calculators[sym]
                     if calc.bucket_volume <= 0:
-                        total_vol = engine.price_feed.get_total_volume(
-                            sym, window_seconds=settings.vpin_auto_calibrate_window_minutes * 60,
-                        )
-                        bv = calc.auto_calibrate_bucket_size(
-                            total_volume=total_vol,
-                            window_minutes=float(settings.vpin_auto_calibrate_window_minutes),
-                        )
-                        LOGGER.info("VPIN: auto-calibrated bucket_volume=%.4f for %s", bv, sym)
-                        print(f"   {sym.upper()}: bucket_volume={bv:.4f}")
+                        min_bv = _VPIN_MIN_BUCKET.get(sym, 1.0)
+                        # Try trade-size-based calibration first (more reliable)
+                        buy_sells = engine.price_feed._buy_sells.get(sym, [])
+                        trade_sizes = [vol for _, vol, _ in buy_sells]
+                        if len(trade_sizes) >= 10:
+                            bv = calc.calibrate_from_trades(
+                                trade_sizes=trade_sizes,
+                                trades_per_bucket=30,
+                                min_bucket_volume=min_bv,
+                            )
+                        else:
+                            # Fallback to volume-rate method
+                            total_vol = engine.price_feed.get_total_volume(
+                                sym, window_seconds=settings.vpin_auto_calibrate_window_minutes * 60,
+                            )
+                            bv = calc.auto_calibrate_bucket_size(
+                                total_volume=total_vol,
+                                window_minutes=float(settings.vpin_auto_calibrate_window_minutes),
+                                min_bucket_volume=min_bv,
+                            )
+                        LOGGER.info("VPIN: calibrated bucket_volume=%.4f for %s (min=%.4f)", bv, sym, min_bv)
+                        print(f"   {sym.upper()}: bucket_volume={bv:.4f} (min_floor={min_bv:.4f})")
 
             # Re-inject bootstrap aggTrades so VPIN can process them
             for sym in [s.lower() for s in binance_symbols]:

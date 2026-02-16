@@ -343,6 +343,7 @@ class VPINCalculator:
         total_volume: float,
         window_minutes: float = 60.0,
         target_buckets_per_hour: int = 50,
+        min_bucket_volume: float = 0.001,
     ) -> float:
         """Set bucket volume from recent trading activity.
 
@@ -354,21 +355,72 @@ class VPINCalculator:
             The window used to measure *total_volume*.
         target_buckets_per_hour:
             Desired number of buckets per hour.
+        min_bucket_volume:
+            Absolute minimum bucket volume.  Set this based on the asset's
+            typical trade size so that each bucket contains many trades
+            (needed for meaningful buy/sell ratio).  For BTC this should
+            be ~0.1, for ETH ~1.0, for SOL ~50.
 
         Returns
         -------
         The computed bucket volume (also stored internally).
         """
         if total_volume <= 0 or window_minutes <= 0:
-            self._bucket_volume = 1.0  # fallback
+            self._bucket_volume = max(1.0, min_bucket_volume)
             return self._bucket_volume
 
         vol_per_min = total_volume / window_minutes
         vol_per_hour = vol_per_min * 60.0
         bucket_vol = vol_per_hour / max(target_buckets_per_hour, 1)
-        self._bucket_volume = max(bucket_vol, 0.001)  # floor to avoid tiny buckets
+        self._bucket_volume = max(bucket_vol, min_bucket_volume)
         LOGGER.info(
-            "VPIN: auto-calibrated bucket_volume=%.4f from %.1f vol/hr (target %d buckets/hr)",
+            "VPIN: auto-calibrated bucket_volume=%.4f from %.1f vol/hr "
+            "(target %d buckets/hr, floor=%.4f)",
             self._bucket_volume, vol_per_hour, target_buckets_per_hour,
+            min_bucket_volume,
+        )
+        return self._bucket_volume
+
+    def calibrate_from_trades(
+        self,
+        trade_sizes: List[float],
+        trades_per_bucket: int = 30,
+        min_bucket_volume: float = 0.001,
+    ) -> float:
+        """Calibrate bucket volume from observed trade sizes.
+
+        A bucket should contain enough trades for a meaningful buy/sell
+        ratio.  This method uses the median trade size × trades_per_bucket
+        to set the bucket volume.  Much more reliable than extrapolating
+        from total volume.
+
+        Parameters
+        ----------
+        trade_sizes:
+            List of individual trade volumes (e.g., from bootstrap).
+        trades_per_bucket:
+            Target number of trades per bucket (30 is a good default
+            for statistically meaningful buy/sell classification).
+        min_bucket_volume:
+            Absolute minimum bucket volume.
+
+        Returns
+        -------
+        The computed bucket volume (also stored internally).
+        """
+        if not trade_sizes:
+            self._bucket_volume = max(1.0, min_bucket_volume)
+            return self._bucket_volume
+
+        sorted_sizes = sorted(trade_sizes)
+        n = len(sorted_sizes)
+        median_size = sorted_sizes[n // 2]
+        bucket_vol = median_size * trades_per_bucket
+        self._bucket_volume = max(bucket_vol, min_bucket_volume)
+        LOGGER.info(
+            "VPIN: calibrated bucket_volume=%.4f from %d trades "
+            "(median_trade=%.6f, target %d trades/bucket, floor=%.4f)",
+            self._bucket_volume, n, median_size, trades_per_bucket,
+            min_bucket_volume,
         )
         return self._bucket_volume
