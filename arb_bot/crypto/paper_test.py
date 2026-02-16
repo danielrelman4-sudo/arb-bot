@@ -535,12 +535,12 @@ async def run_paper_test(
         regime_kelly_mean_reverting=1.5,
         regime_kelly_trending_up=0.4,
         regime_kelly_trending_down=0.5,
-        regime_kelly_high_vol=0.0,
+        regime_kelly_high_vol=0.3,  # Was 0.0; zero blocks ALL trades in high-vol (common in crypto)
         # Tier 1: Regime min edge thresholds
         regime_min_edge_enabled=True,
         regime_min_edge_mean_reverting=0.10,
-        regime_min_edge_trending=0.20,
-        regime_min_edge_high_vol=0.30,
+        regime_min_edge_trending=0.15,  # Was 0.20; 20% after dynamic floor + blending = impossible
+        regime_min_edge_high_vol=0.15,  # Was 0.30; 30% edge is unreachable in binary markets
         # Tier 1: VPIN halt gate
         vpin_halt_enabled=True,
         vpin_halt_threshold=0.85,

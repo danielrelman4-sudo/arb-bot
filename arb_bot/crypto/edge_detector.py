@@ -195,21 +195,34 @@ class EdgeDetector:
             )
             min_edge = self._min_edge_pct_daily if is_daily else self._min_edge_pct
             if effective_edge < min_edge:
+                LOGGER.info(
+                    "Edge on %s rejected: effective_edge %.1f%% < min_edge %.1f%% "
+                    "(side=%s, blended=%.1f%%, mkt=%.1f%%, model=%.1f%%)",
+                    ticker, effective_edge * 100, min_edge * 100,
+                    side, blended * 100, market_prob * 100,
+                    model.probability * 100,
+                )
                 continue
             if edge_cents < self._min_edge_cents:
                 continue
             if model.uncertainty > self._max_uncertainty:
-                LOGGER.debug(
-                    "Edge on %s rejected: uncertainty %.3f > %.3f",
+                LOGGER.info(
+                    "Edge on %s rejected: uncertainty %.3f > max %.3f "
+                    "(edge=%.1f%%, side=%s)",
                     ticker, model.uncertainty, self._max_uncertainty,
+                    effective_edge * 100, side,
                 )
                 continue
 
             # Model-market divergence gate
             if abs(raw_edge) < self._min_model_market_divergence:
-                LOGGER.debug(
-                    "Edge on %s rejected: divergence %.3f < %.3f",
-                    ticker, abs(raw_edge), self._min_model_market_divergence,
+                LOGGER.info(
+                    "Edge on %s rejected: divergence %.1f%% < min %.1f%% "
+                    "(edge=%.1f%%, side=%s, blended=%.1f%%, mkt=%.1f%%)",
+                    ticker, abs(raw_edge) * 100,
+                    self._min_model_market_divergence * 100,
+                    effective_edge * 100, side,
+                    blended * 100, market_prob * 100,
                 )
                 continue
 
@@ -217,9 +230,12 @@ class EdgeDetector:
             if self._dynamic_edge_enabled:
                 dynamic_floor = min_edge + self._dynamic_edge_k * model.uncertainty
                 if effective_edge < dynamic_floor:
-                    LOGGER.debug(
-                        "Edge on %s rejected: edge %.3f < dynamic floor %.3f",
-                        ticker, effective_edge, dynamic_floor,
+                    LOGGER.info(
+                        "Edge on %s rejected: edge %.1f%% < dynamic floor %.1f%% "
+                        "(base=%.1f%% + k=%.1f × unc=%.3f, side=%s)",
+                        ticker, effective_edge * 100, dynamic_floor * 100,
+                        min_edge * 100, self._dynamic_edge_k,
+                        model.uncertainty, side,
                     )
                     continue
 

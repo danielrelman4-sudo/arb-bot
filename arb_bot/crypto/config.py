@@ -98,13 +98,13 @@ class CryptoSettings:
     min_edge_cents: float = 0.05
     min_edge_pct_no_side: float = 0.12
     dynamic_edge_threshold_enabled: bool = True
-    dynamic_edge_uncertainty_multiplier: float = 2.0
+    dynamic_edge_uncertainty_multiplier: float = 1.0  # Was 2.0; k=1 already lifts floor by full uncertainty
     # ── Z-score reachability filter ────────────────────────────────
     zscore_filter_enabled: bool = True
     zscore_max: float = 2.0
     zscore_vol_window_minutes: int = 15
-    min_model_market_divergence: float = 0.12
-    max_model_uncertainty: float = 0.15
+    min_model_market_divergence: float = 0.06  # Was 0.12; after blending compresses, 0.12 needs 17%+ true divergence
+    max_model_uncertainty: float = 0.25  # Was 0.15; with 1.5x Student-t multiplier, raw 0.10 = 0.15 — too tight
     # Calibrated from paper run v4: trades with <5% edge went 1/6 (17%
     # win rate).  Trades with >6% edge went 4/5 (80%).  Raising the
     # floor from 5% → 6% cuts marginal losers.
@@ -422,12 +422,12 @@ def load_crypto_settings() -> CryptoSettings:
         min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.05),
         min_edge_pct_no_side=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_NO_SIDE"), 0.12),
         dynamic_edge_threshold_enabled=_as_bool(os.getenv("ARB_CRYPTO_DYNAMIC_EDGE_THRESHOLD_ENABLED"), True),
-        dynamic_edge_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_DYNAMIC_EDGE_UNCERTAINTY_MULTIPLIER"), 2.0),
+        dynamic_edge_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_DYNAMIC_EDGE_UNCERTAINTY_MULTIPLIER"), 1.0),
         zscore_filter_enabled=_as_bool(os.getenv("ARB_CRYPTO_ZSCORE_FILTER_ENABLED"), True),
         zscore_max=_as_float(os.getenv("ARB_CRYPTO_ZSCORE_MAX"), 2.0),
         zscore_vol_window_minutes=_as_int(os.getenv("ARB_CRYPTO_ZSCORE_VOL_WINDOW_MINUTES"), 15),
-        min_model_market_divergence=_as_float(os.getenv("ARB_CRYPTO_MIN_MODEL_MARKET_DIVERGENCE"), 0.12),
-        max_model_uncertainty=_as_float(os.getenv("ARB_CRYPTO_MAX_MODEL_UNCERTAINTY"), 0.15),
+        min_model_market_divergence=_as_float(os.getenv("ARB_CRYPTO_MIN_MODEL_MARKET_DIVERGENCE"), 0.06),
+        max_model_uncertainty=_as_float(os.getenv("ARB_CRYPTO_MAX_MODEL_UNCERTAINTY"), 0.25),
         model_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_MODEL_UNCERTAINTY_MULTIPLIER"), 3.0),
         confidence_level=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_LEVEL"), 0.95),
         calibration_enabled=_as_bool(os.getenv("ARB_CRYPTO_CALIBRATION_ENABLED"), True),
