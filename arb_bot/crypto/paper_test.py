@@ -398,7 +398,7 @@ async def run_paper_test(
     min_edge: float,
     scan_interval: float,
     max_tte: int,
-    probability_model: str = "ab_test",
+    probability_model: str = "empirical",
 ) -> None:
     """Run the crypto engine paper test."""
 
@@ -1089,8 +1089,8 @@ def main() -> None:
     parser.add_argument("--max-tte", type=int, default=600,
                         help="Max time-to-expiry in minutes (default: 600)")
     parser.add_argument("--model", choices=["mc_gbm", "student_t", "ab_test", "empirical", "ab_empirical"],
-                        default="ab_test",
-                        help="Probability model (default: ab_test)")
+                        default="empirical",
+                        help="Probability model (default: empirical)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
