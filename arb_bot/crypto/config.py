@@ -73,16 +73,50 @@ class CryptoSettings:
     # giving ~4-8 shocks/day (fat-tail adjusted).  Previous 4.0σ fired
     # only ~once per 11 days — far too rare to be useful.
 
+    # ── Probability model selection ──────────────────────────────────
+    probability_model: str = "mc_gbm"  # "mc_gbm" | "student_t" | "empirical" | "ab_test" | "ab_empirical"
+    student_t_nu_default: float = 5.0        # Default degrees of freedom
+    student_t_nu_floor: float = 2.5          # Minimum nu (variance must exist)
+    student_t_nu_ceiling: float = 30.0       # Maximum nu (converges to normal)
+    student_t_fit_window_minutes: int = 120  # Window for fitting nu from returns
+    student_t_fit_min_samples: int = 30      # Minimum returns to fit nu
+    student_t_refit_every_cycles: int = 20   # Re-fit nu every N scan cycles
+    student_t_min_uncertainty: float = 0.02  # Floor on analytical uncertainty
+    student_t_uncertainty_multiplier: float = 1.5  # Separate from MC's 3.0
+
+    # ── Empirical CDF model ──────────────────────────────────────────
+    empirical_window_minutes: int = 120           # Lookback window for returns
+    empirical_min_samples: int = 30               # Minimum returns required
+    empirical_bootstrap_paths: int = 2000         # Number of bootstrap resamples
+    empirical_min_uncertainty: float = 0.02       # Floor on uncertainty
+    empirical_uncertainty_multiplier: float = 1.5 # Separate from MC's 3.0
+    empirical_return_interval_seconds: int = 60   # Return bucketing interval
+
     # ── Edge detection ─────────────────────────────────────────────
-    min_edge_pct: float = 0.06
-    min_edge_pct_daily: float = 0.06
-    min_edge_cents: float = 0.03
+    min_edge_pct: float = 0.12
+    min_edge_pct_daily: float = 0.15
+    min_edge_cents: float = 0.05
+    min_edge_pct_no_side: float = 0.12
+    dynamic_edge_threshold_enabled: bool = True
+    dynamic_edge_uncertainty_multiplier: float = 2.0
+    # ── Z-score reachability filter ────────────────────────────────
+    zscore_filter_enabled: bool = True
+    zscore_max: float = 2.0
+    zscore_vol_window_minutes: int = 15
+    min_model_market_divergence: float = 0.12
     max_model_uncertainty: float = 0.15
     # Calibrated from paper run v4: trades with <5% edge went 1/6 (17%
     # win rate).  Trades with >6% edge went 4/5 (80%).  Raising the
     # floor from 5% → 6% cuts marginal losers.
     model_uncertainty_multiplier: float = 3.0
     confidence_level: float = 0.95
+
+    # ── Calibration ──────────────────────────────────────────────
+    calibration_enabled: bool = True
+    calibration_min_samples: int = 30
+    calibration_recalibrate_every: int = 20
+    calibration_method: str = "isotonic"  # "platt" | "isotonic"
+    calibration_isotonic_min_samples: int = 20
 
     # ── Market filtering ───────────────────────────────────────────
     allowed_directions: List[str] = field(
@@ -91,6 +125,15 @@ class CryptoSettings:
     min_minutes_to_expiry: int = 2
     max_minutes_to_expiry: int = 14
     min_book_depth_contracts: int = 5
+    min_book_volume: int = 10
+
+    # ── Staleness detection ──────────────────────────────────────
+    staleness_enabled: bool = True
+    staleness_spot_move_threshold: float = 0.003
+    staleness_quote_change_threshold: float = 0.005
+    staleness_lookback_seconds: int = 120
+    staleness_max_age_seconds: int = 300
+    staleness_edge_bonus: float = 0.02
 
     # ── Sizing ─────────────────────────────────────────────────────
     bankroll: float = 500.0
@@ -111,6 +154,11 @@ class CryptoSettings:
     ofi_recalibrate_interval_hours: float = 4.0
     ofi_impact_exponent: float = 0.5  # Power-law exponent (0.5 = square root law)
 
+    # ── Multi-timescale features ─────────────────────────────────────
+    multiscale_ofi_enabled: bool = True
+    multiscale_ofi_windows: str = "30,60,120,300"  # comma-separated ints
+    multiscale_ofi_weights: str = "0.4,0.3,0.2,0.1"  # comma-separated floats
+
     # ── AggTrades WebSocket ────────────────────────────────────────────
     agg_trades_ws_enabled: bool = True
 
@@ -118,6 +166,18 @@ class CryptoSettings:
     activity_scaling_enabled: bool = True
     activity_scaling_short_window_seconds: int = 300    # "current" volume window
     activity_scaling_long_window_seconds: int = 3600    # "average" volume window
+
+    # ── Trend drift ──────────────────────────────────────────────
+    trend_drift_enabled: bool = False
+    trend_drift_window_minutes: int = 15
+    trend_drift_decay: float = 5.0
+    trend_drift_max_annualized: float = 5.0
+
+    # ── Drift safety ────────────────────────────────────────────
+    max_total_drift: float = 2.0  # Maximum annualized drift magnitude from all sources
+    mean_reversion_enabled: bool = True
+    mean_reversion_kappa: float = 50.0  # Annualized OU reversion speed
+    mean_reversion_lookback_minutes: float = 5.0
 
     # ── Volume clock ────────────────────────────────────────────
     volume_clock_enabled: bool = False  # Default off for backward compat
@@ -132,6 +192,106 @@ class CryptoSettings:
     # With 4-hr baseline, the smoothed ratio ranges ~0.40-1.55 under
     # normal conditions.  Ceiling of 2.5 gives headroom for genuine
     # volume spikes (news events, crashes) while blocking noise.
+
+    # ── Cross-asset features ──────────────────────────────────────
+    cross_asset_enabled: bool = True
+    cross_asset_leader: str = "btcusdt"
+    cross_asset_ofi_weight: float = 0.3
+    cross_asset_vol_weight: float = 0.2
+    cross_asset_return_weight: float = 0.2
+    cross_asset_return_scale: float = 20.0
+    cross_asset_max_drift: float = 2.0
+
+    # ── Funding rate ────────────────────────────────────────────────
+    funding_rate_enabled: bool = True
+    funding_rate_poll_interval_seconds: int = 300
+    funding_rate_extreme_threshold: float = 0.0005
+    funding_rate_drift_weight: float = 0.5
+    funding_rate_api_url: str = "https://www.okx.com/api/v5/public/funding-rate"
+    funding_rate_history_url: str = "https://fapi.binance.com/fapi/v1/fundingRate"
+
+    # ── VPIN (Volume-Synchronized Probability of Informed Trading) ──
+    vpin_enabled: bool = True
+    vpin_bucket_volume: float = 0.0  # 0 = auto-calibrate
+    vpin_num_buckets: int = 50
+    vpin_auto_calibrate_window_minutes: int = 60
+    vpin_extreme_threshold: float = 0.7
+    vpin_drift_weight: float = 0.4
+    vpin_vol_boost_factor: float = 1.5
+
+    # ── Confidence scoring ──────────────────────────────────────────
+    confidence_scoring_enabled: bool = False  # Start disabled, enable after testing
+    confidence_min_score: float = 0.65
+    confidence_min_agreement: int = 3
+    confidence_staleness_weight: float = 0.25
+    confidence_vpin_weight: float = 0.20
+    confidence_ofi_weight: float = 0.15
+    confidence_funding_weight: float = 0.10
+    confidence_vol_regime_weight: float = 0.10
+    confidence_cross_asset_weight: float = 0.10
+    confidence_model_edge_weight: float = 0.10
+
+    # ── Regime detection ──────────────────────────────────────────────
+    regime_detection_enabled: bool = True
+    regime_ofi_trend_threshold: float = 0.3
+    regime_vol_expansion_threshold: float = 2.0
+    regime_autocorr_window: int = 15
+    regime_min_returns: int = 10
+    regime_vpin_spike_threshold: float = 0.85
+
+    # ── Regime-conditional improvements ────────────────────────────────
+
+    # Tier 1: Regime Kelly multiplier
+    regime_sizing_enabled: bool = False
+    regime_kelly_mean_reverting: float = 1.0
+    regime_kelly_trending_up: float = 0.4
+    regime_kelly_trending_down: float = 0.5
+    regime_kelly_high_vol: float = 0.0
+
+    # Tier 1: Regime min edge threshold
+    regime_min_edge_enabled: bool = False
+    regime_min_edge_mean_reverting: float = 0.10
+    regime_min_edge_trending: float = 0.20
+    regime_min_edge_high_vol: float = 0.30
+
+    # Tier 1: VPIN halt gate
+    vpin_halt_enabled: bool = True
+    vpin_halt_threshold: float = 0.85
+
+    # Tier 2: Counter-trend filter
+    regime_skip_counter_trend: bool = True
+    regime_skip_counter_trend_min_conf: float = 0.6
+
+    # Tier 2: Vol regime adjustment
+    regime_vol_boost_high_vol: float = 1.5
+    regime_empirical_window_high_vol: int = 30
+    regime_empirical_window_trending: int = 60
+
+    # Tier 2: Mean-reverting size boost
+    regime_kelly_cap_boost_mean_reverting: float = 1.25
+
+    # Tier 3: Conditional trend drift (only in trending regimes)
+    regime_conditional_drift: bool = True
+
+    # Tier 3: Transition caution zone
+    regime_transition_sizing_multiplier: float = 0.3
+
+    # ── Feature store ──────────────────────────────────────────────────
+    feature_store_enabled: bool = False
+    feature_store_path: str = "feature_store.csv"
+    feature_store_min_samples: int = 200
+
+    # ── Classifier ─────────────────────────────────────────────────────
+    classifier_enabled: bool = False
+    classifier_model_path: str = ""
+    classifier_min_training_samples: int = 200
+    classifier_retrain_interval_hours: float = 24.0
+    classifier_use_isotonic_calibration: bool = True
+    classifier_max_depth: int = 4
+    classifier_n_estimators: int = 100
+    classifier_learning_rate: float = 0.1
+    classifier_min_child_weight: int = 5
+    classifier_subsample: float = 0.8
 
     # ── Cycle timing ───────────────────────────────────────────────
     scan_interval_seconds: float = 5.0
@@ -172,16 +332,50 @@ def load_crypto_settings() -> CryptoSettings:
         hawkes_alpha=_as_float(os.getenv("ARB_CRYPTO_HAWKES_ALPHA"), 5.0),
         hawkes_beta=_as_float(os.getenv("ARB_CRYPTO_HAWKES_BETA"), 0.00115),
         hawkes_return_threshold_sigma=_as_float(os.getenv("ARB_CRYPTO_HAWKES_RETURN_THRESHOLD_SIGMA"), 3.0),
-        min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.06),
-        min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.06),
-        min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.03),
+        probability_model=os.getenv("ARB_CRYPTO_PROBABILITY_MODEL", "mc_gbm"),
+        student_t_nu_default=_as_float(os.getenv("ARB_CRYPTO_STUDENT_T_NU_DEFAULT"), 5.0),
+        student_t_nu_floor=_as_float(os.getenv("ARB_CRYPTO_STUDENT_T_NU_FLOOR"), 2.5),
+        student_t_nu_ceiling=_as_float(os.getenv("ARB_CRYPTO_STUDENT_T_NU_CEILING"), 30.0),
+        student_t_fit_window_minutes=_as_int(os.getenv("ARB_CRYPTO_STUDENT_T_FIT_WINDOW_MINUTES"), 120),
+        student_t_fit_min_samples=_as_int(os.getenv("ARB_CRYPTO_STUDENT_T_FIT_MIN_SAMPLES"), 30),
+        student_t_refit_every_cycles=_as_int(os.getenv("ARB_CRYPTO_STUDENT_T_REFIT_EVERY_CYCLES"), 20),
+        student_t_min_uncertainty=_as_float(os.getenv("ARB_CRYPTO_STUDENT_T_MIN_UNCERTAINTY"), 0.02),
+        student_t_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_STUDENT_T_UNCERTAINTY_MULTIPLIER"), 1.5),
+        empirical_window_minutes=_as_int(os.getenv("ARB_CRYPTO_EMPIRICAL_WINDOW_MINUTES"), 120),
+        empirical_min_samples=_as_int(os.getenv("ARB_CRYPTO_EMPIRICAL_MIN_SAMPLES"), 30),
+        empirical_bootstrap_paths=_as_int(os.getenv("ARB_CRYPTO_EMPIRICAL_BOOTSTRAP_PATHS"), 2000),
+        empirical_min_uncertainty=_as_float(os.getenv("ARB_CRYPTO_EMPIRICAL_MIN_UNCERTAINTY"), 0.02),
+        empirical_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_EMPIRICAL_UNCERTAINTY_MULTIPLIER"), 1.5),
+        empirical_return_interval_seconds=_as_int(os.getenv("ARB_CRYPTO_EMPIRICAL_RETURN_INTERVAL_SECONDS"), 60),
+        min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT"), 0.12),
+        min_edge_pct_daily=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_DAILY"), 0.15),
+        min_edge_cents=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_CENTS"), 0.05),
+        min_edge_pct_no_side=_as_float(os.getenv("ARB_CRYPTO_MIN_EDGE_PCT_NO_SIDE"), 0.12),
+        dynamic_edge_threshold_enabled=_as_bool(os.getenv("ARB_CRYPTO_DYNAMIC_EDGE_THRESHOLD_ENABLED"), True),
+        dynamic_edge_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_DYNAMIC_EDGE_UNCERTAINTY_MULTIPLIER"), 2.0),
+        zscore_filter_enabled=_as_bool(os.getenv("ARB_CRYPTO_ZSCORE_FILTER_ENABLED"), True),
+        zscore_max=_as_float(os.getenv("ARB_CRYPTO_ZSCORE_MAX"), 2.0),
+        zscore_vol_window_minutes=_as_int(os.getenv("ARB_CRYPTO_ZSCORE_VOL_WINDOW_MINUTES"), 15),
+        min_model_market_divergence=_as_float(os.getenv("ARB_CRYPTO_MIN_MODEL_MARKET_DIVERGENCE"), 0.12),
         max_model_uncertainty=_as_float(os.getenv("ARB_CRYPTO_MAX_MODEL_UNCERTAINTY"), 0.15),
         model_uncertainty_multiplier=_as_float(os.getenv("ARB_CRYPTO_MODEL_UNCERTAINTY_MULTIPLIER"), 3.0),
         confidence_level=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_LEVEL"), 0.95),
+        calibration_enabled=_as_bool(os.getenv("ARB_CRYPTO_CALIBRATION_ENABLED"), True),
+        calibration_min_samples=_as_int(os.getenv("ARB_CRYPTO_CALIBRATION_MIN_SAMPLES"), 30),
+        calibration_recalibrate_every=_as_int(os.getenv("ARB_CRYPTO_CALIBRATION_RECALIBRATE_EVERY"), 20),
+        calibration_method=os.environ.get("ARB_CRYPTO_CALIBRATION_METHOD", "isotonic"),
+        calibration_isotonic_min_samples=int(os.environ.get("ARB_CRYPTO_CALIBRATION_ISOTONIC_MIN_SAMPLES", "20")),
         allowed_directions=_as_csv(os.getenv("ARB_CRYPTO_ALLOWED_DIRECTIONS")) or ["above", "below"],
         min_minutes_to_expiry=_as_int(os.getenv("ARB_CRYPTO_MIN_MINUTES_TO_EXPIRY"), 2),
         max_minutes_to_expiry=_as_int(os.getenv("ARB_CRYPTO_MAX_MINUTES_TO_EXPIRY"), 14),
         min_book_depth_contracts=_as_int(os.getenv("ARB_CRYPTO_MIN_BOOK_DEPTH_CONTRACTS"), 5),
+        min_book_volume=_as_int(os.getenv("ARB_CRYPTO_MIN_BOOK_VOLUME"), 10),
+        staleness_enabled=_as_bool(os.getenv("ARB_CRYPTO_STALENESS_ENABLED"), True),
+        staleness_spot_move_threshold=_as_float(os.getenv("ARB_CRYPTO_STALENESS_SPOT_MOVE_THRESHOLD"), 0.003),
+        staleness_quote_change_threshold=_as_float(os.getenv("ARB_CRYPTO_STALENESS_QUOTE_CHANGE_THRESHOLD"), 0.005),
+        staleness_lookback_seconds=_as_int(os.getenv("ARB_CRYPTO_STALENESS_LOOKBACK_SECONDS"), 120),
+        staleness_max_age_seconds=_as_int(os.getenv("ARB_CRYPTO_STALENESS_MAX_AGE_SECONDS"), 300),
+        staleness_edge_bonus=_as_float(os.getenv("ARB_CRYPTO_STALENESS_EDGE_BONUS"), 0.02),
         bankroll=_as_float(os.getenv("ARB_CRYPTO_BANKROLL"), 500.0),
         max_position_per_market=_as_float(os.getenv("ARB_CRYPTO_MAX_POSITION_PER_MARKET"), 50.0),
         max_concurrent_positions=_as_int(os.getenv("ARB_CRYPTO_MAX_CONCURRENT_POSITIONS"), 10),
@@ -198,12 +392,92 @@ def load_crypto_settings() -> CryptoSettings:
         ofi_alpha=_as_float(os.getenv("ARB_CRYPTO_OFI_ALPHA"), 0.0),
         ofi_recalibrate_interval_hours=_as_float(os.getenv("ARB_CRYPTO_OFI_RECALIBRATE_HOURS"), 4.0),
         ofi_impact_exponent=_as_float(os.getenv("ARB_CRYPTO_OFI_IMPACT_EXPONENT"), 0.5),
+        multiscale_ofi_enabled=_as_bool(os.getenv("ARB_CRYPTO_MULTISCALE_OFI_ENABLED"), True),
+        multiscale_ofi_windows=os.environ.get("ARB_CRYPTO_MULTISCALE_OFI_WINDOWS", "30,60,120,300"),
+        multiscale_ofi_weights=os.environ.get("ARB_CRYPTO_MULTISCALE_OFI_WEIGHTS", "0.4,0.3,0.2,0.1"),
         agg_trades_ws_enabled=_as_bool(os.getenv("ARB_CRYPTO_AGG_TRADES_WS_ENABLED"), True),
         volume_clock_enabled=_as_bool(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_ENABLED"), False),
         volume_clock_short_window_seconds=_as_int(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_SHORT_WINDOW"), 300),
         volume_clock_baseline_window_seconds=_as_int(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_BASELINE_WINDOW"), 14400),
         volume_clock_ratio_floor=_as_float(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_RATIO_FLOOR"), 0.25),
         volume_clock_ratio_ceiling=_as_float(os.getenv("ARB_CRYPTO_VOLUME_CLOCK_RATIO_CEILING"), 2.5),
+        trend_drift_enabled=_as_bool(os.getenv("ARB_CRYPTO_TREND_DRIFT_ENABLED"), False),
+        trend_drift_window_minutes=_as_int(os.getenv("ARB_CRYPTO_TREND_DRIFT_WINDOW_MINUTES"), 15),
+        trend_drift_decay=_as_float(os.getenv("ARB_CRYPTO_TREND_DRIFT_DECAY"), 5.0),
+        trend_drift_max_annualized=_as_float(os.getenv("ARB_CRYPTO_TREND_DRIFT_MAX_ANNUALIZED"), 5.0),
+        max_total_drift=_as_float(os.getenv("ARB_CRYPTO_MAX_TOTAL_DRIFT"), 2.0),
+        mean_reversion_enabled=_as_bool(os.getenv("ARB_CRYPTO_MEAN_REVERSION_ENABLED"), True),
+        mean_reversion_kappa=_as_float(os.getenv("ARB_CRYPTO_MEAN_REVERSION_KAPPA"), 50.0),
+        mean_reversion_lookback_minutes=_as_float(os.getenv("ARB_CRYPTO_MEAN_REVERSION_LOOKBACK_MINUTES"), 5.0),
+        cross_asset_enabled=_as_bool(os.getenv("ARB_CRYPTO_CROSS_ASSET_ENABLED"), True),
+        cross_asset_leader=os.getenv("ARB_CRYPTO_CROSS_ASSET_LEADER", "btcusdt"),
+        cross_asset_ofi_weight=_as_float(os.getenv("ARB_CRYPTO_CROSS_ASSET_OFI_WEIGHT"), 0.3),
+        cross_asset_vol_weight=_as_float(os.getenv("ARB_CRYPTO_CROSS_ASSET_VOL_WEIGHT"), 0.2),
+        cross_asset_return_weight=_as_float(os.getenv("ARB_CRYPTO_CROSS_ASSET_RETURN_WEIGHT"), 0.2),
+        cross_asset_return_scale=_as_float(os.getenv("ARB_CRYPTO_CROSS_ASSET_RETURN_SCALE"), 20.0),
+        cross_asset_max_drift=_as_float(os.getenv("ARB_CRYPTO_CROSS_ASSET_MAX_DRIFT"), 2.0),
+        funding_rate_enabled=_as_bool(os.getenv("ARB_CRYPTO_FUNDING_RATE_ENABLED"), True),
+        funding_rate_poll_interval_seconds=_as_int(os.getenv("ARB_CRYPTO_FUNDING_RATE_POLL_INTERVAL"), 300),
+        funding_rate_extreme_threshold=_as_float(os.getenv("ARB_CRYPTO_FUNDING_RATE_EXTREME_THRESHOLD"), 0.0005),
+        funding_rate_drift_weight=_as_float(os.getenv("ARB_CRYPTO_FUNDING_RATE_DRIFT_WEIGHT"), 0.5),
+        funding_rate_api_url=os.getenv("ARB_CRYPTO_FUNDING_RATE_API_URL", "https://www.okx.com/api/v5/public/funding-rate"),
+        funding_rate_history_url=os.getenv("ARB_CRYPTO_FUNDING_RATE_HISTORY_URL", "https://fapi.binance.com/fapi/v1/fundingRate"),
+        vpin_enabled=_as_bool(os.getenv("ARB_CRYPTO_VPIN_ENABLED"), True),
+        vpin_bucket_volume=_as_float(os.getenv("ARB_CRYPTO_VPIN_BUCKET_VOLUME"), 0.0),
+        vpin_num_buckets=_as_int(os.getenv("ARB_CRYPTO_VPIN_NUM_BUCKETS"), 50),
+        vpin_auto_calibrate_window_minutes=_as_int(os.getenv("ARB_CRYPTO_VPIN_AUTO_CALIBRATE_WINDOW"), 60),
+        vpin_extreme_threshold=_as_float(os.getenv("ARB_CRYPTO_VPIN_EXTREME_THRESHOLD"), 0.7),
+        vpin_drift_weight=_as_float(os.getenv("ARB_CRYPTO_VPIN_DRIFT_WEIGHT"), 0.4),
+        vpin_vol_boost_factor=_as_float(os.getenv("ARB_CRYPTO_VPIN_VOL_BOOST_FACTOR"), 1.5),
+        confidence_scoring_enabled=_as_bool(os.getenv("ARB_CRYPTO_CONFIDENCE_SCORING_ENABLED"), False),
+        confidence_min_score=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_MIN_SCORE"), 0.65),
+        confidence_min_agreement=_as_int(os.getenv("ARB_CRYPTO_CONFIDENCE_MIN_AGREEMENT"), 3),
+        confidence_staleness_weight=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_STALENESS_WEIGHT"), 0.25),
+        confidence_vpin_weight=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_VPIN_WEIGHT"), 0.20),
+        confidence_ofi_weight=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_OFI_WEIGHT"), 0.15),
+        confidence_funding_weight=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_FUNDING_WEIGHT"), 0.10),
+        confidence_vol_regime_weight=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_VOL_REGIME_WEIGHT"), 0.10),
+        confidence_cross_asset_weight=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_CROSS_ASSET_WEIGHT"), 0.10),
+        confidence_model_edge_weight=_as_float(os.getenv("ARB_CRYPTO_CONFIDENCE_MODEL_EDGE_WEIGHT"), 0.10),
+        regime_detection_enabled=_as_bool(os.getenv("ARB_CRYPTO_REGIME_DETECTION_ENABLED"), True),
+        regime_ofi_trend_threshold=_as_float(os.getenv("ARB_CRYPTO_REGIME_OFI_TREND_THRESHOLD"), 0.3),
+        regime_vol_expansion_threshold=_as_float(os.getenv("ARB_CRYPTO_REGIME_VOL_EXPANSION_THRESHOLD"), 2.0),
+        regime_autocorr_window=_as_int(os.getenv("ARB_CRYPTO_REGIME_AUTOCORR_WINDOW"), 15),
+        regime_min_returns=_as_int(os.getenv("ARB_CRYPTO_REGIME_MIN_RETURNS"), 10),
+        regime_vpin_spike_threshold=_as_float(os.getenv("ARB_CRYPTO_REGIME_VPIN_SPIKE_THRESHOLD"), 0.85),
+        # Regime-conditional improvements
+        regime_sizing_enabled=_as_bool(os.getenv("ARB_CRYPTO_REGIME_SIZING_ENABLED"), False),
+        regime_kelly_mean_reverting=_as_float(os.getenv("ARB_CRYPTO_REGIME_KELLY_MEAN_REVERTING"), 1.0),
+        regime_kelly_trending_up=_as_float(os.getenv("ARB_CRYPTO_REGIME_KELLY_TRENDING_UP"), 0.4),
+        regime_kelly_trending_down=_as_float(os.getenv("ARB_CRYPTO_REGIME_KELLY_TRENDING_DOWN"), 0.5),
+        regime_kelly_high_vol=_as_float(os.getenv("ARB_CRYPTO_REGIME_KELLY_HIGH_VOL"), 0.0),
+        regime_min_edge_enabled=_as_bool(os.getenv("ARB_CRYPTO_REGIME_MIN_EDGE_ENABLED"), False),
+        regime_min_edge_mean_reverting=_as_float(os.getenv("ARB_CRYPTO_REGIME_MIN_EDGE_MEAN_REVERTING"), 0.10),
+        regime_min_edge_trending=_as_float(os.getenv("ARB_CRYPTO_REGIME_MIN_EDGE_TRENDING"), 0.20),
+        regime_min_edge_high_vol=_as_float(os.getenv("ARB_CRYPTO_REGIME_MIN_EDGE_HIGH_VOL"), 0.30),
+        vpin_halt_enabled=_as_bool(os.getenv("ARB_CRYPTO_VPIN_HALT_ENABLED"), True),
+        vpin_halt_threshold=_as_float(os.getenv("ARB_CRYPTO_VPIN_HALT_THRESHOLD"), 0.85),
+        regime_skip_counter_trend=_as_bool(os.getenv("ARB_CRYPTO_REGIME_SKIP_COUNTER_TREND"), True),
+        regime_skip_counter_trend_min_conf=_as_float(os.getenv("ARB_CRYPTO_REGIME_SKIP_COUNTER_TREND_MIN_CONF"), 0.6),
+        regime_vol_boost_high_vol=_as_float(os.getenv("ARB_CRYPTO_REGIME_VOL_BOOST_HIGH_VOL"), 1.5),
+        regime_empirical_window_high_vol=_as_int(os.getenv("ARB_CRYPTO_REGIME_EMPIRICAL_WINDOW_HIGH_VOL"), 30),
+        regime_empirical_window_trending=_as_int(os.getenv("ARB_CRYPTO_REGIME_EMPIRICAL_WINDOW_TRENDING"), 60),
+        regime_kelly_cap_boost_mean_reverting=_as_float(os.getenv("ARB_CRYPTO_REGIME_KELLY_CAP_BOOST_MEAN_REVERTING"), 1.25),
+        regime_conditional_drift=_as_bool(os.getenv("ARB_CRYPTO_REGIME_CONDITIONAL_DRIFT"), True),
+        regime_transition_sizing_multiplier=_as_float(os.getenv("ARB_CRYPTO_REGIME_TRANSITION_SIZING_MULTIPLIER"), 0.3),
+        feature_store_enabled=_as_bool(os.getenv("ARB_CRYPTO_FEATURE_STORE_ENABLED"), False),
+        feature_store_path=os.getenv("ARB_CRYPTO_FEATURE_STORE_PATH", "feature_store.csv"),
+        feature_store_min_samples=_as_int(os.getenv("ARB_CRYPTO_FEATURE_STORE_MIN_SAMPLES"), 200),
+        classifier_enabled=_as_bool(os.getenv("ARB_CRYPTO_CLASSIFIER_ENABLED"), False),
+        classifier_model_path=os.getenv("ARB_CRYPTO_CLASSIFIER_MODEL_PATH", ""),
+        classifier_min_training_samples=_as_int(os.getenv("ARB_CRYPTO_CLASSIFIER_MIN_TRAINING_SAMPLES"), 200),
+        classifier_retrain_interval_hours=_as_float(os.getenv("ARB_CRYPTO_CLASSIFIER_RETRAIN_INTERVAL_HOURS"), 24.0),
+        classifier_use_isotonic_calibration=_as_bool(os.getenv("ARB_CRYPTO_CLASSIFIER_USE_ISOTONIC"), True),
+        classifier_max_depth=_as_int(os.getenv("ARB_CRYPTO_CLASSIFIER_MAX_DEPTH"), 4),
+        classifier_n_estimators=_as_int(os.getenv("ARB_CRYPTO_CLASSIFIER_N_ESTIMATORS"), 100),
+        classifier_learning_rate=_as_float(os.getenv("ARB_CRYPTO_CLASSIFIER_LEARNING_RATE"), 0.1),
+        classifier_min_child_weight=_as_int(os.getenv("ARB_CRYPTO_CLASSIFIER_MIN_CHILD_WEIGHT"), 5),
+        classifier_subsample=_as_float(os.getenv("ARB_CRYPTO_CLASSIFIER_SUBSAMPLE"), 0.8),
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),
