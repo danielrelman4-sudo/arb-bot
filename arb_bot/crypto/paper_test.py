@@ -55,6 +55,9 @@ _BINANCE_MAP = {
     "SOL": "SOLUSDT",
 }
 
+OKX_TRADES_URL = "https://www.okx.com/api/v5/market/trades"
+_OKX_MAP = {"BTC": "BTC-USDT", "ETH": "ETH-USDT", "SOL": "SOL-USDT"}
+
 
 # ── Binance REST price feed ────────────────────────────────────────
 
@@ -125,6 +128,29 @@ async def fetch_binance_agg_trades(
     return []
 
 
+async def fetch_okx_trades(
+    okx_symbol: str,
+    limit: int,
+    client: httpx.AsyncClient,
+) -> list[dict]:
+    """Fetch recent trades from OKX for OFI bootstrap (higher volume than Binance US)."""
+    try:
+        resp = await client.get(
+            OKX_TRADES_URL,
+            params={
+                "instId": okx_symbol,
+                "limit": str(min(limit, 100)),  # OKX max is 100 per request
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            return body.get("data", [])
+    except Exception as exc:
+        LOGGER.warning("OKX trades %s failed: %s", okx_symbol, exc)
+    return []
+
+
 # ── Kalshi market parsing ──────────────────────────────────────────
 
 def _infer_underlying(ticker: str) -> str:
@@ -178,6 +204,7 @@ def _infer_direction_and_strike(
 def kalshi_raw_to_quote(
     raw: dict,
     now: datetime,
+    min_book_volume: int = 0,
 ) -> CryptoMarketQuote | None:
     """Convert a raw Kalshi market dict to CryptoMarketQuote.
 
@@ -273,6 +300,11 @@ def kalshi_raw_to_quote(
     if yes_spread > 0.40 or no_spread > 0.40:
         return None
 
+    # Volume filter: skip low-volume markets
+    volume = raw.get("volume", 0)
+    if min_book_volume > 0 and isinstance(volume, (int, float)) and volume < min_book_volume:
+        return None
+
     # Use bid/ask midpoints for more accurate implied probability
     yes_mid = (yes_bid + yes_ask) / 2.0
     no_mid = (no_bid + no_ask) / 2.0
@@ -338,10 +370,14 @@ async def run_paper_test(
     min_edge: float,
     scan_interval: float,
     max_tte: int,
+    probability_model: str = "ab_test",
 ) -> None:
     """Run the crypto engine paper test."""
 
     binance_symbols = [_BINANCE_MAP[u] for u in underlyings if u in _BINANCE_MAP]
+
+    # Feature store path (unique per run)
+    fs_path = f"arb_bot/output/feature_store_v11_{int(time.time())}.csv"
 
     settings = CryptoSettings(
         enabled=True,
@@ -350,7 +386,7 @@ async def run_paper_test(
         price_feed_symbols=[s.lower() for s in binance_symbols],
         mc_num_paths=mc_paths,
         min_edge_pct=min_edge,
-        min_edge_pct_daily=0.06,
+        min_edge_pct_daily=0.15,
         min_edge_cents=min_edge,
         max_model_uncertainty=0.20,
         model_uncertainty_multiplier=3.0,
@@ -367,57 +403,181 @@ async def run_paper_test(
         max_minutes_to_expiry=max_tte,
         min_book_depth_contracts=1,
         allowed_directions=["above", "below", "up", "down"],
+        # Fix 1: Trend drift
+        trend_drift_enabled=True,
+        trend_drift_window_minutes=15,
+        trend_drift_decay=5.0,
+        trend_drift_max_annualized=5.0,
+        # Fix 2: Raised thresholds (min_edge_pct/min_edge_cents from --min-edge arg)
+        # min_edge_pct_daily raised from 0.06 → 0.15
+        # Fix 3: Isotonic calibration (upgraded from Platt)
+        calibration_enabled=True,
+        calibration_min_samples=20,
+        calibration_recalibrate_every=10,
+        calibration_method="isotonic",
+        calibration_isotonic_min_samples=20,
+        # Fix 4: NO-side threshold equalized with YES (was 0.20)
+        min_edge_pct_no_side=0.12,
+        # Fix 5: Model-market divergence filter
+        min_model_market_divergence=0.12,
+        # Fix 6: Book volume filter
+        min_book_volume=10,
         # OFI microstructure drift
         ofi_enabled=True,
         ofi_window_seconds=600,
         ofi_alpha=0.0,  # starts neutral, calibrated at runtime
         ofi_recalibrate_interval_hours=4.0,
+        # Multi-timescale OFI (Phase A3)
+        multiscale_ofi_enabled=True,
+        multiscale_ofi_windows="30,60,120,300",
+        multiscale_ofi_weights="0.4,0.3,0.2,0.1",
         # Volume clock — calibrated from 30-day historical data
-        # BTC has 11× diurnal volume range → needs 4-hr baseline
         volume_clock_enabled=True,
         volume_clock_short_window_seconds=300,
-        volume_clock_baseline_window_seconds=14400,  # 4hr (was 1hr)
+        volume_clock_baseline_window_seconds=14400,  # 4hr
         volume_clock_ratio_floor=0.25,
-        volume_clock_ratio_ceiling=2.5,  # (was 4.0)
+        volume_clock_ratio_ceiling=2.5,
         activity_scaling_enabled=False,  # Superseded by volume clock
         activity_scaling_short_window_seconds=300,
         activity_scaling_long_window_seconds=3600,
         # Jump diffusion + Hawkes self-exciting intensity
-        # Hawkes threshold calibrated: 3.0σ gives ~4-8 shocks/day
-        # (was 4.0σ → ~1 per 11 days, never triggered in paper v4)
         use_jump_diffusion=True,
         hawkes_enabled=True,
         mc_jump_intensity=3.0,
         mc_jump_mean=0.0,
         mc_jump_vol=0.02,
+        # ── Phase A: New signal features ──────────────────────────
+        # A1: Staleness detection
+        staleness_enabled=True,
+        staleness_spot_move_threshold=0.003,
+        staleness_quote_change_threshold=0.005,
+        staleness_lookback_seconds=120,
+        staleness_max_age_seconds=300,
+        staleness_edge_bonus=0.02,
+        # A2: Funding rate
+        funding_rate_enabled=True,
+        funding_rate_poll_interval_seconds=300,
+        funding_rate_extreme_threshold=0.0005,
+        funding_rate_drift_weight=0.5,
+        # A5: Cross-asset features
+        cross_asset_enabled=True,
+        cross_asset_leader="btcusdt",
+        cross_asset_ofi_weight=0.3,
+        cross_asset_vol_weight=0.2,
+        cross_asset_return_weight=0.2,
+        cross_asset_return_scale=20.0,  # v9: was 105,192x annualization
+        cross_asset_max_drift=2.0,     # v9: clamp cross-asset drift
+        # ── v9: Drift safety ────────────────────────────────────
+        max_total_drift=2.0,           # clamp sum of all 5 drift sources
+        mean_reversion_enabled=True,   # OU-like pull against recent moves
+        mean_reversion_kappa=50.0,     # reversion strength
+        mean_reversion_lookback_minutes=5.0,
+        # ── Phase B: Core signals ─────────────────────────────────
+        # B1: VPIN
+        vpin_enabled=True,
+        vpin_bucket_volume=0.0,  # Auto-calibrate
+        vpin_num_buckets=50,
+        vpin_auto_calibrate_window_minutes=60,
+        vpin_extreme_threshold=0.7,
+        vpin_drift_weight=0.4,
+        vpin_vol_boost_factor=1.5,
+        # B2: Confidence scoring — disabled for now, just observe
+        confidence_scoring_enabled=False,
+        confidence_min_score=0.65,
+        confidence_min_agreement=3,
+        # ── Phase C: Training pipeline ────────────────────────────
+        # C1: Feature store — ENABLED to collect training data
+        feature_store_enabled=True,
+        feature_store_path=fs_path,
+        feature_store_min_samples=200,
+        # C2: Classifier — disabled until we have enough training data
+        classifier_enabled=False,
+        # ── v11: Student-t A/B test ────────────────────────────────
+        probability_model=probability_model,
+        # ── Empirical CDF model ──────────────────────────────────────
+        empirical_window_minutes=120,
+        empirical_min_samples=30,
+        empirical_bootstrap_paths=2000,
+        empirical_min_uncertainty=0.02,
+        empirical_uncertainty_multiplier=1.5,
+        empirical_return_interval_seconds=60,
+        # ── Regime-conditional improvements ──────────────────────────
+        # Tier 1: Regime Kelly multiplier
+        regime_sizing_enabled=True,
+        regime_kelly_mean_reverting=1.0,
+        regime_kelly_trending_up=0.4,
+        regime_kelly_trending_down=0.5,
+        regime_kelly_high_vol=0.0,
+        # Tier 1: Regime min edge thresholds
+        regime_min_edge_enabled=True,
+        regime_min_edge_mean_reverting=0.10,
+        regime_min_edge_trending=0.20,
+        regime_min_edge_high_vol=0.30,
+        # Tier 1: VPIN halt gate
+        vpin_halt_enabled=True,
+        vpin_halt_threshold=0.85,
+        # Tier 2: Counter-trend filter
+        regime_skip_counter_trend=True,
+        regime_skip_counter_trend_min_conf=0.6,
+        # Tier 2: Vol regime adjustment
+        regime_vol_boost_high_vol=1.5,
+        regime_empirical_window_high_vol=30,
+        regime_empirical_window_trending=60,
+        # Tier 2: Mean-reverting size boost
+        regime_kelly_cap_boost_mean_reverting=1.25,
+        # Tier 3: Conditional trend drift
+        regime_conditional_drift=True,
+        # Tier 3: Transition caution zone
+        regime_transition_sizing_multiplier=0.3,
     )
 
     engine = CryptoEngine(settings)
 
     print(f"\n{'='*70}")
-    print(f"  Crypto Prediction Engine — Paper Test v6 (real settlement)")
-    print(f"  (calibrated from 30-day historical + paper v4 results)")
+    model_label = {"mc_gbm": "MC-GBM", "student_t": "Student-t", "ab_test": "MC+Student-t A/B", "empirical": "Empirical CDF", "ab_empirical": "MC+Empirical A/B"}
+    print(f"  Crypto Prediction Engine — Paper Test v11 ({model_label.get(probability_model, probability_model)})")
+    print(f"  v11: Student-t analytical model A/B test,")
+    print(f"        OKX trades, all predictive alpha features")
     print(f"{'='*70}")
     print(f"  Underlyings:    {', '.join(underlyings)}")
     print(f"  Binance feeds:  {', '.join(binance_symbols)}")
     print(f"  MC paths:       {mc_paths}")
-    print(f"  Min edge:       {min_edge*100:.1f}% (daily: 6.0%)")
+    print(f"  Min edge:       {min_edge*100:.1f}% (daily: {settings.min_edge_pct_daily*100:.1f}%)")
     print(f"  Duration:       {duration_minutes} min")
     print(f"  Max TTE:        {max_tte} min")
     print(f"  Scan interval:  {scan_interval}s")
-    print(f"  Directions:     above, below, up, down (ref-price fixed)")
-    print(f"  OFI drift:      enabled (window=600s, recal=4h)")
-    print(f"  Volume clock:   enabled (short=300s, baseline=14400s/4hr)")
-    print(f"  VC clamps:      [{settings.volume_clock_ratio_floor}, {settings.volume_clock_ratio_ceiling}]")
-    print(f"  Hawkes jumps:   enabled (α=5.0, β=0.00115, threshold=3.0σ)")
-    print(f"  Jump diffusion: enabled (μ=0, σ_j=0.02, base λ=3/day)")
-    print(f"  Unc multiplier: 3.0x")
-    print(f"  Max per-UL:     3 positions")
+    print(f"  Prob model:     {probability_model}")
+    print(f"  Calibration:    {settings.calibration_method} (min_samples={settings.calibration_min_samples})")
+    print(f"  Staleness:      {'ON' if settings.staleness_enabled else 'OFF'}")
+    print(f"  Multi-OFI:      {'ON' if settings.multiscale_ofi_enabled else 'OFF'} (windows={settings.multiscale_ofi_windows})")
+    print(f"  Funding rate:   {'ON' if settings.funding_rate_enabled else 'OFF'} (weight={settings.funding_rate_drift_weight})")
+    print(f"  Cross-asset:    {'ON' if settings.cross_asset_enabled else 'OFF'} (leader={settings.cross_asset_leader}, scale={settings.cross_asset_return_scale}, max={settings.cross_asset_max_drift})")
+    print(f"  VPIN:           {'ON' if settings.vpin_enabled else 'OFF'} (drift_wt={settings.vpin_drift_weight})")
+    print(f"  Drift safety:   max_total={settings.max_total_drift}, mean_rev={'ON' if settings.mean_reversion_enabled else 'OFF'} (κ={settings.mean_reversion_kappa}, lookback={settings.mean_reversion_lookback_minutes}m)")
+    print(f"  Edge thresholds: YES={settings.min_edge_pct*100:.0f}%, NO={settings.min_edge_pct_no_side*100:.0f}%")
+    print(f"  Dynamic edge:   {'ON' if settings.dynamic_edge_threshold_enabled else 'OFF'} (k={settings.dynamic_edge_uncertainty_multiplier})")
+    print(f"  Z-score filter: {'ON' if settings.zscore_filter_enabled else 'OFF'} (max={settings.zscore_max}, vol_window={settings.zscore_vol_window_minutes}m)")
+    print(f"  Regime detect:  {'ON' if settings.regime_detection_enabled else 'OFF'} (ofi_thresh={settings.regime_ofi_trend_threshold}, vpin_spike={settings.regime_vpin_spike_threshold})")
+    print(f"  Regime sizing:  {'ON' if settings.regime_sizing_enabled else 'OFF'} (mr={settings.regime_kelly_mean_reverting}, tu={settings.regime_kelly_trending_up}, td={settings.regime_kelly_trending_down}, hv={settings.regime_kelly_high_vol})")
+    print(f"  Regime edge:    {'ON' if settings.regime_min_edge_enabled else 'OFF'} (mr={settings.regime_min_edge_mean_reverting}, tr={settings.regime_min_edge_trending}, hv={settings.regime_min_edge_high_vol})")
+    print(f"  VPIN halt:      {'ON' if settings.vpin_halt_enabled else 'OFF'} (threshold={settings.vpin_halt_threshold})")
+    print(f"  Counter-trend:  {'SKIP' if settings.regime_skip_counter_trend else 'OFF'} (min_conf={settings.regime_skip_counter_trend_min_conf})")
+    print(f"  Cond. drift:    {'ON' if settings.regime_conditional_drift else 'OFF'}")
+    print(f"  Transition:     sizing×{settings.regime_transition_sizing_multiplier}")
+    print(f"  Confidence:     {'ON' if settings.confidence_scoring_enabled else 'OFF (observing)'}")
+    print(f"  Feature store:  {'ON' if settings.feature_store_enabled else 'OFF'} → {fs_path}")
+    print(f"  Classifier:     {'ON' if settings.classifier_enabled else 'OFF (collecting data)'}")
+    print(f"  Volume clock:   ON (short=300s, baseline=4hr)")
+    print(f"  Hawkes jumps:   ON (α=5.0, β=0.00115, threshold=3.0σ)")
     print(f"{'='*70}\n")
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
         # Wire up HTTP client for real Kalshi settlement
         engine.set_http_client(client)
+
+        # Start funding rate tracker polling
+        if engine._funding_tracker is not None:
+            await engine._funding_tracker.start(client)
 
         # 1. Bootstrap with Binance klines
         print("Loading historical prices from Binance US REST API...")
@@ -444,37 +604,73 @@ async def run_paper_test(
         if not prices:
             print("   WARNING: No Binance prices available. Using historical data only.")
 
-        # 2b. Bootstrap OFI data from aggTrades
-        print("\nBootstrapping OFI data from Binance aggTrades...")
-        for sym in binance_symbols:
-            trades = await fetch_binance_agg_trades(sym, 1000, client)
+        # 2b. Bootstrap OFI data from OKX trades
+        print("\nBootstrapping OFI data from OKX trades...")
+        for underlying in underlyings:
+            okx_sym = _OKX_MAP.get(underlying)
+            binance_sym = _BINANCE_MAP.get(underlying)
+            if not okx_sym or not binance_sym:
+                continue
+            trades = await fetch_okx_trades(okx_sym, 100, client)
             if trades:
                 buy_count = 0
                 sell_count = 0
                 for trade in trades:
                     try:
-                        ts = float(trade["T"]) / 1000.0
-                        price = float(trade["p"])
-                        qty = float(trade["q"])
-                        is_buyer_maker = trade.get("m")
+                        price = float(trade["px"])
+                        qty = float(trade["sz"])
+                        ts = float(trade["ts"]) / 1000.0
+                        side = trade.get("side", "")
                     except (KeyError, ValueError, TypeError):
                         continue
+                    is_buyer_maker = side == "sell"
                     tick = PriceTick(
-                        symbol=sym.lower(), price=price, timestamp=ts,
+                        symbol=binance_sym.lower(), price=price, timestamp=ts,
                         volume=qty, is_buyer_maker=is_buyer_maker,
                     )
                     engine.price_feed.inject_tick(tick)
-                    if isinstance(is_buyer_maker, bool):
-                        if is_buyer_maker:
-                            sell_count += 1
-                        else:
-                            buy_count += 1
-                ofi = engine.price_feed.get_ofi(sym.lower(), window_seconds=600)
+                    if side == "buy":
+                        buy_count += 1
+                    elif side == "sell":
+                        sell_count += 1
+                ofi = engine.price_feed.get_ofi(binance_sym.lower(), window_seconds=600)
                 print(
-                    f"   {sym}: {len(trades)} trades loaded, "
+                    f"   {underlying} ({okx_sym}): {len(trades)} trades loaded, "
                     f"{buy_count} buys / {sell_count} sells, "
                     f"OFI={ofi:+.3f}"
                 )
+
+        # 2c. Auto-calibrate VPIN bucket sizes from bootstrap volume data
+        if settings.vpin_enabled:
+            print("\nCalibrating VPIN bucket sizes...")
+            for sym in [s.lower() for s in binance_symbols]:
+                if sym in engine._vpin_calculators:
+                    calc = engine._vpin_calculators[sym]
+                    if calc.bucket_volume <= 0:
+                        total_vol = engine.price_feed.get_total_volume(
+                            sym, window_seconds=settings.vpin_auto_calibrate_window_minutes * 60,
+                        )
+                        bv = calc.auto_calibrate_bucket_size(
+                            total_volume=total_vol,
+                            window_minutes=float(settings.vpin_auto_calibrate_window_minutes),
+                        )
+                        LOGGER.info("VPIN: auto-calibrated bucket_volume=%.4f for %s", bv, sym)
+                        print(f"   {sym.upper()}: bucket_volume={bv:.4f}")
+
+            # Re-inject bootstrap aggTrades so VPIN can process them
+            for sym in [s.lower() for s in binance_symbols]:
+                if sym in engine._vpin_calculators:
+                    calc = engine._vpin_calculators[sym]
+                    # Get classified trades from price feed buy/sell history
+                    buy_sells = engine.price_feed._buy_sells.get(sym, [])
+                    replayed = 0
+                    for ts, vol, is_buy in buy_sells:
+                        price = engine.price_feed.get_current_price(sym) or 0.0
+                        calc.process_trade(price, vol, is_buy, ts)
+                        replayed += 1
+                    if replayed:
+                        vpin_val = calc.get_vpin()
+                        print(f"   {sym.upper()}: replayed {replayed} trades, VPIN={vpin_val}")
 
         # 3. Show vol estimates
         print("\nVolatility estimates:")
@@ -487,13 +683,13 @@ async def run_paper_test(
             else:
                 print(f"   {sym.upper()}: insufficient data for vol estimate")
 
-        # 4. Start aggTrades WebSocket for continuous OFI data
+        # 4. Start OKX trades WebSocket for continuous OFI data
         agg_trades_task = None
         if settings.agg_trades_ws_enabled:
             agg_trades_task = asyncio.create_task(
-                engine.price_feed.connect_agg_trades_ws()
+                engine.price_feed.connect_okx_trades_ws()
             )
-            print("\nStarted aggTrades WebSocket stream for continuous OFI data")
+            print("\nStarted OKX trades WebSocket stream for continuous OFI data")
 
         # 5. Set up per-cycle CSV logger
         log_path = f"arb_bot/output/paper_v3_{int(time.time())}.csv"
@@ -528,8 +724,13 @@ async def run_paper_test(
             for sym in [s.lower() for s in binance_symbols]:
                 p = engine.price_feed.get_current_price(sym)
                 ofi = engine.price_feed.get_ofi(sym, window_seconds=300)
+                vpin_str = ""
+                if settings.vpin_enabled and sym in engine._vpin_calculators:
+                    calc = engine._vpin_calculators[sym]
+                    v = calc.get_vpin()
+                    vpin_str = f"  VPIN={v:.3f}" if v is not None else "  VPIN=None"
                 if p:
-                    print(f"   {sym.upper()}: ${p:,.2f}  OFI={ofi:+.3f}")
+                    print(f"   {sym.upper()}: ${p:,.2f}  OFI={ofi:+.3f}{vpin_str}")
 
             # Fetch Kalshi markets
             raw_markets = await fetch_kalshi_crypto_markets(underlyings, client)
@@ -538,7 +739,7 @@ async def run_paper_test(
             quotes: list[CryptoMarketQuote] = []
             skipped = 0
             for raw in raw_markets:
-                q = kalshi_raw_to_quote(raw, now)
+                q = kalshi_raw_to_quote(raw, now, min_book_volume=settings.min_book_volume)
                 if q is not None and q.time_to_expiry_minutes <= max_tte:
                     quotes.append(q)
                 else:
@@ -574,10 +775,22 @@ async def run_paper_test(
                 if edges:
                     print(f"\n   EDGES DETECTED: {len(edges)}")
                     for e in edges[:8]:
+                        # Show Student-t probability if available (A/B mode)
+                        st_str = ""
+                        if hasattr(engine, '_ab_student_t_probs'):
+                            st_est = engine._ab_student_t_probs.get(e.market.ticker)
+                            if st_est is not None:
+                                st_str = f" st={st_est.probability:.0%}"
+                        # Show empirical probability if available (A/B mode)
+                        emp_str = ""
+                        if hasattr(engine, '_ab_empirical_probs'):
+                            emp_est = engine._ab_empirical_probs.get(e.market.ticker)
+                            if emp_est is not None:
+                                emp_str = f" emp={emp_est.probability:.0%}"
                         print(
                             f"     {e.market.ticker[:35]:35s} → {e.side.upper():3s} "
                             f"edge={e.edge_cents*100:+.1f}% "
-                            f"model={e.model_prob.probability:.0%} "
+                            f"mc={e.model_prob.probability:.0%}{st_str}{emp_str} "
                             f"market={e.market_implied_prob:.0%} "
                             f"unc={e.model_uncertainty:.3f} spread={e.spread_cost*100:.1f}\u00a2"
                         )
@@ -599,6 +812,10 @@ async def run_paper_test(
             print(f"   Bankroll: ${engine.bankroll:.2f}")
 
             await asyncio.sleep(scan_interval)
+
+    # Clean up funding rate tracker
+    if engine._funding_tracker is not None:
+        await engine._funding_tracker.stop()
 
     # Clean up aggTrades WebSocket
     if agg_trades_task is not None:
@@ -735,18 +952,21 @@ async def run_paper_test(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Crypto engine paper test")
-    parser.add_argument("--symbols", nargs="+", default=["BTC", "SOL"],
-                        help="Underlyings to trade (default: BTC SOL)")
+    parser.add_argument("--symbols", nargs="+", default=["BTC", "ETH", "SOL"],
+                        help="Underlyings to trade (default: BTC ETH SOL)")
     parser.add_argument("--duration-minutes", type=float, default=5,
                         help="How long to run (default: 5)")
     parser.add_argument("--mc-paths", type=int, default=1000,
                         help="Monte Carlo paths (default: 1000)")
-    parser.add_argument("--min-edge", type=float, default=0.06,
-                        help="Min edge fraction (default: 0.06 = 6%%)")
+    parser.add_argument("--min-edge", type=float, default=0.12,
+                        help="Min edge fraction (default: 0.12 = 12%%)")
     parser.add_argument("--scan-interval", type=float, default=15.0,
                         help="Seconds between scans (default: 15)")
     parser.add_argument("--max-tte", type=int, default=600,
                         help="Max time-to-expiry in minutes (default: 600)")
+    parser.add_argument("--model", choices=["mc_gbm", "student_t", "ab_test", "empirical", "ab_empirical"],
+                        default="ab_test",
+                        help="Probability model (default: ab_test)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -766,6 +986,7 @@ def main() -> None:
         min_edge=args.min_edge,
         scan_interval=args.scan_interval,
         max_tte=args.max_tte,
+        probability_model=args.model,
     ))
 
 
