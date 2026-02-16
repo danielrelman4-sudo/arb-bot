@@ -303,6 +303,9 @@ class CryptoSettings:
     momentum_max_position: float = 25.0     # Max dollar per momentum trade
     momentum_max_concurrent: int = 2        # Max open momentum positions
     momentum_cooldown_seconds: float = 120.0  # Per-symbol cooldown
+    momentum_min_ofi_streak: int = 3           # Consecutive aligned OFI cycles before entry
+    momentum_require_ofi_acceleration: bool = True  # Skip if |OFI_30s| <= |OFI_120s|
+    momentum_max_contracts: int = 100          # Hard cap on contracts per momentum trade
 
     # ── Strategy cell parameters (model path) ──────────────────────
     # YES/15min — microstructure-confirmed
@@ -556,6 +559,9 @@ def load_crypto_settings() -> CryptoSettings:
         momentum_max_position=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_POSITION"), 25.0),
         momentum_max_concurrent=_as_int(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_CONCURRENT"), 2),
         momentum_cooldown_seconds=_as_float(os.getenv("ARB_CRYPTO_MOMENTUM_COOLDOWN_SECONDS"), 120.0),
+        momentum_min_ofi_streak=_as_int(os.getenv("ARB_CRYPTO_MOMENTUM_MIN_OFI_STREAK"), 3),
+        momentum_require_ofi_acceleration=_as_bool(os.getenv("ARB_CRYPTO_MOMENTUM_REQUIRE_OFI_ACCELERATION"), True),
+        momentum_max_contracts=_as_int(os.getenv("ARB_CRYPTO_MOMENTUM_MAX_CONTRACTS"), 100),
         # Strategy cell parameters
         cell_yes_15min_model_weight=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_MODEL_WEIGHT"), 0.5),
         cell_yes_15min_prob_haircut=_as_float(os.getenv("ARB_CRYPTO_CELL_YES_15MIN_PROB_HAIRCUT"), 0.90),
