@@ -2881,18 +2881,15 @@ class CryptoEngine:
             # Per-symbol VPIN filter: only trade symbols in momentum zone
             if momentum_symbols is not None and binance_sym not in momentum_symbols:
                 continue
-            # Per-symbol regime check
+            # Per-symbol regime — used for OFI alignment info, NOT as a hard gate.
+            # VPIN zone (0.85-0.95) is the volatility signal; requiring regime=="high_vol"
+            # was redundant and too restrictive (blocked valid momentum opportunities).
             sym_snap = self._current_regime.per_symbol.get(binance_sym) if self._current_regime.per_symbol else None
             if sym_snap is None:
                 LOGGER.info("CryptoEngine: momentum skip %s — no per-symbol regime", binance_sym)
                 continue
-            if sym_snap.regime != "high_vol":
-                LOGGER.info("CryptoEngine: momentum skip %s — regime=%s vol_score=%.2f (need high_vol)",
-                             binance_sym, sym_snap.regime, sym_snap.vol_score)
-                continue
-            if sym_snap.is_transitioning:
-                LOGGER.info("CryptoEngine: momentum skip %s — regime transitioning", binance_sym)
-                continue
+            LOGGER.debug("CryptoEngine: momentum %s — regime=%s vol_score=%.2f",
+                         binance_sym, sym_snap.regime, sym_snap.vol_score)
 
             # Cooldown check
             last_settled = self._momentum_cooldowns.get(binance_sym)
