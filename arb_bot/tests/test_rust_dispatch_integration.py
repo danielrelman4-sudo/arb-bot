@@ -132,14 +132,14 @@ class TestSizingDispatch:
 class TestKellyDispatch:
     def test_inactive_by_default(self) -> None:
         _clear_env("ARB_USE_RUST_KELLY", "ARB_USE_RUST_ALL")
-        from arb_bot import kelly_sizing
+        from arb_bot.framework import kelly_sizing
         importlib.reload(kelly_sizing)
         assert kelly_sizing._RUST_ACTIVE is False
 
     def test_active_with_env_var(self) -> None:
         keys = _set_env(ARB_USE_RUST_KELLY="1")
         try:
-            from arb_bot import kelly_sizing
+            from arb_bot.framework import kelly_sizing
             importlib.reload(kelly_sizing)
             assert kelly_sizing._RUST_ACTIVE is True
 
@@ -156,7 +156,7 @@ class TestKellyDispatch:
         """Verify Rust and Python produce identical results."""
         # Run Python first.
         _clear_env("ARB_USE_RUST_KELLY", "ARB_USE_RUST_ALL")
-        from arb_bot import kelly_sizing
+        from arb_bot.framework import kelly_sizing
         importlib.reload(kelly_sizing)
         sizer_py = kelly_sizing.TailRiskKelly()
         py = sizer_py.compute(edge=0.50, cost=0.50, fill_prob=0.8, model_uncertainty=0.1)
@@ -187,14 +187,14 @@ class TestKellyDispatch:
 class TestFeeModelDispatch:
     def test_inactive_by_default(self) -> None:
         _clear_env("ARB_USE_RUST_FEE_MODEL", "ARB_USE_RUST_ALL")
-        from arb_bot import fee_model
+        from arb_bot.framework import fee_model
         importlib.reload(fee_model)
         assert fee_model._RUST_ACTIVE is False
 
     def test_active_with_env_var(self) -> None:
         keys = _set_env(ARB_USE_RUST_FEE_MODEL="1")
         try:
-            from arb_bot import fee_model
+            from arb_bot.framework import fee_model
             importlib.reload(fee_model)
             assert fee_model._RUST_ACTIVE is True
 
@@ -220,14 +220,14 @@ class TestFeeModelDispatch:
 class TestExecutionModelDispatch:
     def test_inactive_by_default(self) -> None:
         _clear_env("ARB_USE_RUST_EXECUTION_MODEL", "ARB_USE_RUST_ALL")
-        from arb_bot import execution_model
+        from arb_bot.framework import execution_model
         importlib.reload(execution_model)
         assert execution_model._RUST_ACTIVE is False
 
     def test_active_with_env_var(self) -> None:
         keys = _set_env(ARB_USE_RUST_EXECUTION_MODEL="1")
         try:
-            from arb_bot import execution_model
+            from arb_bot.framework import execution_model
             importlib.reload(execution_model)
             assert execution_model._RUST_ACTIVE is True
 
@@ -263,7 +263,8 @@ class TestStagedCutover:
         # Enable only sizing.
         keys = _set_env(ARB_USE_RUST_SIZING="1")
         try:
-            from arb_bot import sizing, kelly_sizing, fee_model, execution_model
+            from arb_bot import sizing
+            from arb_bot.framework import kelly_sizing, fee_model, execution_model
             importlib.reload(sizing)
             importlib.reload(kelly_sizing)
             importlib.reload(fee_model)
@@ -284,7 +285,8 @@ class TestStagedCutover:
         """ARB_USE_RUST_ALL=1 enables all modules."""
         keys = _set_env(ARB_USE_RUST_ALL="1")
         try:
-            from arb_bot import sizing, kelly_sizing, fee_model, execution_model
+            from arb_bot import sizing
+            from arb_bot.framework import kelly_sizing, fee_model, execution_model
             importlib.reload(sizing)
             importlib.reload(kelly_sizing)
             importlib.reload(fee_model)
@@ -304,7 +306,8 @@ class TestStagedCutover:
     def test_rollback_all(self) -> None:
         """Clearing env vars rolls back to Python implementations."""
         keys = _set_env(ARB_USE_RUST_ALL="1")
-        from arb_bot import sizing, kelly_sizing, fee_model, execution_model
+        from arb_bot import sizing
+        from arb_bot.framework import kelly_sizing, fee_model, execution_model
         importlib.reload(sizing)
         importlib.reload(kelly_sizing)
         importlib.reload(fee_model)

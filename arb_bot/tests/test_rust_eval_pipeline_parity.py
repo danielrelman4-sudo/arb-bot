@@ -27,13 +27,13 @@ except ImportError:
 import importlib
 import os
 
-import arb_bot.fee_model
-import arb_bot.kelly_sizing
+import arb_bot.framework.fee_model
+import arb_bot.framework.kelly_sizing
 import arb_bot.sizing
-import arb_bot.execution_model
+import arb_bot.framework.execution_model
 
-from arb_bot.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
-from arb_bot.kelly_sizing import TailRiskKelly, TailRiskKellyConfig, _raw_kelly
+from arb_bot.framework.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
+from arb_bot.framework.kelly_sizing import TailRiskKelly, TailRiskKellyConfig, _raw_kelly
 from arb_bot.sizing import PositionSizer
 
 # ---------------------------------------------------------------------------
@@ -47,15 +47,15 @@ def _clean_dispatch_state():
     for key in list(os.environ):
         if key.startswith("ARB_USE_RUST_"):
             os.environ.pop(key, None)
-    importlib.reload(arb_bot.fee_model)
-    importlib.reload(arb_bot.kelly_sizing)
+    importlib.reload(arb_bot.framework.fee_model)
+    importlib.reload(arb_bot.framework.kelly_sizing)
     importlib.reload(arb_bot.sizing)
-    importlib.reload(arb_bot.execution_model)
+    importlib.reload(arb_bot.framework.execution_model)
     # Re-import from clean modules.
     global FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
     global TailRiskKelly, TailRiskKellyConfig, _raw_kelly, PositionSizer
-    from arb_bot.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
-    from arb_bot.kelly_sizing import TailRiskKelly, TailRiskKellyConfig, _raw_kelly
+    from arb_bot.framework.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
+    from arb_bot.framework.kelly_sizing import TailRiskKelly, TailRiskKellyConfig, _raw_kelly
     from arb_bot.sizing import PositionSizer
     yield
 
@@ -426,7 +426,7 @@ class TestExecutionModelParity:
         return json.dumps(defaults)
 
     def _exec_config(self, **overrides: Any) -> Any:
-        from arb_bot.execution_model import ExecutionModelConfig
+        from arb_bot.framework.execution_model import ExecutionModelConfig
         defaults = dict(
             queue_decay_half_life_seconds=5.0,
             latency_seconds=0.2,
@@ -442,7 +442,7 @@ class TestExecutionModelParity:
         return ExecutionModelConfig(**defaults)
 
     def _leg_input(self, **overrides: Any) -> Any:
-        from arb_bot.execution_model import LegInput
+        from arb_bot.framework.execution_model import LegInput
         defaults = dict(
             venue="kalshi", market_id="m1", side="yes",
             buy_price=0.50, available_size=100.0, spread=0.02,
@@ -459,7 +459,7 @@ class TestExecutionModelParity:
         ])
 
     def test_single_leg_basic(self) -> None:
-        from arb_bot.execution_model import ExecutionModel
+        from arb_bot.framework.execution_model import ExecutionModel
         legs = [self._leg_input()]
         config = self._exec_config()
         model = ExecutionModel(config)
@@ -484,7 +484,7 @@ class TestExecutionModelParity:
         )
 
     def test_two_legs_sequential(self) -> None:
-        from arb_bot.execution_model import ExecutionModel
+        from arb_bot.framework.execution_model import ExecutionModel
         legs = [
             self._leg_input(venue="kalshi", market_id="m1", spread=0.03),
             self._leg_input(venue="polymarket", market_id="m2", available_size=50.0, spread=0.05),
@@ -522,7 +522,7 @@ class TestExecutionModelParity:
             )
 
     def test_no_decay_no_impact(self) -> None:
-        from arb_bot.execution_model import ExecutionModel
+        from arb_bot.framework.execution_model import ExecutionModel
         legs = [self._leg_input()]
         config = self._exec_config(enable_queue_decay=False, enable_market_impact=False)
         model = ExecutionModel(config)
@@ -539,7 +539,7 @@ class TestExecutionModelParity:
         assert _close(py.expected_market_impact_per_contract, rs["expected_market_impact_per_contract"])
 
     def test_high_staleness(self) -> None:
-        from arb_bot.execution_model import ExecutionModel
+        from arb_bot.framework.execution_model import ExecutionModel
         legs = [self._leg_input(available_size=50.0)]
         config = self._exec_config()
         model = ExecutionModel(config)
@@ -555,7 +555,7 @@ class TestExecutionModelParity:
         assert py.all_fill_probability < 0.1
 
     def test_zero_spread(self) -> None:
-        from arb_bot.execution_model import ExecutionModel
+        from arb_bot.framework.execution_model import ExecutionModel
         legs = [self._leg_input(spread=0.0)]
         config = self._exec_config()
         model = ExecutionModel(config)
@@ -570,7 +570,7 @@ class TestExecutionModelParity:
         assert py.expected_market_impact_per_contract == 0.0
 
     def test_graduated_distribution_length(self) -> None:
-        from arb_bot.execution_model import ExecutionModel
+        from arb_bot.framework.execution_model import ExecutionModel
         legs = [self._leg_input()]
         config = self._exec_config(fill_fraction_steps=5)
         model = ExecutionModel(config)
@@ -757,7 +757,7 @@ class TestEvalPipelinePerformance:
               f"speedup={py_time / rs_time:.1f}x")
 
     def test_execution_model_perf(self) -> None:
-        from arb_bot.execution_model import ExecutionModel, ExecutionModelConfig, LegInput
+        from arb_bot.framework.execution_model import ExecutionModel, ExecutionModelConfig, LegInput
 
         config = ExecutionModelConfig()
         model = ExecutionModel(config)

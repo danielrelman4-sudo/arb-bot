@@ -27,7 +27,7 @@ from arb_bot.config import (
     UniverseRankingSettings,
 )
 from arb_bot.engine import ArbEngine
-from arb_bot.fee_model import FeeModel, FeeModelConfig, VenueFeeSchedule
+from arb_bot.framework.fee_model import FeeModel, FeeModelConfig, VenueFeeSchedule
 from arb_bot.models import BinaryQuote, EngineState
 
 
@@ -257,7 +257,7 @@ class TestFeeModelForecastEx:
         assert model.get_schedule("forecastex").taker_fee_per_contract == 0.005
 
     def test_forecastex_fee_estimate(self) -> None:
-        from arb_bot.fee_model import OrderType
+        from arb_bot.framework.fee_model import OrderType
         schedule = VenueFeeSchedule(
             venue="forecastex",
             taker_fee_per_contract=0.005,

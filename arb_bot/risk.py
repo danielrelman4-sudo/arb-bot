@@ -7,7 +7,7 @@ from arb_bot.config import RiskSettings
 from arb_bot.models import EngineState, OpportunityKind, TradePlan
 
 if TYPE_CHECKING:
-    from arb_bot.kill_switch import KillSwitchManager
+    from arb_bot.framework.kill_switch import KillSwitchManager
 
 
 class RiskManager:
