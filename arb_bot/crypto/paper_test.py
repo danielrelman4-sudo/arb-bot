@@ -521,10 +521,20 @@ async def run_paper_test(
         feature_store_min_samples=200,
         # C2: Classifier — ENABLED with trained model
         classifier_enabled=True,
-        classifier_model_path="arb_bot/output/classifier_model_model.json",
-        classifier_veto_threshold=0.4,  # Reject trades where P(win) < 40%
+        classifier_model_path="arb_bot/output/classifier_model_model.json",  # Global fallback
+        classifier_veto_threshold=0.4,  # Default reject trades where P(win) < 40%
         classifier_min_training_samples=50,  # Lower for small dataset
         classifier_retrain_interval_hours=1.0,  # Retrain hourly as new data comes in
+        # Per-cell classifiers (trained via: python3 -m arb_bot.crypto.train_classifier --cell <cell>)
+        classifier_model_path_yes_15min="arb_bot/output/classifier_model_model_yes_15min.json",
+        classifier_model_path_yes_daily="arb_bot/output/classifier_model_model_yes_daily.json",
+        classifier_model_path_no_15min="arb_bot/output/classifier_model_model_no_15min.json",
+        classifier_model_path_no_daily="arb_bot/output/classifier_model_model_no_daily.json",
+        # Per-cell veto thresholds
+        classifier_veto_threshold_yes_15min=0.45,
+        classifier_veto_threshold_yes_daily=0.40,
+        classifier_veto_threshold_no_15min=0.40,
+        classifier_veto_threshold_no_daily=0.40,
         # ── v11: Student-t A/B test ────────────────────────────────
         probability_model=probability_model,
         # ── Empirical CDF model ──────────────────────────────────────
@@ -639,6 +649,11 @@ async def run_paper_test(
     print(f"  Max TTE:        {max_tte} min")
     print(f"  Scan interval:  {scan_interval}s")
     print(f"  Prob model:     {probability_model}")
+    _cell_models = {c: getattr(settings, f"cell_{c}_probability_model", "")
+                    for c in ["yes_15min", "yes_daily", "no_15min", "no_daily"]}
+    _overrides = {c: m for c, m in _cell_models.items() if m}
+    if _overrides:
+        print(f"  Cell models:    {_overrides}")
     print(f"  Calibration:    {settings.calibration_method} (min_samples={settings.calibration_min_samples})")
     print(f"  Staleness:      {'ON' if settings.staleness_enabled else 'OFF'}")
     print(f"  Multi-OFI:      {'ON' if settings.multiscale_ofi_enabled else 'OFF'} (windows={settings.multiscale_ofi_windows})")
@@ -658,7 +673,10 @@ async def run_paper_test(
     print(f"  Transition:     sizing×{settings.regime_transition_sizing_multiplier}")
     print(f"  Confidence:     {'ON' if settings.confidence_scoring_enabled else 'OFF (observing)'}")
     print(f"  Feature store:  {'ON' if settings.feature_store_enabled else 'OFF'} → {fs_path}")
-    print(f"  Classifier:     {'ON' if settings.classifier_enabled else 'OFF (collecting data)'}")
+    _clf_cells = [c for c in ["yes_15min", "yes_daily", "no_15min", "no_daily"]
+                  if getattr(settings, f"classifier_model_path_{c}", "")]
+    print(f"  Classifier:     {'ON' if settings.classifier_enabled else 'OFF (collecting data)'}"
+          f" (per-cell: {', '.join(_clf_cells) if _clf_cells else 'none'})")
     print(f"  Volume clock:   ON (short=300s, baseline=4hr)")
     print(f"  Hawkes jumps:   ON (α=5.0, β=0.00115, threshold=3.0σ)")
     if settings.cycle_recorder_enabled:

@@ -3,8 +3,12 @@
 Merges feature store CSVs, backfills outcomes from paper run logs,
 and trains an XGBoost classifier for model-path or momentum trades.
 
+Supports per-cell training via --cell flag:
+    python3 -m arb_bot.crypto.train_classifier --cell yes_15min
+    python3 -m arb_bot.crypto.train_classifier --cell no_daily
+
 Usage:
-    python3 -m arb_bot.crypto.train_classifier [--strategy model|momentum] [--verbose]
+    python3 -m arb_bot.crypto.train_classifier [--strategy model|momentum] [--cell CELL] [--verbose]
 """
 
 from __future__ import annotations
@@ -216,8 +220,14 @@ def main() -> None:
         help="Directory containing feature_store_v11_*.csv files"
     )
     parser.add_argument(
+        "--cell",
+        choices=["yes_15min", "yes_daily", "no_15min", "no_daily"],
+        default=None,
+        help="Train per-cell classifier (filters data to single strategy cell)"
+    )
+    parser.add_argument(
         "--output", default="",
-        help="Output model path (default: arb_bot/output/classifier_model_<strategy>.json)"
+        help="Output model path (default: arb_bot/output/classifier_model_<strategy>[_<cell>].json)"
     )
     parser.add_argument(
         "--backfill", action="store_true", default=True,
@@ -232,7 +242,12 @@ def main() -> None:
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    output_path = args.output or str(data_dir / f"classifier_model_{args.strategy}.json")
+    if args.output:
+        output_path = args.output
+    elif args.cell:
+        output_path = str(data_dir / f"classifier_model_{args.strategy}_{args.cell}.json")
+    else:
+        output_path = str(data_dir / f"classifier_model_{args.strategy}.json")
 
     # Find feature store CSVs
     csv_pattern = str(data_dir / "feature_store_v11_*.csv")
@@ -266,6 +281,29 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Loaded {len(y)} settled {args.strategy}-path trades")
+
+    # Step 2b: Filter to single strategy cell if --cell is provided
+    if args.cell:
+        cell_mask = [
+            i for i, m in enumerate(metadata)
+            if (m.get("strategy_cell", "") or "") == args.cell
+        ]
+        if len(cell_mask) < 20:
+            print(f"\nWARNING: Cell '{args.cell}' has only {len(cell_mask)} samples "
+                  f"(need >= 20). Skipping training.")
+            print(f"Available cells:")
+            cell_counts: Dict[str, int] = {}
+            for m in metadata:
+                c = m.get("strategy_cell", "unknown") or "unknown"
+                cell_counts[c] = cell_counts.get(c, 0) + 1
+            for c in sorted(cell_counts):
+                print(f"  {c}: {cell_counts[c]} samples")
+            sys.exit(0)
+
+        X = X[cell_mask]
+        y = y[cell_mask]
+        metadata = [metadata[i] for i in cell_mask]
+        print(f"Filtered to cell '{args.cell}': {len(y)} samples")
 
     # Step 3: Train and report
     train_and_report(X, y, metadata, feature_names, output_path, verbose=args.verbose)

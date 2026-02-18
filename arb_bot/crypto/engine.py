@@ -388,24 +388,61 @@ class CryptoEngine:
                 min_samples_for_classifier=settings.feature_store_min_samples,
             )
 
-        # Classifier (C2)
-        self._classifier = None
+        # Classifier (C2) — per-cell classifiers or global fallback
+        self._classifiers: Dict[str, Any] = {}  # cell_name → BinaryClassifier
         self._classifier_last_train: float = 0.0
         if settings.classifier_enabled:
             from arb_bot.crypto.classifier import BinaryClassifier, HAS_XGBOOST
             if HAS_XGBOOST:
-                self._classifier = BinaryClassifier(
-                    max_depth=settings.classifier_max_depth,
-                    n_estimators=settings.classifier_n_estimators,
-                    learning_rate=settings.classifier_learning_rate,
-                    min_child_weight=settings.classifier_min_child_weight,
-                    subsample=settings.classifier_subsample,
-                    use_isotonic_calibration=settings.classifier_use_isotonic_calibration,
-                    model_path=settings.classifier_model_path or None,
-                )
-                # Try loading a pre-trained model
-                if settings.classifier_model_path:
-                    self._classifier.load_model()
+                # Try loading per-cell classifiers first
+                _cell_paths = {
+                    "yes_15min": settings.classifier_model_path_yes_15min,
+                    "yes_daily": settings.classifier_model_path_yes_daily,
+                    "no_15min": settings.classifier_model_path_no_15min,
+                    "no_daily": settings.classifier_model_path_no_daily,
+                }
+                for cell_name, path in _cell_paths.items():
+                    if path:
+                        clf = BinaryClassifier(
+                            max_depth=settings.classifier_max_depth,
+                            n_estimators=settings.classifier_n_estimators,
+                            learning_rate=settings.classifier_learning_rate,
+                            min_child_weight=settings.classifier_min_child_weight,
+                            subsample=settings.classifier_subsample,
+                            use_isotonic_calibration=settings.classifier_use_isotonic_calibration,
+                            model_path=path,
+                        )
+                        if clf.load_model():
+                            self._classifiers[cell_name] = clf
+                            LOGGER.info(
+                                "CryptoEngine: loaded per-cell classifier for %s from %s",
+                                cell_name, path,
+                            )
+
+                # Fallback: if no per-cell classifiers, try global model
+                if not self._classifiers and settings.classifier_model_path:
+                    global_clf = BinaryClassifier(
+                        max_depth=settings.classifier_max_depth,
+                        n_estimators=settings.classifier_n_estimators,
+                        learning_rate=settings.classifier_learning_rate,
+                        min_child_weight=settings.classifier_min_child_weight,
+                        subsample=settings.classifier_subsample,
+                        use_isotonic_calibration=settings.classifier_use_isotonic_calibration,
+                        model_path=settings.classifier_model_path,
+                    )
+                    if global_clf.load_model():
+                        self._classifiers["_global"] = global_clf
+                        LOGGER.info(
+                            "CryptoEngine: loaded global classifier from %s",
+                            settings.classifier_model_path,
+                        )
+
+                if self._classifiers:
+                    LOGGER.info(
+                        "CryptoEngine: %d classifier(s) loaded: %s",
+                        len(self._classifiers),
+                        list(self._classifiers.keys()),
+                    )
             else:
                 LOGGER.warning("CryptoEngine: classifier_enabled but xgboost not installed")
 
@@ -750,15 +787,25 @@ class CryptoEngine:
     # ── Classifier (C2) ────────────────────────────────────────────
 
     def _maybe_retrain_classifier(self) -> None:
-        """Check if the classifier should be retrained based on interval and sample count."""
-        if self._classifier is None or self._feature_store is None:
+        """Check if the classifier should be retrained based on interval and sample count.
+
+        For per-cell classifiers, online retraining is skipped — use the
+        offline ``train_classifier.py --cell`` script instead.  Only the
+        global fallback (``_global`` key) supports online retraining.
+        """
+        if not self._classifiers or self._feature_store is None:
+            return
+
+        # Only retrain global classifier online
+        global_clf = self._classifiers.get("_global")
+        if global_clf is None:
             return
 
         now = time.time()
         interval = self._settings.classifier_retrain_interval_hours * 3600
 
         # Check if enough time has passed since last training
-        if self._classifier.is_trained and (now - self._classifier_last_train) < interval:
+        if global_clf.is_trained and (now - self._classifier_last_train) < interval:
             return
 
         # Check if we have enough samples
@@ -771,27 +818,35 @@ class CryptoEngine:
         if len(y) < self._settings.classifier_min_training_samples:
             return
 
-        LOGGER.info("CryptoEngine: retraining classifier with %d samples", len(y))
-        report = self._classifier.train(X, y, feature_names=FEATURE_COLUMNS)
+        LOGGER.info("CryptoEngine: retraining global classifier with %d samples", len(y))
+        report = global_clf.train(X, y, feature_names=FEATURE_COLUMNS)
         self._classifier_last_train = now
 
         LOGGER.info(
-            "CryptoEngine: classifier retrained -- accuracy=%.3f brier=%.4f",
+            "CryptoEngine: global classifier retrained -- accuracy=%.3f brier=%.4f",
             report.accuracy, report.brier_score,
         )
 
     def _compute_classifier_probability(
-        self, edge_features: np.ndarray,
+        self,
+        edge_features: np.ndarray,
+        strategy_cell: str = "",
     ) -> Optional[ProbabilityEstimate]:
         """Compute probability from the trained classifier.
 
+        Looks up per-cell classifier first, falls back to global.
         Returns None if classifier is not available or not trained.
         """
-        if self._classifier is None or not self._classifier.is_trained:
+        if not self._classifiers:
+            return None
+
+        # Look up per-cell classifier, then global fallback
+        classifier = self._classifiers.get(strategy_cell) or self._classifiers.get("_global")
+        if classifier is None or not classifier.is_trained:
             return None
 
         from arb_bot.crypto.classifier import ProbabilityEstimate as ClassifierEstimate
-        result = self._classifier.predict(edge_features)
+        result = classifier.predict(edge_features)
         if not result.is_classifier:
             return None
 
@@ -807,12 +862,21 @@ class CryptoEngine:
     def _classifier_veto(self, edge: CryptoEdge) -> Tuple[bool, float, Optional["FeatureVector"]]:
         """Check if the classifier vetoes this trade.
 
+        Uses per-cell classifier if available, falls back to global.
+        Uses per-cell veto threshold if configured.
+
         Returns (vetoed, p_win, feature_vector).
         - vetoed: True if classifier says don't trade (p_win < threshold)
         - p_win: classifier's estimated P(win), or -1 if not available
         - feature_vector: built FeatureVector (reuse for feature store recording)
         """
-        if self._classifier is None or not self._classifier.is_trained:
+        if not self._classifiers:
+            return False, -1.0, None
+
+        # Look up per-cell classifier, then global fallback
+        cell_name = edge.strategy_cell or ""
+        classifier = self._classifiers.get(cell_name) or self._classifiers.get("_global")
+        if classifier is None or not classifier.is_trained:
             return False, -1.0, None
 
         from arb_bot.crypto.feature_store import FEATURE_COLUMNS, _REGIME_ENCODE
@@ -838,23 +902,34 @@ class CryptoEngine:
         features[n_base + 1] = 1.0 if "daily" in (edge.strategy_cell or "") else 0.0  # is_daily
 
         # Predict
-        result = self._classifier.predict(features)
+        result = classifier.predict(features)
         p_win = result.probability if result.is_classifier else -1.0
 
-        # Veto threshold (configurable)
-        threshold = getattr(self._settings, 'classifier_veto_threshold', 0.4)
+        # Per-cell veto threshold (falls back to global)
+        _threshold_map = {
+            "yes_15min": self._settings.classifier_veto_threshold_yes_15min,
+            "yes_daily": self._settings.classifier_veto_threshold_yes_daily,
+            "no_15min": self._settings.classifier_veto_threshold_no_15min,
+            "no_daily": self._settings.classifier_veto_threshold_no_daily,
+        }
+        threshold = _threshold_map.get(cell_name, self._settings.classifier_veto_threshold)
         vetoed = p_win >= 0 and p_win < threshold
 
+        # Log with classifier source info
+        clf_source = cell_name if cell_name in self._classifiers else "_global"
         if vetoed:
             LOGGER.info(
-                "CryptoEngine: classifier veto %s — P(win)=%.2f < %.2f (cell=%s)",
+                "CryptoEngine: classifier veto %s — P(win)=%.2f < %.2f "
+                "(cell=%s, clf=%s)",
                 edge.market.ticker, p_win, threshold,
-                edge.strategy_cell or "unknown",
+                cell_name or "unknown", clf_source,
             )
         else:
             LOGGER.debug(
-                "CryptoEngine: classifier pass %s — P(win)=%.2f (cell=%s)",
-                edge.market.ticker, p_win, edge.strategy_cell or "unknown",
+                "CryptoEngine: classifier pass %s — P(win)=%.2f "
+                "(cell=%s, clf=%s)",
+                edge.market.ticker, p_win,
+                cell_name or "unknown", clf_source,
             )
 
         return vetoed, p_win, fv
