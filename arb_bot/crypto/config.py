@@ -422,6 +422,22 @@ class CryptoSettings:
     paper_mode: bool = True
     paper_slippage_cents: float = 0.5
 
+    # ── Ensemble probability (v42) ──────────────────────────────────
+    ensemble_enabled: bool = False  # Enable multi-model ensemble averaging
+    ensemble_weight_empirical_yes: float = 0.60  # Empirical weight for YES cells
+    ensemble_weight_student_t_yes: float = 0.25  # Student-t weight for YES cells
+    ensemble_weight_mc_gbm_yes: float = 0.15     # MC GBM weight for YES cells
+    ensemble_weight_empirical_no: float = 0.20   # Empirical weight for NO cells
+    ensemble_weight_student_t_no: float = 0.30   # Student-t weight for NO cells
+    ensemble_weight_mc_gbm_no: float = 0.50      # MC GBM weight for NO cells
+
+    # ── IV cross-check (v42) ──────────────────────────────────────
+    iv_crosscheck_enabled: bool = False          # Enable implied vol cross-check
+    iv_crosscheck_dampen_threshold: float = 1.2  # If IV/model_vol > this, dampen edge
+    iv_crosscheck_dampen_factor: float = 0.7     # Multiply edge by this when dampened
+    iv_crosscheck_boost_threshold: float = 0.8   # If IV/model_vol < this, edge is more real
+    iv_crosscheck_boost_factor: float = 1.1      # Multiply confidence when boosted
+
     # ── Settlement ────────────────────────────────────────────────
     settlement_grace_minutes: float = 10.0  # How long to wait for Kalshi settlement data
 
@@ -689,5 +705,17 @@ def load_crypto_settings() -> CryptoSettings:
         scan_interval_seconds=_as_float(os.getenv("ARB_CRYPTO_SCAN_INTERVAL_SECONDS"), 5.0),
         paper_mode=_as_bool(os.getenv("ARB_CRYPTO_PAPER_MODE"), True),
         paper_slippage_cents=_as_float(os.getenv("ARB_CRYPTO_PAPER_SLIPPAGE_CENTS"), 0.5),
+        ensemble_enabled=_as_bool(os.getenv("ARB_CRYPTO_ENSEMBLE_ENABLED"), False),
+        ensemble_weight_empirical_yes=_as_float(os.getenv("ARB_CRYPTO_ENSEMBLE_WEIGHT_EMPIRICAL_YES"), 0.60),
+        ensemble_weight_student_t_yes=_as_float(os.getenv("ARB_CRYPTO_ENSEMBLE_WEIGHT_STUDENT_T_YES"), 0.25),
+        ensemble_weight_mc_gbm_yes=_as_float(os.getenv("ARB_CRYPTO_ENSEMBLE_WEIGHT_MC_GBM_YES"), 0.15),
+        ensemble_weight_empirical_no=_as_float(os.getenv("ARB_CRYPTO_ENSEMBLE_WEIGHT_EMPIRICAL_NO"), 0.20),
+        ensemble_weight_student_t_no=_as_float(os.getenv("ARB_CRYPTO_ENSEMBLE_WEIGHT_STUDENT_T_NO"), 0.30),
+        ensemble_weight_mc_gbm_no=_as_float(os.getenv("ARB_CRYPTO_ENSEMBLE_WEIGHT_MC_GBM_NO"), 0.50),
+        iv_crosscheck_enabled=_as_bool(os.getenv("ARB_CRYPTO_IV_CROSSCHECK_ENABLED"), False),
+        iv_crosscheck_dampen_threshold=_as_float(os.getenv("ARB_CRYPTO_IV_CROSSCHECK_DAMPEN_THRESHOLD"), 1.2),
+        iv_crosscheck_dampen_factor=_as_float(os.getenv("ARB_CRYPTO_IV_CROSSCHECK_DAMPEN_FACTOR"), 0.7),
+        iv_crosscheck_boost_threshold=_as_float(os.getenv("ARB_CRYPTO_IV_CROSSCHECK_BOOST_THRESHOLD"), 0.8),
+        iv_crosscheck_boost_factor=_as_float(os.getenv("ARB_CRYPTO_IV_CROSSCHECK_BOOST_FACTOR"), 1.1),
         settlement_grace_minutes=_as_float(os.getenv("ARB_CRYPTO_SETTLEMENT_GRACE_MINUTES"), 10.0),
     )

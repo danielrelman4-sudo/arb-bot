@@ -640,6 +640,20 @@ async def run_paper_test(
         cell_no_daily_uncertainty_mult=1.5,
         cell_no_daily_kelly_multiplier=0.6,
         cell_no_daily_max_position=25.0,
+        # ── v42: Ensemble probability ──────────────────────────────
+        ensemble_enabled=True,
+        ensemble_weight_empirical_yes=0.60,
+        ensemble_weight_student_t_yes=0.25,
+        ensemble_weight_mc_gbm_yes=0.15,
+        ensemble_weight_empirical_no=0.20,
+        ensemble_weight_student_t_no=0.30,
+        ensemble_weight_mc_gbm_no=0.50,
+        # ── v42: IV cross-check (start collecting data, dampen OFF for now) ──
+        iv_crosscheck_enabled=False,  # Start disabled — collecting iv_rv_ratio feature first
+        iv_crosscheck_dampen_threshold=1.2,
+        iv_crosscheck_dampen_factor=0.7,
+        iv_crosscheck_boost_threshold=0.8,
+        iv_crosscheck_boost_factor=1.1,
     )
 
     engine = CryptoEngine(settings)
@@ -704,6 +718,13 @@ async def run_paper_test(
     print(f"  Momentum:       {'ON' if settings.momentum_enabled else 'OFF'}"
           f"  VPIN zone: {settings.momentum_vpin_floor:.2f}–{settings.momentum_vpin_ceiling:.2f}"
           f"  OFI align>{settings.momentum_ofi_alignment_min:.1f} mag>{settings.momentum_ofi_magnitude_min:.0f}")
+    # v42 improvements
+    print(f"  Ensemble:       {'ON' if settings.ensemble_enabled else 'OFF'}"
+          f" (YES: emp={settings.ensemble_weight_empirical_yes:.0%}/st={settings.ensemble_weight_student_t_yes:.0%}/mc={settings.ensemble_weight_mc_gbm_yes:.0%},"
+          f" NO: emp={settings.ensemble_weight_empirical_no:.0%}/st={settings.ensemble_weight_student_t_no:.0%}/mc={settings.ensemble_weight_mc_gbm_no:.0%})")
+    print(f"  IV cross-check: {'ON' if settings.iv_crosscheck_enabled else 'OFF (collecting data)'}"
+          f" (dampen>{settings.iv_crosscheck_dampen_threshold:.1f}x, boost<{settings.iv_crosscheck_boost_threshold:.1f}x)")
+    print(f"  New features:   15 v42 columns (temporal, hawkes, ensemble, meta, IV, funding)")
     print(f"{'='*70}\n")
 
     # Wire up cycle recorder if enabled

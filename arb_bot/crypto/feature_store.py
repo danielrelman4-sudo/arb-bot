@@ -86,6 +86,27 @@ class FeatureVector:
     regime_min_edge_applied: float = 0.0 # Regime min edge threshold used
     vpin_at_entry: float = 0.0           # VPIN value when trade was placed
 
+    # ── v42 Tier 1: High-impact features ──────────────────────────
+    hour_utc_sin: float = 0.0           # sin(2π × hour/24) cyclical time encoding
+    hour_utc_cos: float = 0.0           # cos(2π × hour/24) cyclical time encoding
+    day_of_week: float = 0.0            # 0-6 (Monday=0)
+    inv_sqrt_tte: float = 0.0           # 1/sqrt(time_to_expiry_minutes) — gamma acceleration
+    model_disagreement: float = 0.0     # max - min across ensemble model probs
+    hawkes_intensity: float = 0.0       # Self-exciting jump intensity at entry
+    volume_flow_rate: float = 0.0       # Avg volume per minute (5-min window)
+
+    # ── v42 Tier 2: Medium-impact features ────────────────────────
+    cell_rolling_win_rate: float = 0.0  # Win rate of last N trades in this cell
+    cell_rolling_pnl: float = 0.0       # Sum PnL of last N trades in this cell
+    cell_trades_last_24h: int = 0       # Count of trades in this cell in last 24h
+    cross_ofi_divergence: float = 0.0   # |leader_ofi - target_ofi|
+    realized_vol_15m: float = 0.0       # Std of 15-min returns (contract-horizon vol)
+    realized_vol_1h: float = 0.0        # Std of 1-hour returns (daily-horizon vol)
+
+    # ── v42 Tier 3: New-data-source features ──────────────────────
+    iv_rv_ratio: float = 0.0            # Implied vol / realized vol
+    funding_rate_persistence: int = 0   # Consecutive same-sign funding intervals
+
     # Trade direction
     side: str = ""                        # "yes" or "no"
     entry_price: float = 0.0
@@ -120,6 +141,15 @@ FEATURE_COLUMNS = [
     "regime_vol_score", "regime_mean_reversion_score", "regime_ofi_alignment",
     "regime_is_transitioning", "regime_kelly_multiplier",
     "regime_min_edge_applied", "vpin_at_entry",
+    # v42 Tier 1
+    "hour_utc_sin", "hour_utc_cos", "day_of_week",
+    "inv_sqrt_tte", "model_disagreement",
+    "hawkes_intensity", "volume_flow_rate",
+    # v42 Tier 2
+    "cell_rolling_win_rate", "cell_rolling_pnl", "cell_trades_last_24h",
+    "cross_ofi_divergence", "realized_vol_15m", "realized_vol_1h",
+    # v42 Tier 3
+    "iv_rv_ratio", "funding_rate_persistence",
 ]
 
 # All CSV columns (features + identifiers + label)

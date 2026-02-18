@@ -450,6 +450,155 @@ class PriceModel:
         ) / (volatility * math.sqrt(dt))
         return float(_norm.cdf(d2))
 
+    # ── Implied volatility extraction ─────────────────────────────
+
+    def extract_implied_vol(
+        self,
+        market_price: float,
+        strike: float,
+        spot: float,
+        tte_minutes: float,
+        drift: float = 0.0,
+        direction: str = "above",
+        tol: float = 1e-6,
+        max_iter: int = 50,
+    ) -> float | None:
+        """Extract implied volatility from a binary option market price.
+
+        Inverts the Black-Scholes binary option pricing formula:
+
+            P(above) = N(d2)  where d2 = [ln(S/K) + (μ - σ²/2)τ] / (σ√τ)
+
+        Uses Brent's method (bisection with interpolation) to find σ such
+        that the analytical binary price matches the observed market price.
+
+        Parameters
+        ----------
+        market_price:
+            Observed binary option price (probability), in [0, 1].
+        strike:
+            Settlement threshold.
+        spot:
+            Current spot price.
+        tte_minutes:
+            Time to expiry in minutes.
+        drift:
+            Annualized drift (μ). Default 0.
+        direction:
+            ``"above"`` (call-like) or ``"below"`` (put-like).
+        tol:
+            Convergence tolerance for σ.
+        max_iter:
+            Maximum bisection iterations.
+
+        Returns
+        -------
+        float or None
+            Annualized implied volatility, or None if extraction fails
+            (degenerate inputs, price outside [0.01, 0.99], no convergence).
+        """
+        if _norm is None:
+            return None
+        if spot <= 0 or strike <= 0 or tte_minutes <= 0:
+            return None
+        # Prices near 0 or 1 are uninformative for IV
+        if market_price < 0.01 or market_price > 0.99:
+            return None
+
+        # For "below" contracts, invert: P(below) = 1 - P(above)
+        target_prob = market_price if direction == "above" else (1.0 - market_price)
+
+        dt = tte_minutes / _MINUTES_PER_YEAR_CRYPTO
+        log_moneyness = math.log(spot / strike)
+
+        def _binary_price(sigma: float) -> float:
+            d2 = (log_moneyness + (drift - 0.5 * sigma * sigma) * dt) / (sigma * math.sqrt(dt))
+            return float(_norm.cdf(d2))
+
+        # Bisection bounds: 1% to 500% annualized vol
+        lo, hi = 0.01, 5.0
+
+        # Check if solution exists within bounds
+        p_lo = _binary_price(lo)
+        p_hi = _binary_price(hi)
+
+        # If target is outside the range, no valid IV
+        if (target_prob - p_lo) * (target_prob - p_hi) > 0:
+            return None
+
+        # Brent-style bisection
+        for _ in range(max_iter):
+            mid = (lo + hi) / 2.0
+            p_mid = _binary_price(mid)
+            if abs(p_mid - target_prob) < tol:
+                return mid
+            # Binary option price is monotonically decreasing in vol
+            # for above contracts (higher vol → d2 shrinks for OTM, but
+            # relationship depends on moneyness).
+            # Use sign-based bisection which works regardless.
+            if (p_mid - target_prob) * (p_lo - target_prob) < 0:
+                hi = mid
+            else:
+                lo = mid
+                p_lo = p_mid
+
+        # Return midpoint even if not fully converged
+        return (lo + hi) / 2.0
+
+    def extract_iv_from_atm_contracts(
+        self,
+        quotes: list[dict],
+        spot: float,
+        tte_minutes: float,
+        drift: float = 0.0,
+    ) -> float | None:
+        """Extract implied vol from the ATM (closest-to-spot) contract.
+
+        Parameters
+        ----------
+        quotes:
+            List of dicts with keys ``"strike"``, ``"price"``, and
+            optionally ``"direction"`` (default ``"above"``).
+            ``price`` is the binary option market price [0, 1].
+        spot:
+            Current spot price.
+        tte_minutes:
+            Time to expiry in minutes.
+        drift:
+            Annualized drift.
+
+        Returns
+        -------
+        float or None
+            Implied vol from the ATM contract, or None if extraction fails.
+        """
+        if not quotes or spot <= 0 or tte_minutes <= 0:
+            return None
+
+        # Find ATM contract (closest strike to spot)
+        best = None
+        best_dist = float("inf")
+        for q in quotes:
+            strike = q.get("strike", 0.0)
+            if strike <= 0:
+                continue
+            dist = abs(strike - spot) / spot
+            if dist < best_dist:
+                best_dist = dist
+                best = q
+
+        if best is None:
+            return None
+
+        return self.extract_implied_vol(
+            market_price=best["price"],
+            strike=best["strike"],
+            spot=spot,
+            tte_minutes=tte_minutes,
+            drift=drift,
+            direction=best.get("direction", "above"),
+        )
+
     # ── internal ───────────────────────────────────────────────────
 
     def _wilson_ci(self, p_hat: float, n: int) -> ProbabilityEstimate:

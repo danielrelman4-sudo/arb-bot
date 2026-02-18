@@ -370,6 +370,18 @@ class CryptoEngine:
         self._empirical_returns_cache: Dict[str, list] = {}  # cached returns per symbol
         self._empirical_returns_cache_cycle: int = 0  # cache freshness
 
+        # v42: MC GBM cache for ensemble (store per-ticker for current cycle)
+        self._ab_mc_probs: Dict[str, ProbabilityEstimate] = {}  # ticker → MC prob
+
+        # v42: Per-cell rolling stats for meta-features
+        from collections import deque
+        self._cell_outcomes: Dict[str, deque] = {}  # cell → deque of (timestamp, pnl, won)
+        self._cell_outcome_window: int = 20  # last N trades per cell
+
+        # v42: Funding rate persistence tracking
+        self._funding_sign_persistence: Dict[str, int] = {}  # symbol → consecutive same-sign count
+        self._funding_last_sign: Dict[str, int] = {}  # symbol → last sign (-1, 0, 1)
+
         # Confidence scorer (B2)
         self._confidence_scorer = None
         if settings.confidence_scoring_enabled:
@@ -2548,9 +2560,13 @@ class CryptoEngine:
                         num_paths=up.num_paths,
                     )
 
-            # Always store empirical prob for feature store (classifier training)
+            # Always store all model probs for feature store + ensemble
             if emp_prob is not None:
                 self._ab_empirical_probs[mq.market.ticker] = emp_prob
+            if mc_prob is not None:
+                self._ab_mc_probs[mq.market.ticker] = mc_prob
+            if st_prob is not None:
+                self._ab_student_t_probs[mq.market.ticker] = st_prob
 
             # Select which probability to use for trading
             if self._settings.probability_model == "student_t":
@@ -2559,8 +2575,6 @@ class CryptoEngine:
                 prob = emp_prob
             elif self._settings.probability_model == "ab_test":
                 prob = mc_prob  # Trade on MC, but log Student-t
-                if st_prob is not None:
-                    self._ab_student_t_probs[mq.market.ticker] = st_prob
             elif self._settings.probability_model == "ab_empirical":
                 prob = mc_prob  # Trade on MC, but log empirical
             else:
@@ -2994,6 +3008,193 @@ class CryptoEngine:
             uncertainty=scaled_unc,
             num_paths=raw_est.num_paths,
         )
+
+    def _compute_ensemble_probability(
+        self,
+        edge: CryptoEdge,
+        is_yes: bool,
+    ) -> tuple[float, float]:
+        """Compute weighted ensemble probability from all 3 models.
+
+        Returns (ensemble_prob, model_disagreement).
+        model_disagreement = max - min across available model probabilities.
+
+        Falls back to the primary model if fewer than 2 models are available.
+        """
+        ticker = edge.market.ticker
+
+        # Collect available model probabilities
+        probs: Dict[str, float] = {}
+        if ticker in self._ab_mc_probs:
+            probs["mc_gbm"] = self._ab_mc_probs[ticker].probability
+        if ticker in self._ab_empirical_probs:
+            probs["empirical"] = self._ab_empirical_probs[ticker].probability
+        if ticker in self._ab_student_t_probs:
+            probs["student_t"] = self._ab_student_t_probs[ticker].probability
+
+        # Model disagreement (even if ensemble is disabled — always capture)
+        if len(probs) >= 2:
+            disagreement = max(probs.values()) - min(probs.values())
+        else:
+            disagreement = 0.0
+
+        # If ensemble disabled or fewer than 2 models, return primary model
+        if not self._settings.ensemble_enabled or len(probs) < 2:
+            return edge.model_prob.probability, disagreement
+
+        # Select weights based on YES/NO cell
+        if is_yes:
+            weights = {
+                "empirical": self._settings.ensemble_weight_empirical_yes,
+                "student_t": self._settings.ensemble_weight_student_t_yes,
+                "mc_gbm": self._settings.ensemble_weight_mc_gbm_yes,
+            }
+        else:
+            weights = {
+                "empirical": self._settings.ensemble_weight_empirical_no,
+                "student_t": self._settings.ensemble_weight_student_t_no,
+                "mc_gbm": self._settings.ensemble_weight_mc_gbm_no,
+            }
+
+        # Weighted average (normalize weights for available models only)
+        total_weight = sum(weights.get(k, 0.0) for k in probs)
+        if total_weight <= 0:
+            return edge.model_prob.probability, disagreement
+
+        ensemble_prob = sum(
+            probs[k] * weights.get(k, 0.0) for k in probs
+        ) / total_weight
+
+        ensemble_prob = max(0.01, min(0.99, ensemble_prob))
+
+        LOGGER.debug(
+            "CryptoEngine: ensemble %s: %s → %.1f%% (disagreement %.1f%%)",
+            ticker,
+            {k: f"{v*100:.1f}%" for k, v in probs.items()},
+            ensemble_prob * 100,
+            disagreement * 100,
+        )
+
+        return ensemble_prob, disagreement
+
+    def _compute_iv_crosscheck(
+        self,
+        edge: CryptoEdge,
+        model_vol: float,
+    ) -> tuple[float, float | None]:
+        """IV cross-check: compare model vol against market-implied vol.
+
+        Returns (edge_multiplier, iv_rv_ratio).
+        edge_multiplier: 1.0 = no change, <1.0 = dampen, >1.0 = boost.
+        iv_rv_ratio: IV/RV ratio for feature store, or None if IV unavailable.
+        """
+        if not self._settings.iv_crosscheck_enabled or model_vol <= 0:
+            return 1.0, None
+
+        # Extract IV from current Kalshi quotes for this contract
+        # We use the current edge's market price as the binary option price
+        market_price = edge.yes_buy_price if edge.side == "yes" else edge.no_buy_price
+        if market_price is None or market_price <= 0:
+            return 1.0, None
+
+        meta = edge.market.meta
+        iv = self._price_model.extract_implied_vol(
+            market_price=market_price,
+            strike=meta.strike or 0,
+            spot=self._price_feed.get_current_price(
+                _KALSHI_TO_BINANCE.get(meta.underlying, "")
+            ) or 0,
+            tte_minutes=edge.time_to_expiry_minutes,
+            direction="above" if meta.direction in ("above", "up") else "below",
+        )
+
+        if iv is None:
+            return 1.0, None
+
+        iv_rv_ratio = iv / model_vol
+
+        # Apply dampen/boost based on ratio
+        multiplier = 1.0
+        if iv_rv_ratio > self._settings.iv_crosscheck_dampen_threshold:
+            multiplier = self._settings.iv_crosscheck_dampen_factor
+            LOGGER.info(
+                "CryptoEngine: IV cross-check DAMPEN %s: IV=%.1f%% vs model=%.1f%% "
+                "(ratio=%.2f > %.2f), edge×%.2f",
+                edge.market.ticker, iv * 100, model_vol * 100,
+                iv_rv_ratio, self._settings.iv_crosscheck_dampen_threshold,
+                multiplier,
+            )
+        elif iv_rv_ratio < self._settings.iv_crosscheck_boost_threshold:
+            multiplier = self._settings.iv_crosscheck_boost_factor
+            LOGGER.info(
+                "CryptoEngine: IV cross-check BOOST %s: IV=%.1f%% vs model=%.1f%% "
+                "(ratio=%.2f < %.2f), edge×%.2f",
+                edge.market.ticker, iv * 100, model_vol * 100,
+                iv_rv_ratio, self._settings.iv_crosscheck_boost_threshold,
+                multiplier,
+            )
+
+        return multiplier, iv_rv_ratio
+
+    def _update_funding_persistence(self, binance_sym: str) -> int:
+        """Track how many consecutive intervals funding rate stays same-sign.
+
+        Returns the current persistence count.
+        """
+        if self._funding_tracker is None:
+            return 0
+
+        funding_sym = binance_sym.upper()
+        rate = self._funding_tracker.get_current_rate(funding_sym)
+        if rate is None:
+            return self._funding_sign_persistence.get(funding_sym, 0)
+
+        # Determine current sign
+        if rate > 0.0001:
+            current_sign = 1
+        elif rate < -0.0001:
+            current_sign = -1
+        else:
+            current_sign = 0
+
+        last_sign = self._funding_last_sign.get(funding_sym, 0)
+        if current_sign == last_sign and current_sign != 0:
+            self._funding_sign_persistence[funding_sym] = (
+                self._funding_sign_persistence.get(funding_sym, 0) + 1
+            )
+        else:
+            self._funding_sign_persistence[funding_sym] = 1 if current_sign != 0 else 0
+
+        self._funding_last_sign[funding_sym] = current_sign
+        return self._funding_sign_persistence.get(funding_sym, 0)
+
+    def _get_cell_rolling_stats(
+        self, cell_name: str,
+    ) -> tuple[float, float, int]:
+        """Get rolling win rate, PnL, and 24h trade count for a cell.
+
+        Returns (win_rate, rolling_pnl, trades_24h).
+        """
+        outcomes = self._cell_outcomes.get(cell_name)
+        if not outcomes or len(outcomes) == 0:
+            return 0.0, 0.0, 0
+
+        now = time.time()
+        wins = sum(1 for _, _, won in outcomes if won)
+        win_rate = wins / len(outcomes) if len(outcomes) > 0 else 0.0
+        rolling_pnl = sum(pnl for _, pnl, _ in outcomes)
+        trades_24h = sum(1 for ts, _, _ in outcomes if now - ts < 86400)
+
+        return win_rate, rolling_pnl, trades_24h
+
+    def _record_cell_outcome(
+        self, cell_name: str, pnl: float, won: bool,
+    ) -> None:
+        """Record a settled trade outcome for per-cell rolling stats."""
+        from collections import deque
+        if cell_name not in self._cell_outcomes:
+            self._cell_outcomes[cell_name] = deque(maxlen=self._cell_outcome_window)
+        self._cell_outcomes[cell_name].append((time.time(), pnl, won))
 
     def _passes_cell_signal_gates(
         self,
@@ -3480,6 +3681,74 @@ class CryptoEngine:
 
         vpin_at_entry_val = vpin_val
 
+        # ── v42 Tier 1: Temporal features ──────────────────────────
+        import datetime as _dt
+        import math as _math
+        now_utc = _dt.datetime.utcnow()
+        hour_frac = now_utc.hour + now_utc.minute / 60.0
+        hour_sin = _math.sin(2.0 * _math.pi * hour_frac / 24.0)
+        hour_cos = _math.cos(2.0 * _math.pi * hour_frac / 24.0)
+        day_of_week = float(now_utc.weekday())  # Monday=0
+
+        # Nonlinear TTE: captures gamma acceleration near expiry
+        tte = edge.time_to_expiry_minutes
+        inv_sqrt_tte = 1.0 / _math.sqrt(max(tte, 0.1))
+
+        # Model disagreement (ensemble)
+        is_yes = (edge.side == "yes")
+        _, model_disagreement = self._compute_ensemble_probability(edge, is_yes)
+
+        # Hawkes intensity
+        hawkes_val = 0.0
+        if self._settings.hawkes_enabled:
+            hawkes_val = self._hawkes.intensity(time.monotonic())
+
+        # Volume flow rate
+        vol_flow = 0.0
+        if binance_sym:
+            vol_flow = self._price_feed.get_volume_flow_rate(binance_sym, window_seconds=300)
+
+        # ── v42 Tier 2: Meta-features ──────────────────────────────
+        cell_name = getattr(edge, "strategy_cell", "")
+        cell_wr, cell_pnl, cell_24h = self._get_cell_rolling_stats(cell_name)
+
+        # Cross-asset OFI divergence
+        cross_div = 0.0
+        if self._cross_asset is not None and binance_sym and binance_sym != self._cross_asset.leader_symbol:
+            cross_sig = self._cross_asset.compute_features(self._price_feed, binance_sym)
+            if cross_sig is not None:
+                cross_div = cross_sig.cross_ofi_divergence
+
+        # Realized vol at contract horizon (15min and 1h)
+        rv_15m = rv_1h = 0.0
+        if binance_sym:
+            returns_15m = self._price_feed.get_returns(binance_sym, 60, 15)
+            if len(returns_15m) >= 2:
+                rv_15m = float(np.std(returns_15m)) * _math.sqrt(15)  # scale to 15-min vol
+            returns_1h = self._price_feed.get_returns(binance_sym, 300, 60)
+            if len(returns_1h) >= 2:
+                rv_1h = float(np.std(returns_1h)) * _math.sqrt(12)  # scale to 1-hour vol
+
+        # ── v42 Tier 3: IV ratio + funding persistence ─────────────
+        iv_rv = 0.0
+        # Get model vol for IV cross-check
+        model_vol = 0.0
+        if binance_sym:
+            vol_returns = self._price_feed.get_returns(
+                binance_sym, interval_seconds=60,
+                window_minutes=self._settings.mc_vol_window_minutes,
+            )
+            if len(vol_returns) >= 5:
+                model_vol = self._price_model.estimate_volatility(
+                    vol_returns, interval_seconds=60,
+                    method=self._settings.mc_vol_method,
+                )
+        _, iv_ratio_result = self._compute_iv_crosscheck(edge, model_vol)
+        if iv_ratio_result is not None:
+            iv_rv = iv_ratio_result
+
+        funding_persist = self._update_funding_persistence(binance_sym) if binance_sym else 0
+
         return FeatureVector(
             ticker=edge.market.ticker,
             timestamp=time.time(),
@@ -3525,6 +3794,25 @@ class CryptoEngine:
             regime_kelly_multiplier=regime_kelly_mult,
             regime_min_edge_applied=regime_min_edge_val,
             vpin_at_entry=vpin_at_entry_val,
+            # v42 Tier 1
+            hour_utc_sin=hour_sin,
+            hour_utc_cos=hour_cos,
+            day_of_week=day_of_week,
+            inv_sqrt_tte=inv_sqrt_tte,
+            model_disagreement=model_disagreement,
+            hawkes_intensity=hawkes_val,
+            volume_flow_rate=vol_flow,
+            # v42 Tier 2
+            cell_rolling_win_rate=cell_wr,
+            cell_rolling_pnl=cell_pnl,
+            cell_trades_last_24h=cell_24h,
+            cross_ofi_divergence=cross_div,
+            realized_vol_15m=rv_15m,
+            realized_vol_1h=rv_1h,
+            # v42 Tier 3
+            iv_rv_ratio=iv_rv,
+            funding_rate_persistence=funding_persist,
+            # Trade identifiers
             side=edge.side,
             entry_price=edge.yes_buy_price if edge.side == "yes" else edge.no_buy_price,
             strategy_cell=edge.strategy_cell,
@@ -3898,6 +4186,15 @@ class CryptoEngine:
                 if self._feature_store is not None:
                     self._feature_store.record_outcome(ticker, settled_yes)
 
+                # v42: Record cell outcome for rolling meta-features
+                cell_name = getattr(pos, 'strategy_cell', '')
+                won = (
+                    (settled_yes and pos.side == "yes")
+                    or (not settled_yes and pos.side == "no")
+                )
+                if cell_name:
+                    self._record_cell_outcome(cell_name, pnl, won)
+
                 record = CryptoTradeRecord(
                     ticker=ticker,
                     side=pos.side,
@@ -4038,6 +4335,15 @@ class CryptoEngine:
         # Record outcome in feature store (C1)
         if self._feature_store is not None:
             self._feature_store.record_outcome(ticker, settled_yes)
+
+        # v42: Record cell outcome for rolling meta-features
+        cell_name = getattr(pos, 'strategy_cell', '')
+        won = (
+            (settled_yes and pos.side == "yes")
+            or (not settled_yes and pos.side == "no")
+        )
+        if cell_name:
+            self._record_cell_outcome(cell_name, pnl, won)
 
         record = CryptoTradeRecord(
             ticker=ticker,
