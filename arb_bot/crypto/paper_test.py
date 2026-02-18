@@ -417,12 +417,12 @@ async def run_paper_test(
         min_edge_pct_daily=min_edge,  # Same as min_edge; per-cell logic applies stricter thresholds
         min_edge_cents=min_edge,
         dynamic_edge_threshold_enabled=False,  # Per-cell logic applies real thresholds; this extra layer is redundant
-        max_model_uncertainty=0.25,
+        max_model_uncertainty=0.30,  # Relaxed from 0.25 — allow more uncertain edges for data collection
         model_uncertainty_multiplier=3.0,
         bankroll=500.0,
         max_position_per_market=50.0,
-        max_concurrent_positions=10,
-        max_positions_per_underlying=3,
+        max_concurrent_positions=20,  # Relaxed from 10 — allow more simultaneous trades for data
+        max_positions_per_underlying=5,  # Relaxed from 3 — allow more trades per underlying
         kelly_fraction_cap=0.06,
         scan_interval_seconds=scan_interval,
         paper_slippage_cents=0.5,
@@ -446,11 +446,11 @@ async def run_paper_test(
         calibration_method="isotonic",
         calibration_isotonic_min_samples=20,
         # Fix 4: NO-side threshold equalized with YES (was 0.20)
-        min_edge_pct_no_side=0.08,  # Permissive gate; per-cell logic applies real thresholds
+        min_edge_pct_no_side=min_edge,  # Relaxed to match --min-edge for max data collection
         # Fix 5: Model-market divergence filter
-        min_model_market_divergence=0.06,  # Was 0.12; after blending, 0.12 needs 17%+ true divergence
-        # Fix 6: Book volume filter
-        min_book_volume=10,
+        min_model_market_divergence=0.02,  # Relaxed from 0.06 for max data collection
+        # Fix 6: Book volume filter (0 = no filter; daily strikes have low volume early)
+        min_book_volume=0,
         # OFI microstructure drift
         ofi_enabled=True,
         ofi_window_seconds=600,
@@ -519,8 +519,12 @@ async def run_paper_test(
         feature_store_enabled=True,
         feature_store_path=fs_path,
         feature_store_min_samples=200,
-        # C2: Classifier — disabled until we have enough training data
-        classifier_enabled=False,
+        # C2: Classifier — ENABLED with trained model
+        classifier_enabled=True,
+        classifier_model_path="arb_bot/output/classifier_model_model.json",
+        classifier_veto_threshold=0.4,  # Reject trades where P(win) < 40%
+        classifier_min_training_samples=50,  # Lower for small dataset
+        classifier_retrain_interval_hours=1.0,  # Retrain hourly as new data comes in
         # ── v11: Student-t A/B test ────────────────────────────────
         probability_model=probability_model,
         # ── Empirical CDF model ──────────────────────────────────────
@@ -542,11 +546,11 @@ async def run_paper_test(
         regime_min_edge_mean_reverting=0.12,
         regime_min_edge_trending=0.12,
         regime_min_edge_high_vol=0.12,
-        # Tier 1: VPIN halt gate
+        # Tier 1: VPIN halt gate — raised threshold for data collection
         vpin_halt_enabled=True,
-        vpin_halt_threshold=0.85,
-        # Tier 2: Counter-trend filter
-        regime_skip_counter_trend=True,
+        vpin_halt_threshold=0.95,  # Was 0.85; only halt on extreme VPIN for data collection
+        # Tier 2: Counter-trend filter — DISABLED for data collection
+        regime_skip_counter_trend=False,  # Let classifier learn which trends matter
         regime_skip_counter_trend_min_conf=0.6,
         # Tier 2: Vol regime adjustment
         regime_vol_boost_high_vol=1.5,
@@ -578,6 +582,45 @@ async def run_paper_test(
         momentum_min_ofi_streak=3,
         momentum_require_ofi_acceleration=True,
         momentum_max_contracts=100,
+        # ── Strategy cell overrides (horizon-aware, classifier-gated) ────
+        # 15min cells: model has good short-term data, trust it more.
+        # Daily cells: model extrapolates beyond data window, defer to
+        # market + require higher edge.  Classifier veto gate on all.
+        # YES/15min — empirical bootstrap: captures actual return distribution
+        cell_yes_15min_probability_model="empirical",
+        cell_yes_15min_min_edge_pct=min_edge,        # 4% — model reliable here
+        cell_yes_15min_vol_dampening=1.0,
+        cell_yes_15min_prob_haircut=1.0,
+        cell_yes_15min_require_ofi=False,
+        cell_yes_15min_require_price_past_strike=False,
+        cell_yes_15min_model_weight=0.65,            # Trust model for short horizon
+        cell_yes_15min_uncertainty_mult=1.5,
+        cell_yes_15min_kelly_multiplier=0.6,
+        cell_yes_15min_max_position=25.0,
+        # YES/daily — empirical with horizon-aware vol scaling
+        cell_yes_daily_probability_model="empirical",
+        cell_yes_daily_min_edge_pct=8.0,             # Higher bar — model extrapolating
+        cell_yes_daily_vol_dampening=1.0,
+        cell_yes_daily_prob_haircut=1.0,
+        cell_yes_daily_require_trend=False,
+        cell_yes_daily_model_weight=0.45,            # Defer to market for long horizon
+        cell_yes_daily_uncertainty_mult=1.5,
+        cell_yes_daily_kelly_multiplier=0.6,
+        cell_yes_daily_max_position=25.0,
+        # NO/15min — mc_gbm: Gaussian tails underestimate extremes → edge for "won't reach X"
+        cell_no_15min_probability_model="mc_gbm",
+        cell_no_15min_min_edge_pct=min_edge,         # 4% — model reliable here
+        cell_no_15min_model_weight=0.65,             # Trust model for short horizon
+        cell_no_15min_uncertainty_mult=1.5,
+        cell_no_15min_kelly_multiplier=0.6,
+        cell_no_15min_max_position=25.0,
+        # NO/daily — mc_gbm: thin tails = proven alpha for "price won't move that far"
+        cell_no_daily_probability_model="mc_gbm",
+        cell_no_daily_min_edge_pct=8.0,              # Higher bar — model extrapolating
+        cell_no_daily_model_weight=0.45,             # Defer to market for long horizon
+        cell_no_daily_uncertainty_mult=1.5,
+        cell_no_daily_kelly_multiplier=0.6,
+        cell_no_daily_max_position=25.0,
     )
 
     engine = CryptoEngine(settings)
@@ -848,14 +891,18 @@ async def run_paper_test(
             # Parse into quotes
             quotes: list[CryptoMarketQuote] = []
             skipped = 0
+            skipped_tte = 0
             for raw in raw_markets:
                 q = kalshi_raw_to_quote(raw, now, min_book_volume=settings.min_book_volume)
                 if q is not None and q.time_to_expiry_minutes <= max_tte:
                     quotes.append(q)
+                elif q is not None:
+                    skipped_tte += 1
+                    skipped += 1
                 else:
                     skipped += 1
 
-            print(f"   Markets: {len(quotes)} tradeable, {skipped} filtered")
+            print(f"   Markets: {len(quotes)} tradeable, {skipped} filtered (TTE={skipped_tte})")
 
             if quotes:
                 # Group by interval type
@@ -1091,8 +1138,8 @@ def main() -> None:
                         help="How long to run (default: 5)")
     parser.add_argument("--mc-paths", type=int, default=1000,
                         help="Monte Carlo paths (default: 1000)")
-    parser.add_argument("--min-edge", type=float, default=0.08,
-                        help="Min edge fraction (default: 0.12 = 12%%)")
+    parser.add_argument("--min-edge", type=float, default=0.04,
+                        help="Min edge fraction (default: 0.04 = 4%%)")
     parser.add_argument("--scan-interval", type=float, default=15.0,
                         help="Seconds between scans (default: 15)")
     parser.add_argument("--max-tte", type=int, default=600,

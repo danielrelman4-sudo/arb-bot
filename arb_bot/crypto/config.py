@@ -362,6 +362,26 @@ class CryptoSettings:
     cell_no_daily_kelly_multiplier: float = 1.0         # Full size — proven alpha
     cell_no_daily_max_position: float = 50.0
 
+    # Per-cell probability model overrides (empty = use global probability_model)
+    # YES cells use empirical (captures return distribution for "will price reach X?")
+    # NO cells use mc_gbm (Gaussian tails underestimate extremes → edge for "won't reach X")
+    cell_yes_15min_probability_model: str = ""
+    cell_yes_daily_probability_model: str = ""
+    cell_no_15min_probability_model: str = ""
+    cell_no_daily_probability_model: str = ""
+
+    # Per-cell classifier model paths (empty = use global classifier_model_path)
+    classifier_model_path_yes_15min: str = ""
+    classifier_model_path_yes_daily: str = ""
+    classifier_model_path_no_15min: str = ""
+    classifier_model_path_no_daily: str = ""
+
+    # Per-cell classifier veto thresholds
+    classifier_veto_threshold_yes_15min: float = 0.4
+    classifier_veto_threshold_yes_daily: float = 0.4
+    classifier_veto_threshold_no_15min: float = 0.4
+    classifier_veto_threshold_no_daily: float = 0.4
+
     # ── Cycle recorder ────────────────────────────────────────────────
     cycle_recorder_enabled: bool = False
     cycle_recorder_db_dir: str = "recordings"
@@ -382,6 +402,7 @@ class CryptoSettings:
     classifier_learning_rate: float = 0.1
     classifier_min_child_weight: int = 5
     classifier_subsample: float = 0.8
+    classifier_veto_threshold: float = 0.4  # Reject trades where P(win) < this
 
     # ── Cycle timing ───────────────────────────────────────────────
     scan_interval_seconds: float = 5.0
@@ -617,6 +638,21 @@ def load_crypto_settings() -> CryptoSettings:
         cell_no_daily_min_edge_pct=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_MIN_EDGE_PCT"), 0.12),
         cell_no_daily_kelly_multiplier=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_KELLY_MULTIPLIER"), 1.0),
         cell_no_daily_max_position=_as_float(os.getenv("ARB_CRYPTO_CELL_NO_DAILY_MAX_POSITION"), 50.0),
+        # Per-cell probability model overrides
+        cell_yes_15min_probability_model=os.getenv("ARB_CRYPTO_CELL_YES_15MIN_PROBABILITY_MODEL", ""),
+        cell_yes_daily_probability_model=os.getenv("ARB_CRYPTO_CELL_YES_DAILY_PROBABILITY_MODEL", ""),
+        cell_no_15min_probability_model=os.getenv("ARB_CRYPTO_CELL_NO_15MIN_PROBABILITY_MODEL", ""),
+        cell_no_daily_probability_model=os.getenv("ARB_CRYPTO_CELL_NO_DAILY_PROBABILITY_MODEL", ""),
+        # Per-cell classifier model paths
+        classifier_model_path_yes_15min=os.getenv("ARB_CRYPTO_CLASSIFIER_MODEL_PATH_YES_15MIN", ""),
+        classifier_model_path_yes_daily=os.getenv("ARB_CRYPTO_CLASSIFIER_MODEL_PATH_YES_DAILY", ""),
+        classifier_model_path_no_15min=os.getenv("ARB_CRYPTO_CLASSIFIER_MODEL_PATH_NO_15MIN", ""),
+        classifier_model_path_no_daily=os.getenv("ARB_CRYPTO_CLASSIFIER_MODEL_PATH_NO_DAILY", ""),
+        # Per-cell classifier veto thresholds
+        classifier_veto_threshold_yes_15min=_as_float(os.getenv("ARB_CRYPTO_CLASSIFIER_VETO_THRESHOLD_YES_15MIN"), 0.4),
+        classifier_veto_threshold_yes_daily=_as_float(os.getenv("ARB_CRYPTO_CLASSIFIER_VETO_THRESHOLD_YES_DAILY"), 0.4),
+        classifier_veto_threshold_no_15min=_as_float(os.getenv("ARB_CRYPTO_CLASSIFIER_VETO_THRESHOLD_NO_15MIN"), 0.4),
+        classifier_veto_threshold_no_daily=_as_float(os.getenv("ARB_CRYPTO_CLASSIFIER_VETO_THRESHOLD_NO_DAILY"), 0.4),
         cycle_recorder_enabled=_as_bool(os.getenv("ARB_CRYPTO_CYCLE_RECORDER_ENABLED"), False),
         cycle_recorder_db_dir=os.getenv("ARB_CRYPTO_CYCLE_RECORDER_DB_DIR", "recordings"),
         feature_store_enabled=_as_bool(os.getenv("ARB_CRYPTO_FEATURE_STORE_ENABLED"), False),

@@ -21,7 +21,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -804,6 +804,61 @@ class CryptoEngine:
             num_paths=0,  # Not MC-based
         )
 
+    def _classifier_veto(self, edge: CryptoEdge) -> Tuple[bool, float, Optional["FeatureVector"]]:
+        """Check if the classifier vetoes this trade.
+
+        Returns (vetoed, p_win, feature_vector).
+        - vetoed: True if classifier says don't trade (p_win < threshold)
+        - p_win: classifier's estimated P(win), or -1 if not available
+        - feature_vector: built FeatureVector (reuse for feature store recording)
+        """
+        if self._classifier is None or not self._classifier.is_trained:
+            return False, -1.0, None
+
+        from arb_bot.crypto.feature_store import FEATURE_COLUMNS, _REGIME_ENCODE
+
+        # Build feature vector
+        fv = self._build_feature_vector(edge)
+
+        # Convert to numpy array matching training schema
+        n_base = len(FEATURE_COLUMNS)
+        features = np.zeros(n_base + 2)  # +2 for side_numeric, is_daily
+        for j, col in enumerate(FEATURE_COLUMNS):
+            val = getattr(fv, col, 0.0)
+            if col == "regime":
+                features[j] = float(_REGIME_ENCODE.get(str(val), 0))
+            else:
+                try:
+                    features[j] = float(val)
+                except (ValueError, TypeError):
+                    features[j] = 0.0
+
+        # Extra derived features (must match training)
+        features[n_base + 0] = 1.0 if edge.side == "yes" else 0.0  # side_numeric
+        features[n_base + 1] = 1.0 if "daily" in (edge.strategy_cell or "") else 0.0  # is_daily
+
+        # Predict
+        result = self._classifier.predict(features)
+        p_win = result.probability if result.is_classifier else -1.0
+
+        # Veto threshold (configurable)
+        threshold = getattr(self._settings, 'classifier_veto_threshold', 0.4)
+        vetoed = p_win >= 0 and p_win < threshold
+
+        if vetoed:
+            LOGGER.info(
+                "CryptoEngine: classifier veto %s — P(win)=%.2f < %.2f (cell=%s)",
+                edge.market.ticker, p_win, threshold,
+                edge.strategy_cell or "unknown",
+            )
+        else:
+            LOGGER.debug(
+                "CryptoEngine: classifier pass %s — P(win)=%.2f (cell=%s)",
+                edge.market.ticker, p_win, edge.strategy_cell or "unknown",
+            )
+
+        return vetoed, p_win, fv
+
     # ── Cycle logger ─────────────────────────────────────────────
 
     def set_cycle_logger(self, logger: CycleLogger) -> None:
@@ -976,8 +1031,14 @@ class CryptoEngine:
         if _momentum_zone and self._settings.momentum_enabled:
             await self._try_momentum_trades(market_quotes, momentum_symbols=_vpin_momentum_symbols)
 
-        # If no symbols are in normal zone, skip model-path trades
-        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols):
+        # If no symbols are in normal zone, skip model-path trades for 15-min markets.
+        # Daily (above/below TTE>30m) markets are still processed — VPIN measures
+        # short-term microstructure toxicity, not structural model-vs-market edges.
+        _has_daily_quotes = any(
+            mq.market.meta.direction in ("above", "below") and mq.time_to_expiry_minutes > 30
+            for mq in market_quotes
+        )
+        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols) and not _has_daily_quotes:
             await self._settle_expired_positions()
             cycle_elapsed = time.monotonic() - cycle_start
             if cycle_elapsed > 1.0:
@@ -1010,12 +1071,18 @@ class CryptoEngine:
         edges = self._edge_detector.detect_edges(market_quotes, model_probs)
 
         # 3-vpin. Filter edges for symbols in halted or momentum zone (model-path only)
+        # Daily (above/below) markets with TTE > 30m are EXEMPT from VPIN filtering:
+        # VPIN measures short-term order toxicity, not whether a strike will be
+        # reached over the next hour+.  Daily edges are structural (model vs market),
+        # not microstructure-driven.
         if _vpin_halted_symbols or _vpin_momentum_symbols:
             blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
             pre_count = len(edges)
             edges = [
                 e for e in edges
                 if _KALSHI_TO_BINANCE.get(e.market.meta.underlying, "") not in blocked_syms
+                or (e.market.meta.direction in ("above", "below")
+                    and e.time_to_expiry_minutes > 30)
             ]
             if len(edges) < pre_count:
                 LOGGER.info(
@@ -1120,6 +1187,9 @@ class CryptoEngine:
                         _filter_results[ticker].passed_zscore = True
 
         # 3-ofi. Counter-trend OFI filter: skip trades opposing the trend in trending regimes
+        # Daily (above/below) markets with TTE > 30m are EXEMPT: the micro regime
+        # (last few minutes) doesn't predict whether price stays above a strike
+        # over the next hour+.
         if (self._settings.regime_skip_counter_trend
             and self._current_regime is not None
             and self._current_regime.is_trending
@@ -1128,6 +1198,11 @@ class CryptoEngine:
             trend_dir = self._current_regime.trend_direction  # 1=up, -1=down
             ofi_filtered = []
             for edge in edges:
+                # Exempt daily markets from counter-trend filter
+                if (edge.market.meta.direction in ("above", "below")
+                        and edge.time_to_expiry_minutes > 30):
+                    ofi_filtered.append(edge)
+                    continue
                 direction = edge.market.meta.direction
                 if direction in ("above", "up"):
                     trade_dir = 1 if edge.side == "yes" else -1
@@ -1243,11 +1318,16 @@ class CryptoEngine:
                 if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
                     continue
 
+            # Classifier veto gate
+            vetoed, p_win, fv = self._classifier_veto(edge)
+            if vetoed:
+                continue
+
             contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
             if contracts <= 0:
                 continue
 
-            self._execute_paper_trade(edge, contracts)
+            self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
             trades_opened += 1
 
         # 5. Check and settle expired positions
@@ -1436,8 +1516,13 @@ class CryptoEngine:
         if _momentum_zone and self._settings.momentum_enabled:
             await self._try_momentum_trades(quotes, momentum_symbols=_vpin_momentum_symbols)
 
-        # If no symbols are in normal zone, skip model-path trades
-        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols):
+        # If no symbols are in normal zone, skip model-path trades for 15-min markets.
+        # Daily (above/below TTE>30m) markets are still processed.
+        _has_daily_quotes = any(
+            mq.market.meta.direction in ("above", "below") and mq.time_to_expiry_minutes > 30
+            for mq in quotes
+        )
+        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols) and not _has_daily_quotes:
             await self._settle_expired_positions()
             return []
 
@@ -1465,12 +1550,15 @@ class CryptoEngine:
         edges = self._edge_detector.detect_edges(quotes, model_probs)
 
         # Filter edges for symbols in halted or momentum zone (model-path only)
+        # Daily (above/below) markets with TTE > 30m are EXEMPT from VPIN filtering.
         if _vpin_halted_symbols or _vpin_momentum_symbols:
             blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
             pre_count = len(edges)
             edges = [
                 e for e in edges
                 if _KALSHI_TO_BINANCE.get(e.market.meta.underlying, "") not in blocked_syms
+                or (e.market.meta.direction in ("above", "below")
+                    and e.time_to_expiry_minutes > 30)
             ]
             if len(edges) < pre_count:
                 LOGGER.info(
@@ -1575,6 +1663,7 @@ class CryptoEngine:
                         _filter_results[ticker].passed_zscore = True
 
         # Counter-trend OFI filter: skip trades opposing the trend in trending regimes
+        # Daily (above/below) markets with TTE > 30m are EXEMPT.
         if (self._settings.regime_skip_counter_trend
             and self._current_regime is not None
             and self._current_regime.is_trending
@@ -1583,6 +1672,11 @@ class CryptoEngine:
             trend_dir = self._current_regime.trend_direction  # 1=up, -1=down
             ofi_filtered = []
             for edge in edges:
+                # Exempt daily markets from counter-trend filter
+                if (edge.market.meta.direction in ("above", "below")
+                        and edge.time_to_expiry_minutes > 30):
+                    ofi_filtered.append(edge)
+                    continue
                 direction = edge.market.meta.direction
                 if direction in ("above", "up"):
                     trade_dir = 1 if edge.side == "yes" else -1
@@ -1697,11 +1791,16 @@ class CryptoEngine:
                 if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
                     continue
 
+            # Classifier veto gate
+            vetoed, p_win, fv = self._classifier_veto(edge)
+            if vetoed:
+                continue
+
             contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
             if contracts <= 0:
                 continue
 
-            self._execute_paper_trade(edge, contracts)
+            self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
             trades_opened += 1
 
         await self._settle_expired_positions()
@@ -2507,21 +2606,57 @@ class CryptoEngine:
             # Tag edge with cell label (for feature store + logging)
             object.__setattr__(edge, "strategy_cell", cell.value)
 
-            # Determine if any correction is needed
-            needs_vol_dampening = abs(cell_cfg.vol_dampening - 1.0) > 0.001
+            # ── Layer 0: Per-cell probability model override ──
+            # If cell specifies a different probability model than global,
+            # recompute the probability using the cell's preferred model.
+            cell_prob_model = cell_cfg.probability_model
+            global_prob_model = self._settings.probability_model
+            needs_model_switch = (
+                cell_prob_model
+                and cell_prob_model != global_prob_model
+            )
+
+            model_prob = edge.model_prob.probability
+            model_unc = edge.model_uncertainty
+
+            if needs_model_switch:
+                recomputed = None
+                if cell_prob_model == "mc_gbm":
+                    recomputed = self._recompute_with_mc_gbm(
+                        edge, cell_cfg.uncertainty_multiplier,
+                    )
+                elif cell_prob_model == "empirical":
+                    # Recompute with empirical bootstrap (use vol_dampening=1.0
+                    # here; actual dampening applied in Layer 1 if needed)
+                    recomputed = self._recompute_with_vol_dampening(
+                        edge, 1.0, cell_cfg.uncertainty_multiplier,
+                    )
+
+                if recomputed is not None:
+                    model_prob = recomputed.probability
+                    model_unc = recomputed.uncertainty
+                    LOGGER.info(
+                        "CryptoEngine: cell probability model override %s "
+                        "(%s→%s): prob %.1f%%→%.1f%%",
+                        edge.market.ticker, global_prob_model, cell_prob_model,
+                        edge.model_prob.probability * 100, model_prob * 100,
+                    )
+
+            # Determine if any further correction is needed
+            needs_vol_dampening = (
+                abs(cell_cfg.vol_dampening - 1.0) > 0.001
+                and not needs_model_switch  # Already recomputed above
+            )
             needs_reblend = (
                 abs(cell_cfg.model_weight - 0.7) > 0.001
                 or abs(cell_cfg.prob_haircut - 1.0) > 0.001
             )
 
-            if not needs_vol_dampening and not needs_reblend:
+            if not needs_vol_dampening and not needs_reblend and not needs_model_switch:
                 adjusted.append(edge)
                 continue
 
             # ── Layer 1: Vol dampening (recompute probability) ──
-            model_prob = edge.model_prob.probability
-            model_unc = edge.model_uncertainty
-
             if needs_vol_dampening:
                 dampened = self._recompute_with_vol_dampening(
                     edge, cell_cfg.vol_dampening,
@@ -2650,6 +2785,115 @@ class CryptoEngine:
                 uncertainty=raw_est.uncertainty,
                 num_paths=raw_est.num_paths,
             )
+
+        # Apply per-cell uncertainty multiplier
+        scaled_unc = raw_est.uncertainty * uncertainty_multiplier
+        return ProbabilityEstimate(
+            probability=raw_est.probability,
+            ci_lower=max(0.0, raw_est.probability - scaled_unc),
+            ci_upper=min(1.0, raw_est.probability + scaled_unc),
+            uncertainty=scaled_unc,
+            num_paths=raw_est.num_paths,
+        )
+
+    def _recompute_with_mc_gbm(
+        self,
+        edge: CryptoEdge,
+        uncertainty_multiplier: float,
+    ) -> Optional[ProbabilityEstimate]:
+        """Recompute probability using MC GBM paths instead of empirical bootstrap.
+
+        Used when a cell's probability_model overrides the global setting to
+        ``mc_gbm``.  Generates fresh GBM paths (with jump diffusion if enabled)
+        and computes P(above/below/up/down) from the terminal distribution.
+
+        Returns ``None`` if recomputation isn't possible (missing data).
+        """
+        meta = edge.market.meta
+        underlying = meta.underlying
+        direction = meta.direction
+        strike = meta.strike
+
+        # Map Kalshi underlying to Binance symbol
+        binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+        if not binance_sym:
+            return None
+
+        # Get current price
+        current_price = self._price_feed.get_current_price(binance_sym)
+        if current_price is None or current_price <= 0:
+            return None
+
+        # Get volatility
+        vol_returns = self._price_feed.get_returns(
+            binance_sym,
+            window_minutes=self._settings.mc_vol_window_minutes,
+            interval_seconds=60,
+        )
+        if len(vol_returns) < 5:
+            return None
+
+        vol = self._price_model.estimate_volatility(
+            vol_returns,
+            interval_seconds=60,
+            method=self._settings.mc_vol_method,
+        )
+        if vol <= 0:
+            return None
+
+        horizon = edge.time_to_expiry_minutes
+
+        # Generate paths (jump-diffusion or plain GBM)
+        drift = 0.0  # Use zero drift for simplicity in per-cell override
+        if self._settings.use_jump_diffusion:
+            if self._settings.hawkes_enabled:
+                import time as _time
+                dynamic_intensity = self._hawkes.intensity(_time.monotonic())
+            else:
+                dynamic_intensity = self._settings.mc_jump_intensity
+            paths = self._price_model.generate_paths_jump_diffusion(
+                current_price, vol, horizon, drift=drift,
+                jump_intensity=dynamic_intensity,
+                jump_mean=self._settings.mc_jump_mean,
+                jump_vol=self._settings.mc_jump_vol,
+            )
+        else:
+            paths = self._price_model.generate_paths(
+                current_price, vol, horizon, drift=drift,
+            )
+
+        # Compute probability based on direction
+        if direction == "above" and strike is not None:
+            raw_est = self._price_model.probability_above_with_control_variate(
+                paths, strike, current_price, vol, horizon, drift,
+            )
+        elif direction == "below" and strike is not None:
+            raw_est = self._price_model.probability_below(paths, strike)
+        elif direction == "up":
+            ref_price = current_price
+            if meta.interval_start_time is not None:
+                start_ts = meta.interval_start_time.timestamp()
+                looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                if looked_up is not None:
+                    ref_price = looked_up
+            raw_est = self._price_model.probability_up(paths, ref_price)
+        elif direction == "down":
+            ref_price = current_price
+            if meta.interval_start_time is not None:
+                start_ts = meta.interval_start_time.timestamp()
+                looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                if looked_up is not None:
+                    ref_price = looked_up
+            up = self._price_model.probability_up(paths, ref_price)
+            raw_est = ProbabilityEstimate(
+                probability=1.0 - up.probability,
+                ci_lower=1.0 - up.ci_upper,
+                ci_upper=1.0 - up.ci_lower,
+                uncertainty=up.uncertainty,
+                num_paths=up.num_paths,
+            )
+        else:
+            return None
 
         # Apply per-cell uncertainty multiplier
         scaled_unc = raw_est.uncertainty * uncertainty_multiplier
@@ -3018,7 +3262,12 @@ class CryptoEngine:
 
     # ── Execution ─────────────────────────────────────────────────
 
-    def _execute_paper_trade(self, edge: CryptoEdge, contracts: int) -> None:
+    def _execute_paper_trade(
+        self,
+        edge: CryptoEdge,
+        contracts: int,
+        prebuilt_fv: Optional["FeatureVector"] = None,
+    ) -> None:
         """Simulate a paper trade."""
         if edge.side == "yes":
             entry_price = edge.yes_buy_price
@@ -3053,7 +3302,7 @@ class CryptoEngine:
 
         # Record feature vector for training (C1)
         if self._feature_store is not None:
-            fv = self._build_feature_vector(edge)
+            fv = prebuilt_fv or self._build_feature_vector(edge)
             fv.entry_price = entry_price  # Use actual slippage-adjusted price
             self._feature_store.record_entry(fv)
 

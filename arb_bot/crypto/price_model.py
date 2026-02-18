@@ -640,6 +640,14 @@ class PriceModel:
         Accumulates log returns to get terminal prices and counts
         the fraction above ``strike``.
 
+        **Horizon-aware scaling:** When ``horizon_steps`` exceeds the
+        number of available returns, we cap the path length at
+        ``len(returns)`` and scale each resampled return by
+        ``sqrt(horizon_steps / effective_steps)`` so the terminal
+        variance matches what a sqrt-time diffusion would produce.
+        This prevents overconfident predictions for long-horizon
+        contracts (e.g. 8-hour dailies from 2 hours of data).
+
         Parameters
         ----------
         returns:
@@ -664,11 +672,6 @@ class PriceModel:
             This reduces the width of the terminal price distribution and
             lowers tail probabilities.
 
-            Typical values:
-            - 1.0: NO cells (vol fade benefits from wider tails)
-            - 0.75-0.85: YES/daily cells (corrects overconfidence)
-            - 0.80-0.90: YES/15min cells (moderate correction)
-
         Returns
         -------
         ProbabilityEstimate
@@ -684,14 +687,28 @@ class PriceModel:
         arr = np.array(returns, dtype=np.float64)
         rng = self._rng
 
-        # Draw (bootstrap_paths x horizon_steps) random returns
-        indices = rng.integers(0, len(arr), size=(bootstrap_paths, horizon_steps))
-        sampled = arr[indices]  # shape: (bootstrap_paths, horizon_steps)
+        # Horizon-aware scaling: when horizon exceeds available data,
+        # cap steps and widen returns so terminal variance scales correctly.
+        # Var(sum of N iid returns) = N * var(r).
+        # We want Var = horizon_steps * var(r), but only have
+        # effective_steps draws.  Scale each return by
+        # sqrt(horizon_steps / effective_steps) to compensate.
+        effective_steps = min(horizon_steps, len(arr))
+        if effective_steps < horizon_steps:
+            vol_scale = math.sqrt(horizon_steps / effective_steps)
+        else:
+            vol_scale = 1.0
+
+        # Draw (bootstrap_paths x effective_steps) random returns
+        indices = rng.integers(0, len(arr), size=(bootstrap_paths, effective_steps))
+        sampled = arr[indices]  # shape: (bootstrap_paths, effective_steps)
+
+        # Apply horizon vol scaling (widens distribution for long horizons)
+        if vol_scale != 1.0:
+            sampled = sampled * vol_scale
 
         # Apply vol dampening: shrink each return toward zero to model
-        # mean-reversion that the IID bootstrap ignores.  When vol_dampening
-        # < 1.0, the terminal distribution narrows, reducing the probability
-        # of reaching far-OTM strikes.
+        # mean-reversion that the IID bootstrap ignores.
         if vol_dampening != 1.0:
             sampled = sampled * vol_dampening
 

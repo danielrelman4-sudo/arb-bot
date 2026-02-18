@@ -69,6 +69,9 @@ class CellConfig:
     kelly_multiplier: float         # Multiplied into Kelly fraction
     max_position: float             # Dollar cap per trade
 
+    # Probability model override (empty string = use global setting)
+    probability_model: str = ""     # "mc_gbm" | "student_t" | "empirical" | "" (global)
+
 
 def classify_cell(side: str, is_daily: bool) -> StrategyCell:
     """Classify a model-path edge into one of 4 strategy cells.
@@ -104,6 +107,7 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
             require_price_past_strike=settings.cell_yes_15min_require_price_past_strike,
             kelly_multiplier=settings.cell_yes_15min_kelly_multiplier,
             max_position=settings.cell_yes_15min_max_position,
+            probability_model=getattr(settings, "cell_yes_15min_probability_model", ""),
         )
     elif cell is StrategyCell.YES_DAILY:
         return CellConfig(
@@ -120,6 +124,7 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
             require_price_past_strike=False,
             kelly_multiplier=settings.cell_yes_daily_kelly_multiplier,
             max_position=settings.cell_yes_daily_max_position,
+            probability_model=getattr(settings, "cell_yes_daily_probability_model", ""),
         )
     elif cell is StrategyCell.NO_15MIN:
         return CellConfig(
@@ -136,6 +141,7 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
             require_price_past_strike=False,
             kelly_multiplier=settings.cell_no_15min_kelly_multiplier,
             max_position=settings.cell_no_15min_max_position,
+            probability_model=getattr(settings, "cell_no_15min_probability_model", ""),
         )
     else:  # NO_DAILY
         return CellConfig(
@@ -152,4 +158,5 @@ def get_cell_config(cell: StrategyCell, settings: "CryptoSettings") -> CellConfi
             require_price_past_strike=False,
             kelly_multiplier=settings.cell_no_daily_kelly_multiplier,
             max_position=settings.cell_no_daily_max_position,
+            probability_model=getattr(settings, "cell_no_daily_probability_model", ""),
         )

@@ -98,6 +98,11 @@ class FeatureVector:
     outcome: int = -1                     # -1=unsettled, 0=loss, 1=win
 
 
+# Regime string → numeric encoding (XGBoost needs numeric features)
+_REGIME_ENCODE = {
+    "mean_reverting": 0, "trending_up": 1, "trending_down": 2, "high_vol": 3,
+}
+
 # Feature columns used for training (excludes identifiers and label)
 FEATURE_COLUMNS = [
     "strike_distance_pct", "time_to_expiry_minutes", "implied_probability",
@@ -251,10 +256,14 @@ class FeatureStore:
 
         for i, row in enumerate(settled):
             for j, col in enumerate(FEATURE_COLUMNS):
-                try:
-                    X[i, j] = float(row.get(col, 0.0))
-                except (ValueError, TypeError):
-                    X[i, j] = 0.0
+                val = row.get(col, 0.0)
+                if col == "regime":
+                    X[i, j] = float(_REGIME_ENCODE.get(str(val), 0))
+                else:
+                    try:
+                        X[i, j] = float(val)
+                    except (ValueError, TypeError):
+                        X[i, j] = 0.0
             y[i] = float(row["outcome"])
 
         return X, y
@@ -297,3 +306,100 @@ class FeatureStore:
             writer = csv.DictWriter(f, fieldnames=ALL_COLUMNS)
             writer.writeheader()
             writer.writerows(rows)
+
+
+# ── Multi-file utilities (for offline training) ─────────────────────────
+
+
+def load_training_data_from_files(
+    paths: List[str],
+    strategy_filter: str = "model",
+) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
+    """Load and merge training data from multiple feature store CSVs.
+
+    Parameters
+    ----------
+    paths: List of CSV file paths to load.
+    strategy_filter: "model" or "momentum". Rows with matching strategy field
+        are included. Rows with empty strategy but a non-empty strategy_cell
+        are treated as "model" (legacy rows from before the field was added).
+
+    Returns
+    -------
+    X : Feature matrix (n_samples, n_features + 2) — FEATURE_COLUMNS + side_numeric + is_daily
+    y : Binary labels (n_samples,)
+    metadata : List of dicts with ticker, side, strategy_cell, entry_price per row
+    """
+    all_rows: List[dict] = []
+
+    for path in paths:
+        try:
+            with open(path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    all_rows.append(row)
+        except (FileNotFoundError, OSError):
+            LOGGER.warning("load_training_data_from_files: skipping %s", path)
+            continue
+
+    # Filter to settled rows matching strategy
+    settled: List[dict] = []
+    for row in all_rows:
+        outcome = str(row.get("outcome", "-1"))
+        if outcome not in ("0", "1"):
+            continue
+        strategy = row.get("strategy", "")
+        cell = row.get("strategy_cell", "")
+        # Match strategy filter
+        if strategy == strategy_filter:
+            settled.append(row)
+        elif not strategy and cell and strategy_filter == "model":
+            # Legacy rows: no strategy field but have cell → model-path
+            settled.append(row)
+
+    if not settled:
+        n_extra = 2  # side_numeric, is_daily
+        return (
+            np.empty((0, len(FEATURE_COLUMNS) + n_extra)),
+            np.empty(0),
+            [],
+        )
+
+    n_extra = 2  # side_numeric, is_daily
+    n_features = len(FEATURE_COLUMNS) + n_extra
+    X = np.zeros((len(settled), n_features))
+    y = np.zeros(len(settled))
+    metadata: List[dict] = []
+
+    for i, row in enumerate(settled):
+        # Encode standard FEATURE_COLUMNS
+        for j, col in enumerate(FEATURE_COLUMNS):
+            val = row.get(col, 0.0)
+            if col == "regime":
+                X[i, j] = float(_REGIME_ENCODE.get(str(val), 0))
+            else:
+                try:
+                    X[i, j] = float(val)
+                except (ValueError, TypeError):
+                    X[i, j] = 0.0
+
+        # Extra derived features
+        base = len(FEATURE_COLUMNS)
+        X[i, base + 0] = 1.0 if row.get("side", "") == "yes" else 0.0  # side_numeric
+        cell = row.get("strategy_cell", "")
+        X[i, base + 1] = 1.0 if "daily" in cell else 0.0  # is_daily
+
+        y[i] = float(row["outcome"])
+        metadata.append({
+            "ticker": row.get("ticker", ""),
+            "side": row.get("side", ""),
+            "strategy_cell": cell,
+            "entry_price": row.get("entry_price", ""),
+        })
+
+    return X, y, metadata
+
+
+def get_extended_feature_names() -> List[str]:
+    """Return feature names including the extra derived columns."""
+    return FEATURE_COLUMNS + ["side_numeric", "is_daily"]
