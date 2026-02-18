@@ -281,6 +281,13 @@ class CryptoEngine:
         self._running = False
         self._bankroll: float = settings.bankroll
 
+        # Online recalibration: buffer of (predicted_prob, outcome_binary) per cell
+        self._recal_buffer: Dict[str, List[tuple]] = {}  # cell → [(pred, outcome), ...]
+        self._recal_curve: Dict[str, Any] = {}  # cell → fitted IsotonicRegression or None
+        self._recal_trade_count: int = 0  # total settlements seen since last refit
+        self._recal_window: int = settings.recalibration_window  # max buffer size
+        self._recal_refit_interval: int = settings.recalibration_refit_interval  # refit every N
+
         # Cycle logger (optional, for offline calibration)
         self._cycle_logger: Optional[CycleLogger] = None
 
@@ -1393,6 +1400,10 @@ class CryptoEngine:
                 if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
                     continue
 
+            # Quiet hours gate
+            if self._quiet_hours_gate(edge):
+                continue
+
             # Classifier veto gate
             vetoed, p_win, fv = self._classifier_veto(edge)
             if vetoed:
@@ -1865,6 +1876,10 @@ class CryptoEngine:
             if cell is not None and cell_cfg is not None:
                 if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
                     continue
+
+            # Quiet hours gate
+            if self._quiet_hours_gate(edge):
+                continue
 
             # Classifier veto gate
             vetoed, p_win, fv = self._classifier_veto(edge)
@@ -3070,6 +3085,161 @@ class CryptoEngine:
 
         return True
 
+    # ── Online recalibration ─────────────────────────────────────
+
+    def _recal_record(self, predicted_prob: float, outcome_binary: float, cell: str) -> None:
+        """Record a (predicted, outcome) pair for online recalibration."""
+        if not self._settings.recalibration_enabled:
+            return
+
+        if cell not in self._recal_buffer:
+            self._recal_buffer[cell] = []
+
+        self._recal_buffer[cell].append((predicted_prob, outcome_binary))
+
+        # Trim to window size
+        if len(self._recal_buffer[cell]) > self._recal_window:
+            self._recal_buffer[cell] = self._recal_buffer[cell][-self._recal_window:]
+
+        self._recal_trade_count += 1
+
+        # Refit periodically
+        if self._recal_trade_count % self._recal_refit_interval == 0:
+            self._recal_refit(cell)
+
+    def _recal_refit(self, cell: str) -> None:
+        """Refit isotonic regression for a cell's recalibration curve."""
+        buf = self._recal_buffer.get(cell, [])
+        if len(buf) < self._settings.recalibration_min_samples:
+            return
+
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except ImportError:
+            # sklearn not available — use simple piecewise linear fallback
+            self._recal_refit_simple(cell)
+            return
+
+        preds = [p for p, _ in buf]
+        outcomes = [o for _, o in buf]
+
+        ir = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
+        ir.fit(preds, outcomes)
+        self._recal_curve[cell] = ir
+
+        LOGGER.info(
+            "CryptoEngine: recalibration refit for %s (%d samples)",
+            cell, len(buf),
+        )
+
+    def _recal_refit_simple(self, cell: str) -> None:
+        """Simple fallback recalibration without sklearn.
+
+        Bins predictions into 5 buckets and computes realized rate per bucket.
+        Stores as a dict: {bucket_midpoint: realized_rate}.
+        """
+        buf = self._recal_buffer.get(cell, [])
+        if len(buf) < self._settings.recalibration_min_samples:
+            return
+
+        # Bin into 5 buckets: [0-0.2, 0.2-0.4, 0.4-0.6, 0.6-0.8, 0.8-1.0]
+        bins = {0.1: [0, 0], 0.3: [0, 0], 0.5: [0, 0], 0.7: [0, 0], 0.9: [0, 0]}
+        for pred, outcome in buf:
+            if pred < 0.2:
+                mid = 0.1
+            elif pred < 0.4:
+                mid = 0.3
+            elif pred < 0.6:
+                mid = 0.5
+            elif pred < 0.8:
+                mid = 0.7
+            else:
+                mid = 0.9
+            bins[mid][0] += 1  # count
+            bins[mid][1] += outcome  # sum of outcomes
+
+        # Build lookup: midpoint → realized rate
+        lookup = {}
+        for mid, (count, wins) in bins.items():
+            if count >= 3:
+                lookup[mid] = wins / count
+
+        if lookup:
+            self._recal_curve[cell] = lookup
+            LOGGER.info(
+                "CryptoEngine: recalibration refit (simple) for %s (%d samples, %d bins)",
+                cell, len(buf), len(lookup),
+            )
+
+    def _recal_apply(self, raw_prob: float, cell: str) -> float:
+        """Apply recalibration curve to a raw probability estimate.
+
+        Returns the recalibrated probability, or raw_prob if no curve is fitted.
+        """
+        if not self._settings.recalibration_enabled:
+            return raw_prob
+
+        curve = self._recal_curve.get(cell)
+        if curve is None:
+            return raw_prob
+
+        # sklearn IsotonicRegression
+        if hasattr(curve, 'predict'):
+            try:
+                result = float(curve.predict([raw_prob])[0])
+                return max(0.01, min(0.99, result))
+            except Exception:
+                return raw_prob
+
+        # Simple dict lookup fallback
+        if isinstance(curve, dict):
+            # Find nearest bin midpoint
+            if raw_prob < 0.2:
+                mid = 0.1
+            elif raw_prob < 0.4:
+                mid = 0.3
+            elif raw_prob < 0.6:
+                mid = 0.5
+            elif raw_prob < 0.8:
+                mid = 0.7
+            else:
+                mid = 0.9
+
+            if mid in curve:
+                return curve[mid]
+
+        return raw_prob
+
+    # ── Time-of-day gate ────────────────────────────────────────
+
+    def _quiet_hours_gate(self, edge: CryptoEdge) -> bool:
+        """Return True if the trade should be blocked by quiet hours gate.
+
+        During quiet hours, only allow trades with edge >= quiet_hours_min_edge.
+        """
+        if not self._settings.quiet_hours_utc:
+            return False  # No quiet hours configured
+
+        import datetime
+        utc_hour = datetime.datetime.utcnow().hour
+        try:
+            quiet_hours = {int(h.strip()) for h in self._settings.quiet_hours_utc.split(",") if h.strip()}
+        except ValueError:
+            return False
+
+        if utc_hour not in quiet_hours:
+            return False  # Not in quiet hours
+
+        # During quiet hours, require higher edge
+        if abs(edge.edge) < self._settings.quiet_hours_min_edge:
+            LOGGER.info(
+                "CryptoEngine: quiet hours gate blocked %s — edge %.1f%% < min %.1f%% (UTC hour %d)",
+                edge.market.id, edge.edge * 100, self._settings.quiet_hours_min_edge * 100, utc_hour,
+            )
+            return True
+
+        return False
+
     # ── Sizing ────────────────────────────────────────────────────
 
     def _compute_position_size(self, edge: CryptoEdge, cell_cfg: "CellConfig | None" = None) -> int:
@@ -3086,8 +3256,33 @@ class CryptoEngine:
         if cost <= 0 or cost >= 1.0:
             return 0
 
-        # 1. Raw Kelly fraction
-        kelly_f = edge.edge_cents / cost
+        # 0. Online recalibration: adjust edge for sizing based on realized
+        #    calibration. If the model is overconfident, this shrinks the edge.
+        edge_for_sizing = edge.edge_cents
+        cell_name = edge.strategy_cell or ""
+        if cell_name and self._settings.recalibration_enabled:
+            recal_prob = self._recal_apply(edge.blended_probability, cell_name)
+            if recal_prob != edge.blended_probability:
+                # Recompute edge: recalibrated model prob vs market
+                if edge.side == "yes":
+                    recal_edge = recal_prob - edge.market_implied_prob
+                else:
+                    recal_edge = (1.0 - recal_prob) - edge.market_implied_prob
+                edge_for_sizing = max(0.0, recal_edge)
+                if edge_for_sizing < edge.edge_cents:
+                    LOGGER.debug(
+                        "CryptoEngine: recal sizing adjustment %s: edge %.1f%%→%.1f%% (prob %.1f%%→%.1f%%)",
+                        edge.market.id if hasattr(edge.market, 'id') else '',
+                        edge.edge_cents * 100, edge_for_sizing * 100,
+                        edge.blended_probability * 100, recal_prob * 100,
+                    )
+
+        # 1. Raw Kelly fraction (with optional edge cap for sizing)
+        if self._settings.kelly_edge_cap > 0:
+            # Cap effective edge used for sizing — model can detect large edges
+            # but sizing treats them as at most edge_cap (e.g., 10¢ = 10%)
+            edge_for_sizing = min(edge_for_sizing, self._settings.kelly_edge_cap)
+        kelly_f = edge_for_sizing / cost
 
         # 2. Compute effective Kelly cap (may be boosted for mean_reverting)
         effective_kelly_cap = self._settings.kelly_fraction_cap
@@ -3727,6 +3922,18 @@ class CryptoEngine:
                     pos.entry_price * 100, pnl,
                     "YES" if settled_yes else "NO",
                 )
+
+                # ── Online recalibration: feed settlement outcome ──
+                _recal_cell = getattr(pos, 'strategy_cell', '')
+                if _recal_cell:
+                    # For YES side: outcome_binary = 1 if settled_yes else 0
+                    # For NO side: outcome_binary = 0 if settled_yes else 1
+                    if pos.side == "yes":
+                        _recal_outcome = 1.0 if settled_yes else 0.0
+                    else:
+                        _recal_outcome = 0.0 if settled_yes else 1.0
+                    self._recal_record(pos.model_prob, _recal_outcome, _recal_cell)
+
                 # ── Cycle recorder: settlement hook (real) ──
                 if self._cycle_recorder is not None:
                     self._cycle_recorder.record_settlement(

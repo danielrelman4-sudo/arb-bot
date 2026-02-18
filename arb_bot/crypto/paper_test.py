@@ -424,6 +424,7 @@ async def run_paper_test(
         max_concurrent_positions=20,  # Relaxed from 10 — allow more simultaneous trades for data
         max_positions_per_underlying=5,  # Relaxed from 3 — allow more trades per underlying
         kelly_fraction_cap=0.06,
+        kelly_edge_cap=0.10,                  # v41: Cap edge at 10% for Kelly sizing (prevents overconfident large positions)
         scan_interval_seconds=scan_interval,
         paper_slippage_cents=0.5,
         confidence_level=0.95,
@@ -432,6 +433,14 @@ async def run_paper_test(
         max_minutes_to_expiry=max_tte,
         min_book_depth_contracts=1,
         allowed_directions=["above", "below", "up", "down"],
+        # ── v41: Time-of-day gate ─────────────────────────────────────
+        quiet_hours_utc="0,1,2",              # UTC 00-02 (local 16-18): 29% WR in v40, require higher edge
+        quiet_hours_min_edge=0.08,            # 8% min edge during quiet hours (vs 4% normal)
+        # ── v41: Online recalibration ─────────────────────────────────
+        recalibration_enabled=True,
+        recalibration_window=50,              # Rolling buffer of last 50 trades per cell
+        recalibration_refit_interval=10,      # Refit isotonic curve every 10 settlements
+        recalibration_min_samples=15,         # Need 15 samples before applying recal curve
         # Fix 1: Trend drift
         trend_drift_enabled=True,
         trend_drift_window_minutes=15,
@@ -619,7 +628,7 @@ async def run_paper_test(
         cell_yes_daily_max_position=25.0,
         # NO/15min — mc_gbm: Gaussian tails underestimate extremes → edge for "won't reach X"
         cell_no_15min_probability_model="mc_gbm",
-        cell_no_15min_min_edge_pct=min_edge,         # 4% — model reliable here
+        cell_no_15min_min_edge_pct=100.0,             # DISABLED — 25% WR in v40, no edge
         cell_no_15min_model_weight=0.65,             # Trust model for short horizon
         cell_no_15min_uncertainty_mult=1.5,
         cell_no_15min_kelly_multiplier=0.6,
@@ -685,6 +694,13 @@ async def run_paper_test(
     else:
         rec_db_path = None
         print(f"  Recorder:       OFF")
+    # v41 improvements
+    print(f"  Kelly edge cap: {'%.0f%%' % (settings.kelly_edge_cap * 100) if settings.kelly_edge_cap > 0 else 'OFF'}")
+    print(f"  Quiet hours:    {settings.quiet_hours_utc if settings.quiet_hours_utc else 'OFF'}"
+          f"{' (min_edge=' + str(settings.quiet_hours_min_edge) + ')' if settings.quiet_hours_utc else ''}")
+    print(f"  Recalibration:  {'ON' if settings.recalibration_enabled else 'OFF'}"
+          f" (window={settings.recalibration_window}, refit_every={settings.recalibration_refit_interval},"
+          f" min_samples={settings.recalibration_min_samples})")
     print(f"  Momentum:       {'ON' if settings.momentum_enabled else 'OFF'}"
           f"  VPIN zone: {settings.momentum_vpin_floor:.2f}–{settings.momentum_vpin_ceiling:.2f}"
           f"  OFI align>{settings.momentum_ofi_alignment_min:.1f} mag>{settings.momentum_ofi_magnitude_min:.0f}")

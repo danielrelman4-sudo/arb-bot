@@ -141,6 +141,17 @@ class CryptoSettings:
     max_concurrent_positions: int = 10
     max_positions_per_underlying: int = 3
     kelly_fraction_cap: float = 0.10
+    kelly_edge_cap: float = 0.0  # 0 = disabled; e.g., 0.10 caps edge at 10¢ for sizing
+
+    # ── Time-of-day gate ──────────────────────────────────────────
+    quiet_hours_utc: str = ""              # Comma-separated UTC hours, e.g., "0,1,2"
+    quiet_hours_min_edge: float = 0.08     # Min edge required during quiet hours
+
+    # ── Online recalibration ──────────────────────────────────────
+    recalibration_enabled: bool = False
+    recalibration_window: int = 50         # Max trades in recal buffer per cell
+    recalibration_refit_interval: int = 10 # Refit isotonic curve every N settlements
+    recalibration_min_samples: int = 15    # Min samples before applying recal curve
 
     # ── Execution ──────────────────────────────────────────────────
     use_maker: bool = True
@@ -492,6 +503,13 @@ def load_crypto_settings() -> CryptoSettings:
         max_concurrent_positions=_as_int(os.getenv("ARB_CRYPTO_MAX_CONCURRENT_POSITIONS"), 10),
         max_positions_per_underlying=_as_int(os.getenv("ARB_CRYPTO_MAX_POSITIONS_PER_UNDERLYING"), 3),
         kelly_fraction_cap=_as_float(os.getenv("ARB_CRYPTO_KELLY_FRACTION_CAP"), 0.10),
+        kelly_edge_cap=_as_float(os.getenv("ARB_CRYPTO_KELLY_EDGE_CAP"), 0.0),
+        quiet_hours_utc=os.getenv("ARB_CRYPTO_QUIET_HOURS_UTC", ""),
+        quiet_hours_min_edge=_as_float(os.getenv("ARB_CRYPTO_QUIET_HOURS_MIN_EDGE"), 0.08),
+        recalibration_enabled=_as_bool(os.getenv("ARB_CRYPTO_RECALIBRATION_ENABLED"), False),
+        recalibration_window=_as_int(os.getenv("ARB_CRYPTO_RECALIBRATION_WINDOW"), 50),
+        recalibration_refit_interval=_as_int(os.getenv("ARB_CRYPTO_RECALIBRATION_REFIT_INTERVAL"), 10),
+        recalibration_min_samples=_as_int(os.getenv("ARB_CRYPTO_RECALIBRATION_MIN_SAMPLES"), 15),
         use_maker=_as_bool(os.getenv("ARB_CRYPTO_USE_MAKER"), True),
         maker_timeout_seconds=_as_float(os.getenv("ARB_CRYPTO_MAKER_TIMEOUT_SECONDS"), 5.0),
         taker_fallback=_as_bool(os.getenv("ARB_CRYPTO_TAKER_FALLBACK"), True),
