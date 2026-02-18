@@ -618,7 +618,7 @@ async def run_paper_test(
         cell_yes_15min_max_position=25.0,
         # YES/daily — empirical with horizon-aware vol scaling
         cell_yes_daily_probability_model="empirical",
-        cell_yes_daily_min_edge_pct=8.0,             # Higher bar — model extrapolating
+        cell_yes_daily_min_edge_pct=0.08,            # 8% — higher bar for daily (model extrapolating)
         cell_yes_daily_vol_dampening=1.0,
         cell_yes_daily_prob_haircut=1.0,
         cell_yes_daily_require_trend=False,
@@ -628,14 +628,14 @@ async def run_paper_test(
         cell_yes_daily_max_position=25.0,
         # NO/15min — mc_gbm: Gaussian tails underestimate extremes → edge for "won't reach X"
         cell_no_15min_probability_model="mc_gbm",
-        cell_no_15min_min_edge_pct=100.0,             # DISABLED — 25% WR in v40, no edge
+        cell_no_15min_min_edge_pct=1.0,              # DISABLED — 25% WR in v40, no edge (100% edge = impossible)
         cell_no_15min_model_weight=0.65,             # Trust model for short horizon
         cell_no_15min_uncertainty_mult=1.5,
         cell_no_15min_kelly_multiplier=0.6,
         cell_no_15min_max_position=25.0,
         # NO/daily — mc_gbm: thin tails = proven alpha for "price won't move that far"
         cell_no_daily_probability_model="mc_gbm",
-        cell_no_daily_min_edge_pct=8.0,              # Higher bar — model extrapolating
+        cell_no_daily_min_edge_pct=0.08,             # 8% — higher bar for daily (model extrapolating)
         cell_no_daily_model_weight=0.45,             # Defer to market for long horizon
         cell_no_daily_uncertainty_mult=1.5,
         cell_no_daily_kelly_multiplier=0.6,
