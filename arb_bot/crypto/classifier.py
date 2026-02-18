@@ -225,6 +225,20 @@ class BinaryClassifier:
         if features.ndim == 1:
             features = features.reshape(1, -1)
 
+        # Handle feature dimension mismatch: model trained with N features
+        # but current code may produce M features (M > N after adding new
+        # columns, or M < N if columns were removed).
+        # XGBoost stores the expected feature count in model.n_features_in_.
+        expected_n = getattr(self._model, "n_features_in_", features.shape[1])
+        if features.shape[1] != expected_n:
+            if features.shape[1] > expected_n:
+                # Truncate: only pass the first N features the model knows
+                features = features[:, :expected_n]
+            else:
+                # Pad with zeros
+                pad = np.zeros((features.shape[0], expected_n - features.shape[1]))
+                features = np.hstack([features, pad])
+
         raw_prob = float(self._model.predict_proba(features)[:, 1][0])
 
         # Apply isotonic calibration if available
