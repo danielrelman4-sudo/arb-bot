@@ -34,6 +34,8 @@ class CryptoEdge:
     no_buy_price: float
     blended_probability: float = 0.0  # After market blending
     spread_cost: float = 0.0  # Half-spread in dollar terms
+    staleness_score: float = 0.0  # Set by engine: 0=fresh, 1=stale
+    strategy_cell: str = ""  # Set by engine: "yes_15min", "yes_daily", "no_15min", "no_daily"
 
 
 def compute_implied_probability(yes_price: float, no_price: float) -> float:
@@ -92,6 +94,16 @@ class EdgeDetector:
         Max Wilson CI half-width to trade.
     use_blending:
         Whether to blend model probability with market implied probability.
+    min_edge_pct_no_side:
+        Higher minimum edge for edges where directional signal is weak.
+    min_model_market_divergence:
+        Minimum absolute divergence between model probability and
+        market implied probability before considering the edge.
+    dynamic_edge_enabled:
+        When True, raise the effective min-edge threshold by
+        ``dynamic_edge_k * model_uncertainty``.
+    dynamic_edge_k:
+        Multiplier for dynamic edge threshold.
     """
 
     def __init__(
@@ -101,12 +113,22 @@ class EdgeDetector:
         min_edge_cents: float = 0.02,
         max_model_uncertainty: float = 0.15,
         use_blending: bool = True,
+        min_edge_pct_no_side: float = 0.12,
+        min_model_market_divergence: float = 0.12,
+        dynamic_edge_enabled: bool = False,
+        dynamic_edge_k: float = 2.0,
+        market_disagreement_max: float = 1.0,
     ) -> None:
         self._min_edge_pct = min_edge_pct
         self._min_edge_pct_daily = min_edge_pct_daily
         self._min_edge_cents = min_edge_cents
         self._max_uncertainty = max_model_uncertainty
         self._use_blending = use_blending
+        self._min_edge_pct_no_side = min_edge_pct_no_side
+        self._min_model_market_divergence = min_model_market_divergence
+        self._dynamic_edge_enabled = dynamic_edge_enabled
+        self._dynamic_edge_k = dynamic_edge_k
+        self._market_disagreement_max = market_disagreement_max
 
     def detect_edges(
         self,
@@ -176,15 +198,64 @@ class EdgeDetector:
             )
             min_edge = self._min_edge_pct_daily if is_daily else self._min_edge_pct
             if effective_edge < min_edge:
+                LOGGER.info(
+                    "Edge on %s rejected: effective_edge %.1f%% < min_edge %.1f%% "
+                    "(side=%s, blended=%.1f%%, mkt=%.1f%%, model=%.1f%%)",
+                    ticker, effective_edge * 100, min_edge * 100,
+                    side, blended * 100, market_prob * 100,
+                    model.probability * 100,
+                )
                 continue
             if edge_cents < self._min_edge_cents:
                 continue
             if model.uncertainty > self._max_uncertainty:
-                LOGGER.debug(
-                    "Edge on %s rejected: uncertainty %.3f > %.3f",
+                LOGGER.info(
+                    "Edge on %s rejected: uncertainty %.3f > max %.3f "
+                    "(edge=%.1f%%, side=%s)",
                     ticker, model.uncertainty, self._max_uncertainty,
+                    effective_edge * 100, side,
                 )
                 continue
+
+            # Model-market divergence gate
+            if abs(raw_edge) < self._min_model_market_divergence:
+                LOGGER.info(
+                    "Edge on %s rejected: divergence %.1f%% < min %.1f%% "
+                    "(edge=%.1f%%, side=%s, blended=%.1f%%, mkt=%.1f%%)",
+                    ticker, abs(raw_edge) * 100,
+                    self._min_model_market_divergence * 100,
+                    effective_edge * 100, side,
+                    blended * 100, market_prob * 100,
+                )
+                continue
+
+            # Dynamic edge threshold: raise floor by k * uncertainty
+            if self._dynamic_edge_enabled:
+                dynamic_floor = min_edge + self._dynamic_edge_k * model.uncertainty
+                if effective_edge < dynamic_floor:
+                    LOGGER.info(
+                        "Edge on %s rejected: edge %.1f%% < dynamic floor %.1f%% "
+                        "(base=%.1f%% + k=%.1f × unc=%.3f, side=%s)",
+                        ticker, effective_edge * 100, dynamic_floor * 100,
+                        min_edge * 100, self._dynamic_edge_k,
+                        model.uncertainty, side,
+                    )
+                    continue
+
+            # Market disagreement veto (v43 Fix B)
+            # Skip trades where model and market strongly disagree —
+            # the worst v42b losses were all where model said 70%+ but market said <30%.
+            if self._market_disagreement_max < 1.0:
+                disagreement = abs(model.probability - market_prob)
+                if disagreement > self._market_disagreement_max:
+                    LOGGER.info(
+                        "Edge on %s rejected: market disagreement %.1f%% > max %.1f%% "
+                        "(model=%.1f%%, market=%.1f%%, side=%s)",
+                        ticker, disagreement * 100,
+                        self._market_disagreement_max * 100,
+                        model.probability * 100, market_prob * 100, side,
+                    )
+                    continue
 
             # Compute spread cost (half-spread for the traded side)
             if side == "yes":

@@ -39,9 +39,11 @@ from arb_bot.crypto.price_model import PriceModel
 LOGGER = logging.getLogger(__name__)
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
-BINANCE_KLINES = "https://api.binance.us/api/v3/klines"
-BINANCE_PRICE = "https://api.binance.us/api/v3/ticker/price"
-BINANCE_AGG_TRADES = "https://api.binance.us/api/v3/aggTrades"
+
+# OKX REST API endpoints (primary data source — no geo-blocking, high volume)
+OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
+OKX_TICKER_URL = "https://www.okx.com/api/v5/market/ticker"
+OKX_TRADES_URL = "https://www.okx.com/api/v5/market/trades"
 
 # Map underlying to Kalshi series tickers
 _SERIES_MAP = {
@@ -50,83 +52,103 @@ _SERIES_MAP = {
     "SOL": ["KXSOL15M", "KXSOLD"],
 }
 
+# Binance-style symbols used internally as keys (engine, price feed, etc.)
 _BINANCE_MAP = {
     "BTC": "BTCUSDT",
     "ETH": "ETHUSDT",
     "SOL": "SOLUSDT",
 }
 
-OKX_TRADES_URL = "https://www.okx.com/api/v5/market/trades"
+# OKX instrument IDs
 _OKX_MAP = {"BTC": "BTC-USDT", "ETH": "ETH-USDT", "SOL": "SOL-USDT"}
 
+# Reverse: Binance symbol -> OKX instrument ID
+_BINANCE_TO_OKX = {v: _OKX_MAP[k] for k, v in _BINANCE_MAP.items()}
 
-# ── Binance REST price feed ────────────────────────────────────────
 
-async def fetch_binance_prices(
+# ── OKX REST price feed ────────────────────────────────────────────
+
+async def fetch_okx_prices(
     symbols: list[str],
     client: httpx.AsyncClient,
 ) -> dict[str, float]:
-    """Fetch current prices from Binance US REST API."""
+    """Fetch current prices from OKX REST API.
+
+    *symbols* are Binance-style uppercase symbols (e.g. "BTCUSDT").
+    Returns a dict mapping lowercase symbols to prices.
+    """
     prices: dict[str, float] = {}
     for sym in symbols:
+        okx_inst = _BINANCE_TO_OKX.get(sym)
+        if not okx_inst:
+            continue
         try:
             resp = await client.get(
-                BINANCE_PRICE,
-                params={"symbol": sym},
+                OKX_TICKER_URL,
+                params={"instId": okx_inst},
                 timeout=5.0,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                prices[sym.lower()] = float(data["price"])
+                body = resp.json()
+                data_list = body.get("data", [])
+                if data_list:
+                    prices[sym.lower()] = float(data_list[0]["last"])
         except Exception as exc:
-            LOGGER.debug("Binance price fetch %s failed: %s", sym, exc)
+            LOGGER.debug("OKX price fetch %s failed: %s", okx_inst, exc)
     return prices
 
 
-async def fetch_binance_klines(
+async def fetch_okx_klines(
     symbol: str,
     minutes: int,
     client: httpx.AsyncClient,
 ) -> list[tuple[float, float]]:
-    """Fetch 1-minute klines (timestamp, close) from Binance US."""
-    try:
-        resp = await client.get(
-            BINANCE_KLINES,
-            params={
-                "symbol": symbol,
-                "interval": "1m",
-                "limit": min(minutes, 1000),
-            },
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return [(float(k[0]) / 1000.0, float(k[4])) for k in data]
-    except Exception as exc:
-        LOGGER.warning("Binance klines %s failed: %s", symbol, exc)
-    return []
+    """Fetch 1-minute candles (timestamp, close) from OKX.
 
+    *symbol* is a Binance-style symbol (e.g. "BTCUSDT").
+    OKX returns max 100 candles per request, so we paginate if needed.
+    """
+    okx_inst = _BINANCE_TO_OKX.get(symbol)
+    if not okx_inst:
+        return []
 
-async def fetch_binance_agg_trades(
-    symbol: str,
-    limit: int,
-    client: httpx.AsyncClient,
-) -> list[dict]:
-    """Fetch recent aggregate trades from Binance US for OFI bootstrap."""
+    all_candles: list[tuple[float, float]] = []
+    after: str | None = None  # OKX uses "after" for pagination (older data)
+
     try:
-        resp = await client.get(
-            BINANCE_AGG_TRADES,
-            params={
-                "symbol": symbol,
-                "limit": min(limit, 1000),
-            },
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            return resp.json()
+        remaining = min(minutes, 300)  # Cap at 5 hours of 1m candles
+        while remaining > 0:
+            batch = min(remaining, 100)
+            params: dict[str, str] = {
+                "instId": okx_inst,
+                "bar": "1m",
+                "limit": str(batch),
+            }
+            if after:
+                params["after"] = after
+            resp = await client.get(OKX_CANDLES_URL, params=params, timeout=10.0)
+            if resp.status_code != 200:
+                break
+            body = resp.json()
+            data_list = body.get("data", [])
+            if not data_list:
+                break
+            for candle in data_list:
+                # OKX format: [ts_ms, open, high, low, close, vol, volCcy, ...]
+                ts = float(candle[0]) / 1000.0
+                close = float(candle[4])
+                all_candles.append((ts, close))
+            # OKX returns newest first; "after" = oldest timestamp for next page
+            after = data_list[-1][0]
+            remaining -= len(data_list)
+            if len(data_list) < batch:
+                break  # No more data
     except Exception as exc:
-        LOGGER.warning("Binance aggTrades %s failed: %s", symbol, exc)
-    return []
+        LOGGER.warning("OKX klines %s failed: %s", okx_inst, exc)
+
+    # OKX returns newest-first; reverse for chronological order
+    all_candles.reverse()
+    return all_candles
 
 
 async def fetch_okx_trades(
@@ -134,7 +156,7 @@ async def fetch_okx_trades(
     limit: int,
     client: httpx.AsyncClient,
 ) -> list[dict]:
-    """Fetch recent trades from OKX for OFI bootstrap (higher volume than Binance US)."""
+    """Fetch recent trades from OKX (high volume, no geo-blocking)."""
     try:
         resp = await client.get(
             OKX_TRADES_URL,
@@ -150,6 +172,11 @@ async def fetch_okx_trades(
     except Exception as exc:
         LOGGER.warning("OKX trades %s failed: %s", okx_symbol, exc)
     return []
+
+
+# Legacy aliases for backward compatibility
+fetch_binance_prices = fetch_okx_prices
+fetch_binance_klines = fetch_okx_klines
 
 
 # ── Kalshi market parsing ──────────────────────────────────────────
@@ -371,7 +398,8 @@ async def run_paper_test(
     min_edge: float,
     scan_interval: float,
     max_tte: int,
-    probability_model: str = "ab_test",
+    probability_model: str = "empirical",
+    daily_model: bool = False,
 ) -> None:
     """Run the crypto engine paper test."""
 
@@ -387,15 +415,17 @@ async def run_paper_test(
         price_feed_symbols=[s.lower() for s in binance_symbols],
         mc_num_paths=mc_paths,
         min_edge_pct=min_edge,
-        min_edge_pct_daily=0.15,
+        min_edge_pct_daily=min_edge,  # Same as min_edge; per-cell logic applies stricter thresholds
         min_edge_cents=min_edge,
-        max_model_uncertainty=0.20,
+        dynamic_edge_threshold_enabled=False,  # Per-cell logic applies real thresholds; this extra layer is redundant
+        max_model_uncertainty=0.30,  # Relaxed from 0.25 — allow more uncertain edges for data collection
         model_uncertainty_multiplier=3.0,
         bankroll=500.0,
         max_position_per_market=50.0,
-        max_concurrent_positions=10,
-        max_positions_per_underlying=3,
-        kelly_fraction_cap=0.10,
+        max_concurrent_positions=20,  # Relaxed from 10 — allow more simultaneous trades for data
+        max_positions_per_underlying=5,  # Relaxed from 3 — allow more trades per underlying
+        kelly_fraction_cap=0.06,
+        kelly_edge_cap=0.10,                  # v41: Cap edge at 10% for Kelly sizing (prevents overconfident large positions)
         scan_interval_seconds=scan_interval,
         paper_slippage_cents=0.5,
         confidence_level=0.95,
@@ -404,13 +434,21 @@ async def run_paper_test(
         max_minutes_to_expiry=max_tte,
         min_book_depth_contracts=1,
         allowed_directions=["above", "below", "up", "down"],
+        # ── v41: Time-of-day gate ─────────────────────────────────────
+        quiet_hours_utc="0,1,2",              # UTC 00-02 (local 16-18): 29% WR in v40, require higher edge
+        quiet_hours_min_edge=0.08,            # 8% min edge during quiet hours (vs 4% normal)
+        # ── v41: Online recalibration ─────────────────────────────────
+        recalibration_enabled=True,
+        recalibration_window=50,              # Rolling buffer of last 50 trades per cell
+        recalibration_refit_interval=10,      # Refit isotonic curve every 10 settlements
+        recalibration_min_samples=15,         # Need 15 samples before applying recal curve
         # Fix 1: Trend drift
         trend_drift_enabled=True,
         trend_drift_window_minutes=15,
         trend_drift_decay=5.0,
         trend_drift_max_annualized=5.0,
         # Fix 2: Raised thresholds (min_edge_pct/min_edge_cents from --min-edge arg)
-        # min_edge_pct_daily raised from 0.06 → 0.15
+        # min_edge_pct_daily lowered from 0.15 → 0.12 (per-cell logic applies stricter thresholds)
         # Fix 3: Isotonic calibration (upgraded from Platt)
         calibration_enabled=True,
         calibration_min_samples=20,
@@ -418,11 +456,11 @@ async def run_paper_test(
         calibration_method="isotonic",
         calibration_isotonic_min_samples=20,
         # Fix 4: NO-side threshold equalized with YES (was 0.20)
-        min_edge_pct_no_side=0.12,
+        min_edge_pct_no_side=min_edge,  # Relaxed to match --min-edge for max data collection
         # Fix 5: Model-market divergence filter
-        min_model_market_divergence=0.12,
-        # Fix 6: Book volume filter
-        min_book_volume=10,
+        min_model_market_divergence=0.02,  # Relaxed from 0.06 for max data collection
+        # Fix 6: Book volume filter (0 = no filter; daily strikes have low volume early)
+        min_book_volume=0,
         # OFI microstructure drift
         ofi_enabled=True,
         ofi_window_seconds=600,
@@ -491,8 +529,22 @@ async def run_paper_test(
         feature_store_enabled=True,
         feature_store_path=fs_path,
         feature_store_min_samples=200,
-        # C2: Classifier — disabled until we have enough training data
-        classifier_enabled=False,
+        # C2: Classifier — ENABLED with trained model
+        classifier_enabled=True,
+        classifier_model_path="arb_bot/output/classifier_model_model.json",  # Global fallback
+        classifier_veto_threshold=0.4,  # Default reject trades where P(win) < 40%
+        classifier_min_training_samples=50,  # Lower for small dataset
+        classifier_retrain_interval_hours=1.0,  # Retrain hourly as new data comes in
+        # Per-cell classifiers (trained via: python3 -m arb_bot.crypto.train_classifier --cell <cell>)
+        classifier_model_path_yes_15min="arb_bot/output/classifier_model_model_yes_15min.json",
+        classifier_model_path_yes_daily="arb_bot/output/classifier_model_model_yes_daily.json",
+        classifier_model_path_no_15min="arb_bot/output/classifier_model_model_no_15min.json",
+        classifier_model_path_no_daily="arb_bot/output/classifier_model_model_no_daily.json",
+        # Per-cell veto thresholds
+        classifier_veto_threshold_yes_15min=0.45,
+        classifier_veto_threshold_yes_daily=0.40,
+        classifier_veto_threshold_no_15min=0.40,
+        classifier_veto_threshold_no_daily=0.40,
         # ── v11: Student-t A/B test ────────────────────────────────
         probability_model=probability_model,
         # ── Empirical CDF model ──────────────────────────────────────
@@ -505,27 +557,27 @@ async def run_paper_test(
         # ── Regime-conditional improvements ──────────────────────────
         # Tier 1: Regime Kelly multiplier
         regime_sizing_enabled=True,
-        regime_kelly_mean_reverting=1.5,
+        regime_kelly_mean_reverting=0.7,   # v43 Fix C: was 1.5 — boosted sizing in overconfident regime (7/9 MR trades lost)
         regime_kelly_trending_up=0.4,
         regime_kelly_trending_down=0.5,
-        regime_kelly_high_vol=0.0,
-        # Tier 1: Regime min edge thresholds
-        regime_min_edge_enabled=True,
-        regime_min_edge_mean_reverting=0.10,
-        regime_min_edge_trending=0.20,
-        regime_min_edge_high_vol=0.30,
-        # Tier 1: VPIN halt gate
+        regime_kelly_high_vol=0.3,  # Was 0.0; zero blocks ALL trades in high-vol (common in crypto)
+        # Tier 1: Regime min edge thresholds — DISABLED: per-cell logic handles thresholds
+        regime_min_edge_enabled=False,
+        regime_min_edge_mean_reverting=0.12,
+        regime_min_edge_trending=0.12,
+        regime_min_edge_high_vol=0.12,
+        # Tier 1: VPIN halt gate — raised threshold for data collection
         vpin_halt_enabled=True,
-        vpin_halt_threshold=0.85,
-        # Tier 2: Counter-trend filter
-        regime_skip_counter_trend=True,
+        vpin_halt_threshold=0.95,  # Was 0.85; only halt on extreme VPIN for data collection
+        # Tier 2: Counter-trend filter — DISABLED for data collection
+        regime_skip_counter_trend=False,  # Let classifier learn which trends matter
         regime_skip_counter_trend_min_conf=0.6,
         # Tier 2: Vol regime adjustment
         regime_vol_boost_high_vol=1.5,
         regime_empirical_window_high_vol=30,
         regime_empirical_window_trending=60,
         # Tier 2: Mean-reverting size boost
-        regime_kelly_cap_boost_mean_reverting=1.5,
+        regime_kelly_cap_boost_mean_reverting=1.0,  # v43 Fix C: was 1.5 — no cap boost in mean-reverting
         # Tier 3: Conditional trend drift
         regime_conditional_drift=True,
         # Tier 3: Transition caution zone
@@ -533,6 +585,101 @@ async def run_paper_test(
         # ── Cycle recorder ──────────────────────────────────────────
         cycle_recorder_enabled=True,
         cycle_recorder_db_dir="arb_bot/output/recordings",
+        # ── v18: Micro-momentum lane ────────────────────────────────
+        momentum_enabled=True,
+        momentum_vpin_floor=0.85,
+        momentum_vpin_ceiling=0.95,
+        momentum_ofi_alignment_min=0.6,
+        momentum_ofi_magnitude_min=200.0,
+        momentum_max_tte_minutes=15.0,
+        momentum_price_floor=0.15,
+        momentum_price_ceiling=0.40,
+        momentum_kelly_fraction=0.03,
+        momentum_max_position=25.0,
+        momentum_max_concurrent=2,
+        momentum_cooldown_seconds=120.0,
+        # v19: OFI streak + acceleration filters
+        momentum_min_ofi_streak=3,
+        momentum_require_ofi_acceleration=True,
+        momentum_max_contracts=100,
+        # ── Strategy cell overrides (horizon-aware, classifier-gated) ────
+        # 15min cells: model has good short-term data, trust it more.
+        # Daily cells: model extrapolates beyond data window, defer to
+        # market + require higher edge.  Classifier veto gate on all.
+        # YES/15min — empirical bootstrap: captures actual return distribution
+        cell_yes_15min_probability_model="empirical",
+        cell_yes_15min_min_edge_pct=min_edge,        # 4% — model reliable here
+        cell_yes_15min_vol_dampening=1.0,
+        cell_yes_15min_prob_haircut=1.0,
+        cell_yes_15min_require_ofi=False,
+        cell_yes_15min_require_price_past_strike=False,
+        cell_yes_15min_model_weight=0.65,            # Trust model for short horizon
+        cell_yes_15min_uncertainty_mult=1.5,
+        cell_yes_15min_kelly_multiplier=0.6,
+        cell_yes_15min_max_position=25.0,
+        cell_yes_15min_empirical_window=15,   # v43 Fix D: was 30 — 30m lookback too long for 15m contracts
+        # YES/daily — empirical with horizon-aware vol scaling
+        cell_yes_daily_probability_model="empirical",
+        cell_yes_daily_min_edge_pct=0.08,            # 8% — higher bar for daily (model extrapolating)
+        cell_yes_daily_vol_dampening=1.0,
+        cell_yes_daily_prob_haircut=1.0,
+        cell_yes_daily_require_trend=False,
+        cell_yes_daily_model_weight=0.45,            # Defer to market for long horizon
+        cell_yes_daily_uncertainty_mult=1.5,
+        cell_yes_daily_kelly_multiplier=0.6,
+        cell_yes_daily_max_position=25.0,
+        # NO/15min — mc_gbm: Gaussian tails underestimate extremes → edge for "won't reach X"
+        cell_no_15min_probability_model="mc_gbm",
+        cell_no_15min_min_edge_pct=1.0,              # DISABLED — 25% WR in v40, no edge (100% edge = impossible)
+        cell_no_15min_model_weight=0.65,             # Trust model for short horizon
+        cell_no_15min_uncertainty_mult=1.5,
+        cell_no_15min_kelly_multiplier=0.6,
+        cell_no_15min_max_position=25.0,
+        cell_no_15min_empirical_window=15,    # v43 Fix D: was 30 — match YES/15min lookback
+        # NO/daily — mc_gbm: thin tails = proven alpha for "price won't move that far"
+        cell_no_daily_probability_model="mc_gbm",
+        cell_no_daily_min_edge_pct=0.08,             # 8% — higher bar for daily (model extrapolating)
+        cell_no_daily_model_weight=0.45,             # Defer to market for long horizon
+        cell_no_daily_uncertainty_mult=1.5,
+        cell_no_daily_kelly_multiplier=0.6,
+        cell_no_daily_max_position=25.0,
+        # ── v42: Ensemble probability ──────────────────────────────
+        ensemble_enabled=True,
+        ensemble_weight_empirical_yes=0.60,
+        ensemble_weight_student_t_yes=0.25,
+        ensemble_weight_mc_gbm_yes=0.15,
+        ensemble_weight_empirical_no=0.20,
+        ensemble_weight_student_t_no=0.30,
+        ensemble_weight_mc_gbm_no=0.50,
+        # ── v42: IV cross-check (start collecting data, dampen OFF for now) ──
+        iv_crosscheck_enabled=False,  # Start disabled — collecting iv_rv_ratio feature first
+        iv_crosscheck_dampen_threshold=1.2,
+        iv_crosscheck_dampen_factor=0.7,
+        iv_crosscheck_boost_threshold=0.8,
+        iv_crosscheck_boost_factor=1.1,
+        # ── v43: Post-mortem fixes ────────────────────────────────
+        model_prob_cap=0.90,               # Fix A: prevent empirical model saturating at P=1.0
+        model_prob_floor=0.10,             # Fix A: prevent P=0.0 extremes
+        market_disagreement_max=0.30,      # Fix B: skip when model vs market > 30pp
+        # ── v43: Daily pricing model ──────────────────────────────
+        daily_model_enabled=daily_model,
+        variance_ratio_enabled=True,
+        variance_ratio_min_samples=50,
+        merton_enabled=True,
+        merton_jump_mean=0.0,
+        merton_jump_vol=0.02,
+        merton_default_intensity=3.0,
+        merton_n_terms=15,
+        probability_floor_enabled=True,
+        probability_floor_min=0.005,
+        probability_ceiling_max=0.995,
+        daily_ou_weight_mean_reverting=0.7,
+        daily_gbm_weight_trending=0.7,
+        daily_merton_weight_deep=0.8,
+        daily_regime_transition_tau_minutes=5.0,
+        daily_moneyness_deep_threshold=3.0,
+        daily_moneyness_atm_threshold=1.0,
+        daily_ofi_weights="0.1,0.2,0.3,0.4",
     )
 
     engine = CryptoEngine(settings)
@@ -551,6 +698,11 @@ async def run_paper_test(
     print(f"  Max TTE:        {max_tte} min")
     print(f"  Scan interval:  {scan_interval}s")
     print(f"  Prob model:     {probability_model}")
+    _cell_models = {c: getattr(settings, f"cell_{c}_probability_model", "")
+                    for c in ["yes_15min", "yes_daily", "no_15min", "no_daily"]}
+    _overrides = {c: m for c, m in _cell_models.items() if m}
+    if _overrides:
+        print(f"  Cell models:    {_overrides}")
     print(f"  Calibration:    {settings.calibration_method} (min_samples={settings.calibration_min_samples})")
     print(f"  Staleness:      {'ON' if settings.staleness_enabled else 'OFF'}")
     print(f"  Multi-OFI:      {'ON' if settings.multiscale_ofi_enabled else 'OFF'} (windows={settings.multiscale_ofi_windows})")
@@ -570,7 +722,10 @@ async def run_paper_test(
     print(f"  Transition:     sizing×{settings.regime_transition_sizing_multiplier}")
     print(f"  Confidence:     {'ON' if settings.confidence_scoring_enabled else 'OFF (observing)'}")
     print(f"  Feature store:  {'ON' if settings.feature_store_enabled else 'OFF'} → {fs_path}")
-    print(f"  Classifier:     {'ON' if settings.classifier_enabled else 'OFF (collecting data)'}")
+    _clf_cells = [c for c in ["yes_15min", "yes_daily", "no_15min", "no_daily"]
+                  if getattr(settings, f"classifier_model_path_{c}", "")]
+    print(f"  Classifier:     {'ON' if settings.classifier_enabled else 'OFF (collecting data)'}"
+          f" (per-cell: {', '.join(_clf_cells) if _clf_cells else 'none'})")
     print(f"  Volume clock:   ON (short=300s, baseline=4hr)")
     print(f"  Hawkes jumps:   ON (α=5.0, β=0.00115, threshold=3.0σ)")
     if settings.cycle_recorder_enabled:
@@ -579,6 +734,28 @@ async def run_paper_test(
     else:
         rec_db_path = None
         print(f"  Recorder:       OFF")
+    # v41 improvements
+    print(f"  Kelly edge cap: {'%.0f%%' % (settings.kelly_edge_cap * 100) if settings.kelly_edge_cap > 0 else 'OFF'}")
+    print(f"  Quiet hours:    {settings.quiet_hours_utc if settings.quiet_hours_utc else 'OFF'}"
+          f"{' (min_edge=' + str(settings.quiet_hours_min_edge) + ')' if settings.quiet_hours_utc else ''}")
+    print(f"  Recalibration:  {'ON' if settings.recalibration_enabled else 'OFF'}"
+          f" (window={settings.recalibration_window}, refit_every={settings.recalibration_refit_interval},"
+          f" min_samples={settings.recalibration_min_samples})")
+    print(f"  Momentum:       {'ON' if settings.momentum_enabled else 'OFF'}"
+          f"  VPIN zone: {settings.momentum_vpin_floor:.2f}–{settings.momentum_vpin_ceiling:.2f}"
+          f"  OFI align>{settings.momentum_ofi_alignment_min:.1f} mag>{settings.momentum_ofi_magnitude_min:.0f}")
+    # v42 improvements
+    print(f"  Ensemble:       {'ON' if settings.ensemble_enabled else 'OFF'}"
+          f" (YES: emp={settings.ensemble_weight_empirical_yes:.0%}/st={settings.ensemble_weight_student_t_yes:.0%}/mc={settings.ensemble_weight_mc_gbm_yes:.0%},"
+          f" NO: emp={settings.ensemble_weight_empirical_no:.0%}/st={settings.ensemble_weight_student_t_no:.0%}/mc={settings.ensemble_weight_mc_gbm_no:.0%})")
+    print(f"  IV cross-check: {'ON' if settings.iv_crosscheck_enabled else 'OFF (collecting data)'}"
+          f" (dampen>{settings.iv_crosscheck_dampen_threshold:.1f}x, boost<{settings.iv_crosscheck_boost_threshold:.1f}x)")
+    print(f"  New features:   15 v42 columns (temporal, hawkes, ensemble, meta, IV, funding)")
+    print(f"  Daily model:    {'ON (v43 Merton/OU/GBM hybrid)' if settings.daily_model_enabled else 'OFF'}")
+    print(f"  VR correction:  {'ON' if settings.variance_ratio_enabled else 'OFF'} (min_samples={settings.variance_ratio_min_samples})")
+    print(f"  Prob bounds:    {'ON' if settings.probability_floor_enabled else 'OFF'} (floor={settings.probability_floor_min}, ceil={settings.probability_ceiling_max})")
+    print(f"  Prob cap:       [{settings.model_prob_floor:.2f}, {settings.model_prob_cap:.2f}]  (v43 Fix A)")
+    print(f"  Mkt disagree:   max={settings.market_disagreement_max:.0%}  (v43 Fix B)")
     print(f"{'='*70}\n")
 
     # Wire up cycle recorder if enabled
@@ -598,10 +775,10 @@ async def run_paper_test(
         if engine._funding_tracker is not None:
             await engine._funding_tracker.start(client)
 
-        # 1. Bootstrap with Binance klines
-        print("Loading historical prices from Binance US REST API...")
+        # 1. Bootstrap with OKX klines
+        print("Loading historical prices from OKX REST API...")
         for sym in binance_symbols:
-            klines = await fetch_binance_klines(sym, 60, client)
+            klines = await fetch_okx_klines(sym, 60, client)
             if klines:
                 for ts, close in klines:
                     engine.price_feed.inject_tick(
@@ -612,8 +789,8 @@ async def run_paper_test(
                 print(f"   {sym}: no data (API may be unavailable)")
 
         # 2. Fetch current prices
-        print("\nFetching current prices...")
-        prices = await fetch_binance_prices(binance_symbols, client)
+        print("\nFetching current prices from OKX...")
+        prices = await fetch_okx_prices(binance_symbols, client)
         for sym, price in prices.items():
             engine.price_feed.inject_tick(
                 PriceTick(symbol=sym, price=price, timestamp=time.time(), volume=0)
@@ -621,7 +798,7 @@ async def run_paper_test(
             print(f"   {sym.upper()}: ${price:,.2f}")
 
         if not prices:
-            print("   WARNING: No Binance prices available. Using historical data only.")
+            print("   WARNING: No OKX prices available. Using historical data only.")
 
         # 2b. Bootstrap OFI data from OKX trades
         print("\nBootstrapping OFI data from OKX trades...")
@@ -659,22 +836,45 @@ async def run_paper_test(
                     f"OFI={ofi:+.3f}"
                 )
 
-        # 2c. Auto-calibrate VPIN bucket sizes from bootstrap volume data
+        # 2c. Auto-calibrate VPIN bucket sizes from bootstrap trade data.
+        # Key insight: bucket volume must be large enough to contain many
+        # individual trades (~30) so the buy/sell ratio is statistically
+        # meaningful.  Tiny buckets → each bucket filled by 1 trade →
+        # VPIN = 1.0 permanently.  Use per-symbol minimum floors based on
+        # typical trade sizes on OKX spot.
+        _VPIN_MIN_BUCKET = {
+            "btcusdt": 0.10,    # ~$9,700 per bucket at $97k/BTC
+            "ethusdt": 1.0,     # ~$2,700 per bucket at $2,700/ETH
+            "solusdt": 50.0,    # ~$7,500 per bucket at $150/SOL
+        }
         if settings.vpin_enabled:
             print("\nCalibrating VPIN bucket sizes...")
             for sym in [s.lower() for s in binance_symbols]:
                 if sym in engine._vpin_calculators:
                     calc = engine._vpin_calculators[sym]
                     if calc.bucket_volume <= 0:
-                        total_vol = engine.price_feed.get_total_volume(
-                            sym, window_seconds=settings.vpin_auto_calibrate_window_minutes * 60,
-                        )
-                        bv = calc.auto_calibrate_bucket_size(
-                            total_volume=total_vol,
-                            window_minutes=float(settings.vpin_auto_calibrate_window_minutes),
-                        )
-                        LOGGER.info("VPIN: auto-calibrated bucket_volume=%.4f for %s", bv, sym)
-                        print(f"   {sym.upper()}: bucket_volume={bv:.4f}")
+                        min_bv = _VPIN_MIN_BUCKET.get(sym, 1.0)
+                        # Try trade-size-based calibration first (more reliable)
+                        buy_sells = engine.price_feed._buy_sells.get(sym, [])
+                        trade_sizes = [vol for _, vol, _ in buy_sells]
+                        if len(trade_sizes) >= 10:
+                            bv = calc.calibrate_from_trades(
+                                trade_sizes=trade_sizes,
+                                trades_per_bucket=30,
+                                min_bucket_volume=min_bv,
+                            )
+                        else:
+                            # Fallback to volume-rate method
+                            total_vol = engine.price_feed.get_total_volume(
+                                sym, window_seconds=settings.vpin_auto_calibrate_window_minutes * 60,
+                            )
+                            bv = calc.auto_calibrate_bucket_size(
+                                total_volume=total_vol,
+                                window_minutes=float(settings.vpin_auto_calibrate_window_minutes),
+                                min_bucket_volume=min_bv,
+                            )
+                        LOGGER.info("VPIN: calibrated bucket_volume=%.4f for %s (min=%.4f)", bv, sym, min_bv)
+                        print(f"   {sym.upper()}: bucket_volume={bv:.4f} (min_floor={min_bv:.4f})")
 
             # Re-inject bootstrap aggTrades so VPIN can process them
             for sym in [s.lower() for s in binance_symbols]:
@@ -702,13 +902,14 @@ async def run_paper_test(
             else:
                 print(f"   {sym.upper()}: insufficient data for vol estimate")
 
-        # 4. Start OKX trades WebSocket for continuous OFI data
+        # 4. Start OKX trades WebSocket for continuous OFI/VPIN data
         agg_trades_task = None
+        _ws_restart_count = 0
         if settings.agg_trades_ws_enabled:
             agg_trades_task = asyncio.create_task(
-                engine.price_feed.connect_okx_trades_ws()
+                engine.price_feed.connect_agg_trades_ws()
             )
-            print("\nStarted OKX trades WebSocket stream for continuous OFI data")
+            print("\nStarted OKX trades WebSocket stream for continuous OFI/VPIN data")
 
         # 5. Set up per-cycle CSV logger
         log_path = f"arb_bot/output/paper_v3_{int(time.time())}.csv"
@@ -731,14 +932,27 @@ async def run_paper_test(
             print(f"Cycle {cycle} ({elapsed:.1f}m / {duration_minutes}m)")
             print(f"{'─'*50}")
 
-            # Refresh prices + trade flow for OFI
-            new_prices = await fetch_binance_prices(binance_symbols, client)
+            # Health check: auto-restart dead WebSocket task
+            if agg_trades_task is not None and agg_trades_task.done():
+                exc = agg_trades_task.exception() if not agg_trades_task.cancelled() else None
+                _ws_restart_count += 1
+                LOGGER.warning(
+                    "OKX trades WS task died (restart #%d): %s",
+                    _ws_restart_count, exc,
+                )
+                print(f"   ⚠ OKX trades WS died (restart #{_ws_restart_count}): {exc}")
+                agg_trades_task = asyncio.create_task(
+                    engine.price_feed.connect_agg_trades_ws()
+                )
+
+            # Refresh prices from OKX REST
+            new_prices = await fetch_okx_prices(binance_symbols, client)
             for sym, price in new_prices.items():
                 engine.price_feed.inject_tick(
                     PriceTick(symbol=sym, price=price, timestamp=time.time(), volume=0)
                 )
 
-            # OFI data now comes via aggTrades WebSocket (no per-cycle REST poll)
+            # OFI/VPIN data comes via OKX trades WebSocket (no per-cycle REST poll)
 
             for sym in [s.lower() for s in binance_symbols]:
                 p = engine.price_feed.get_current_price(sym)
@@ -747,7 +961,13 @@ async def run_paper_test(
                 if settings.vpin_enabled and sym in engine._vpin_calculators:
                     calc = engine._vpin_calculators[sym]
                     v = calc.get_vpin()
-                    vpin_str = f"  VPIN={v:.3f}" if v is not None else "  VPIN=None"
+                    if v is not None:
+                        vpin_str = f"  VPIN={v:.3f}"
+                    elif hasattr(calc, "is_stale") and calc.is_stale:
+                        age = calc.seconds_since_last_trade
+                        vpin_str = f"  VPIN=stale({age:.0f}s)"
+                    else:
+                        vpin_str = "  VPIN=None"
                 if p:
                     print(f"   {sym.upper()}: ${p:,.2f}  OFI={ofi:+.3f}{vpin_str}")
 
@@ -757,14 +977,28 @@ async def run_paper_test(
             # Parse into quotes
             quotes: list[CryptoMarketQuote] = []
             skipped = 0
+            skipped_tte = 0
+            skipped_daily = 0
             for raw in raw_markets:
                 q = kalshi_raw_to_quote(raw, now, min_book_volume=settings.min_book_volume)
-                if q is not None and q.time_to_expiry_minutes <= max_tte:
+                if q is None:
+                    skipped += 1
+                    continue
+                # v43 Fix E: Exclude daily contracts by ticker when targeting 15min only.
+                # Daily tickers: KXBTCD-*, KXETHD-*, KXSOLD-* — these leak through
+                # TTE filter near their expiry hour.
+                if max_tte < 30 and q.market.meta.interval == "daily":
+                    skipped_daily += 1
+                    skipped += 1
+                    continue
+                if q.time_to_expiry_minutes <= max_tte:
                     quotes.append(q)
                 else:
+                    skipped_tte += 1
                     skipped += 1
 
-            print(f"   Markets: {len(quotes)} tradeable, {skipped} filtered")
+            daily_str = f", daily={skipped_daily}" if skipped_daily else ""
+            print(f"   Markets: {len(quotes)} tradeable, {skipped} filtered (TTE={skipped_tte}{daily_str})")
 
             if quotes:
                 # Group by interval type
@@ -877,6 +1111,10 @@ async def run_paper_test(
         if unsettled_count:
             print(f"  ⚠ {unsettled_count} positions remain unsettled (markets still open)")
 
+    # Flush remaining feature store entries
+    if hasattr(engine, '_feature_store') and engine._feature_store is not None:
+        engine._feature_store.flush()
+
     # Close cycle logger and recorder
     logger.close()
     if cycle_recorder is not None:
@@ -912,6 +1150,22 @@ async def run_paper_test(
                 f"model={t.model_prob_at_entry:.0%} market={t.market_prob_at_entry:.0%} "
                 f"{outcome_tag}"
             )
+        # Per-cell breakdown
+        cell_stats: dict[str, dict] = {}
+        for t in engine.trades:
+            cell = getattr(t, 'strategy_cell', '') or 'unknown'
+            if cell not in cell_stats:
+                cell_stats[cell] = {"trades": 0, "wins": 0, "pnl": 0.0}
+            cell_stats[cell]["trades"] += 1
+            if t.pnl > 0:
+                cell_stats[cell]["wins"] += 1
+            cell_stats[cell]["pnl"] += t.pnl
+        if cell_stats:
+            print(f"\n  Per-cell breakdown:")
+            for cell_name in sorted(cell_stats.keys()):
+                s = cell_stats[cell_name]
+                wr = s["wins"] / s["trades"] * 100 if s["trades"] else 0
+                print(f"    {cell_name:15s}  {s['trades']} trades  {s['wins']} wins ({wr:.0f}%)  PnL=${s['pnl']:+.2f}")
     print(f"\n  Net PnL:        ${engine.session_pnl:+.2f}")
     print(f"  Final bankroll: ${engine.bankroll:.2f}")
     print(f"  Cycle data:     {log_path}")
@@ -980,15 +1234,17 @@ def main() -> None:
                         help="How long to run (default: 5)")
     parser.add_argument("--mc-paths", type=int, default=1000,
                         help="Monte Carlo paths (default: 1000)")
-    parser.add_argument("--min-edge", type=float, default=0.12,
-                        help="Min edge fraction (default: 0.12 = 12%%)")
+    parser.add_argument("--min-edge", type=float, default=0.04,
+                        help="Min edge fraction (default: 0.04 = 4%%)")
     parser.add_argument("--scan-interval", type=float, default=15.0,
                         help="Seconds between scans (default: 15)")
     parser.add_argument("--max-tte", type=int, default=600,
                         help="Max time-to-expiry in minutes (default: 600)")
     parser.add_argument("--model", choices=["mc_gbm", "student_t", "ab_test", "empirical", "ab_empirical"],
-                        default="ab_test",
-                        help="Probability model (default: ab_test)")
+                        default="empirical",
+                        help="Probability model (default: empirical)")
+    parser.add_argument("--daily-model", action="store_true",
+                        help="Enable v43 daily pricing model (Merton/OU/GBM hybrid)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1009,6 +1265,7 @@ def main() -> None:
         scan_interval=args.scan_interval,
         max_tte=args.max_tte,
         probability_model=args.model,
+        daily_model=args.daily_model,
     ))
 
 

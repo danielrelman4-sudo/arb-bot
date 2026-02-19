@@ -43,7 +43,7 @@ from arb_bot.cross_mapping import (
 )
 from arb_bot.engine import ArbEngine
 from arb_bot.exchanges.forecastex import ForecastExAdapter, IBKRRateLimiter
-from arb_bot.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
+from arb_bot.framework.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
 from arb_bot.models import (
     ArbitrageOpportunity,
     BinaryQuote,

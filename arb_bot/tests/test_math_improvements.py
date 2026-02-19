@@ -12,7 +12,7 @@ from collections import Counter
 import pytest
 
 from arb_bot.bucket_quality import BucketAccumulator, BucketQualityModel
-from arb_bot.kelly_sizing import KellySizingResult, TailRiskKelly, TailRiskKellyConfig
+from arb_bot.framework.kelly_sizing import KellySizingResult, TailRiskKelly, TailRiskKellyConfig
 
 
 # ===========================================================================

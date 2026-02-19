@@ -273,16 +273,16 @@ def _reload_with_env(**env_vars: str):
         os.environ[k] = v
 
     import arb_bot.binary_math
-    import arb_bot.execution_model
-    import arb_bot.fee_model
-    import arb_bot.kelly_sizing
+    import arb_bot.framework.execution_model
+    import arb_bot.framework.fee_model
+    import arb_bot.framework.kelly_sizing
     import arb_bot.sizing
 
     importlib.reload(arb_bot.binary_math)
     importlib.reload(arb_bot.sizing)
-    importlib.reload(arb_bot.kelly_sizing)
-    importlib.reload(arb_bot.fee_model)
-    importlib.reload(arb_bot.execution_model)
+    importlib.reload(arb_bot.framework.kelly_sizing)
+    importlib.reload(arb_bot.framework.fee_model)
+    importlib.reload(arb_bot.framework.execution_model)
 
 
 def _reload_clean():
@@ -292,16 +292,16 @@ def _reload_clean():
             os.environ.pop(key, None)
 
     import arb_bot.binary_math
-    import arb_bot.execution_model
-    import arb_bot.fee_model
-    import arb_bot.kelly_sizing
+    import arb_bot.framework.execution_model
+    import arb_bot.framework.fee_model
+    import arb_bot.framework.kelly_sizing
     import arb_bot.sizing
 
     importlib.reload(arb_bot.binary_math)
     importlib.reload(arb_bot.sizing)
-    importlib.reload(arb_bot.kelly_sizing)
-    importlib.reload(arb_bot.fee_model)
-    importlib.reload(arb_bot.execution_model)
+    importlib.reload(arb_bot.framework.kelly_sizing)
+    importlib.reload(arb_bot.framework.fee_model)
+    importlib.reload(arb_bot.framework.execution_model)
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +382,7 @@ class TestFeeModelBenchmark:
     """Benchmark fee estimation — 200 calls."""
 
     def test_python_vs_rust(self) -> None:
-        from arb_bot.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
+        from arb_bot.framework.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
 
         schedule = VenueFeeSchedule(venue="test", taker_fee_per_contract=0.01)
         config = FeeModelConfig(venues=(schedule,))
@@ -400,7 +400,7 @@ class TestFeeModelBenchmark:
 
         # Rust path.
         _reload_with_env(ARB_USE_RUST_FEE_MODEL="1")
-        from arb_bot.fee_model import FeeModel as FeeModelRs
+        from arb_bot.framework.fee_model import FeeModel as FeeModelRs
         model_rs = FeeModelRs(config)
 
         def run_rust():
@@ -422,7 +422,7 @@ class TestExecutionModelBenchmark:
     """Benchmark execution model — 100 simulations."""
 
     def test_python_vs_rust(self) -> None:
-        from arb_bot.execution_model import ExecutionModel, LegInput
+        from arb_bot.framework.execution_model import ExecutionModel, LegInput
 
         leg = LegInput(
             venue="kalshi", market_id="m1", side="yes",
@@ -435,7 +435,7 @@ class TestExecutionModelBenchmark:
 
         # Python path.
         _reload_clean()
-        from arb_bot.execution_model import ExecutionModel as ExecPy
+        from arb_bot.framework.execution_model import ExecutionModel as ExecPy
         model_py = ExecPy()
 
         def run_python():
@@ -446,7 +446,7 @@ class TestExecutionModelBenchmark:
 
         # Rust path.
         _reload_with_env(ARB_USE_RUST_EXECUTION_MODEL="1")
-        from arb_bot.execution_model import ExecutionModel as ExecRs
+        from arb_bot.framework.execution_model import ExecutionModel as ExecRs
         model_rs = ExecRs()
 
         def run_rust():
@@ -477,8 +477,8 @@ class TestFullCycleBenchmark:
 
     def test_eval_pipeline_p99_under_2ms(self) -> None:
         """Full eval pipeline: binary_math + Kelly + fee + execution for 20 opps."""
-        from arb_bot.execution_model import ExecutionModel, LegInput
-        from arb_bot.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
+        from arb_bot.framework.execution_model import ExecutionModel, LegInput
+        from arb_bot.framework.fee_model import FeeModel, FeeModelConfig, OrderType, VenueFeeSchedule
 
         schedule = VenueFeeSchedule(venue="kalshi", taker_fee_per_contract=0.01)
         config = FeeModelConfig(venues=(schedule,))

@@ -21,7 +21,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -55,6 +55,121 @@ _KALSHI_TO_BINANCE = {
 }
 
 
+# ── Momentum helpers (v18) ─────────────────────────────────────────
+
+
+def _select_momentum_contract(
+    quotes: list,
+    spot_price: float,
+    ofi_direction: int,
+    settings,
+) -> tuple | None:
+    """Select best momentum contract: nearest OTM in price sweet spot.
+
+    Returns (quote, side) or None if no suitable contract.
+    """
+    candidates = []
+    for q in quotes:
+        meta = q.market.meta
+        if meta.strike is None:
+            continue
+        if meta.direction not in ("above", "below"):
+            continue
+        if q.time_to_expiry_minutes > settings.momentum_max_tte_minutes:
+            continue
+        if q.time_to_expiry_minutes <= 0:
+            continue
+
+        if ofi_direction > 0:  # Bullish
+            if meta.direction == "above" and meta.strike > spot_price:
+                side = "yes"
+                buy_price = q.yes_buy_price
+            elif meta.direction == "below" and meta.strike < spot_price:
+                side = "no"
+                buy_price = q.no_buy_price
+            else:
+                continue
+        else:  # Bearish
+            if meta.direction == "above" and meta.strike < spot_price:
+                side = "no"
+                buy_price = q.no_buy_price
+            elif meta.direction == "below" and meta.strike > spot_price:
+                side = "yes"
+                buy_price = q.yes_buy_price
+            else:
+                continue
+
+        if buy_price < settings.momentum_price_floor:
+            continue
+        if buy_price > settings.momentum_price_ceiling:
+            continue
+
+        strike_distance = abs(meta.strike - spot_price)
+        candidates.append((q, side, buy_price, strike_distance))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[3])
+    return (candidates[0][0], candidates[0][1])
+
+
+def _compute_momentum_size(
+    bankroll: float,
+    buy_price: float,
+    ofi_alignment: float,
+    settings,
+) -> int:
+    """Compute momentum position size: fixed fraction scaled by OFI alignment."""
+    dollar_amount = bankroll * settings.momentum_kelly_fraction * ofi_alignment
+    dollar_amount = min(dollar_amount, settings.momentum_max_position)
+    dollar_amount = min(dollar_amount, bankroll)
+    if buy_price <= 0:
+        return 0
+    contracts = int(dollar_amount / buy_price)
+    return min(contracts, settings.momentum_max_contracts)
+
+
+def _update_ofi_streak(
+    streaks: dict,
+    last_dirs: dict,
+    symbol: str,
+    ofi_direction: int,
+    ofi_alignment: float,
+    min_alignment: float,
+) -> int:
+    """Update and return the OFI direction streak for a symbol.
+
+    Streak increments when direction is consistent and alignment is above
+    threshold. Resets to 0 on direction flip or alignment drop.
+    """
+    prev_dir = last_dirs.get(symbol)
+    last_dirs[symbol] = ofi_direction
+
+    if ofi_alignment < min_alignment:
+        streaks[symbol] = 0
+        return 0
+
+    if prev_dir is None or ofi_direction != prev_dir:
+        streaks[symbol] = 1 if prev_dir is None else 0
+        return streaks[symbol]
+
+    streaks[symbol] = streaks.get(symbol, 0) + 1
+    return streaks[symbol]
+
+
+def _check_ofi_acceleration(ofi_multiscale: dict) -> bool:
+    """Check if OFI flow is accelerating (short-term stronger than medium-term).
+
+    Compares |OFI at 30s| vs |OFI at 120s|. Returns True if short-term
+    flow is stronger (momentum building) or if data is missing (permissive).
+    """
+    ofi_30 = ofi_multiscale.get(30)
+    ofi_120 = ofi_multiscale.get(120)
+    if ofi_30 is None or ofi_120 is None:
+        return True  # Permissive when data missing
+    return abs(ofi_30) > abs(ofi_120)
+
+
 # ── Trade records ──────────────────────────────────────────────────
 
 @dataclass
@@ -69,6 +184,8 @@ class CryptoPosition:
     edge: CryptoEdge
     model_prob: float
     market_implied_prob: float
+    strategy: str = "model"
+    strategy_cell: str = ""  # "yes_15min", "yes_daily", "no_15min", "no_daily"
 
 
 @dataclass
@@ -90,6 +207,7 @@ class CryptoTradeRecord:
     time_to_expiry_minutes: float = 0.0
     settled: bool = False
     actual_outcome: str = "unsettled"  # "yes" / "no" / "unsettled" / "simulated"
+    strategy_cell: str = ""  # "yes_15min", "yes_daily", "no_15min", "no_daily"
 
 
 # ── Engine ─────────────────────────────────────────────────────────
@@ -140,6 +258,7 @@ class CryptoEngine:
             min_model_market_divergence=settings.min_model_market_divergence,
             dynamic_edge_enabled=settings.dynamic_edge_threshold_enabled,
             dynamic_edge_k=settings.dynamic_edge_uncertainty_multiplier,
+            market_disagreement_max=settings.market_disagreement_max,
         )
         self._calibrator = ModelCalibrator(
             min_samples_for_calibration=settings.calibration_min_samples,
@@ -163,6 +282,13 @@ class CryptoEngine:
         self._running = False
         self._bankroll: float = settings.bankroll
 
+        # Online recalibration: buffer of (predicted_prob, outcome_binary) per cell
+        self._recal_buffer: Dict[str, List[tuple]] = {}  # cell → [(pred, outcome), ...]
+        self._recal_curve: Dict[str, Any] = {}  # cell → fitted IsotonicRegression or None
+        self._recal_trade_count: int = 0  # total settlements seen since last refit
+        self._recal_window: int = settings.recalibration_window  # max buffer size
+        self._recal_refit_interval: int = settings.recalibration_refit_interval  # refit every N
+
         # Cycle logger (optional, for offline calibration)
         self._cycle_logger: Optional[CycleLogger] = None
 
@@ -177,6 +303,11 @@ class CryptoEngine:
         # HTTP client for real settlement via Kalshi API
         self._http_client: Any = None  # httpx.AsyncClient when set
         self._pending_settlement: Dict[str, float] = {}  # ticker -> first_check_time
+
+        # Momentum cooldowns (v18)
+        self._momentum_cooldowns: Dict[str, float] = {}  # binance_sym -> last settle time
+        self._ofi_direction_streak: Dict[str, int] = {}
+        self._ofi_last_direction: Dict[str, int] = {}
 
         # Staleness detector (A1)
         if settings.staleness_enabled:
@@ -224,6 +355,7 @@ class CryptoEngine:
                 calc = VPINCalculator(
                     bucket_volume=settings.vpin_bucket_volume,
                     num_buckets=settings.vpin_num_buckets,
+                    adaptive_history_size=settings.vpin_adaptive_history_size,
                 )
                 self._vpin_calculators[sym] = calc
                 self._price_feed.register_vpin(sym, calc)
@@ -238,6 +370,18 @@ class CryptoEngine:
         self._ab_empirical_probs: Dict[str, ProbabilityEstimate] = {}  # A/B storage
         self._empirical_returns_cache: Dict[str, list] = {}  # cached returns per symbol
         self._empirical_returns_cache_cycle: int = 0  # cache freshness
+
+        # v42: MC GBM cache for ensemble (store per-ticker for current cycle)
+        self._ab_mc_probs: Dict[str, ProbabilityEstimate] = {}  # ticker → MC prob
+
+        # v42: Per-cell rolling stats for meta-features
+        from collections import deque
+        self._cell_outcomes: Dict[str, deque] = {}  # cell → deque of (timestamp, pnl, won)
+        self._cell_outcome_window: int = 20  # last N trades per cell
+
+        # v42: Funding rate persistence tracking
+        self._funding_sign_persistence: Dict[str, int] = {}  # symbol → consecutive same-sign count
+        self._funding_last_sign: Dict[str, int] = {}  # symbol → last sign (-1, 0, 1)
 
         # Confidence scorer (B2)
         self._confidence_scorer = None
@@ -264,24 +408,61 @@ class CryptoEngine:
                 min_samples_for_classifier=settings.feature_store_min_samples,
             )
 
-        # Classifier (C2)
-        self._classifier = None
+        # Classifier (C2) — per-cell classifiers or global fallback
+        self._classifiers: Dict[str, Any] = {}  # cell_name → BinaryClassifier
         self._classifier_last_train: float = 0.0
         if settings.classifier_enabled:
             from arb_bot.crypto.classifier import BinaryClassifier, HAS_XGBOOST
             if HAS_XGBOOST:
-                self._classifier = BinaryClassifier(
-                    max_depth=settings.classifier_max_depth,
-                    n_estimators=settings.classifier_n_estimators,
-                    learning_rate=settings.classifier_learning_rate,
-                    min_child_weight=settings.classifier_min_child_weight,
-                    subsample=settings.classifier_subsample,
-                    use_isotonic_calibration=settings.classifier_use_isotonic_calibration,
-                    model_path=settings.classifier_model_path or None,
-                )
-                # Try loading a pre-trained model
-                if settings.classifier_model_path:
-                    self._classifier.load_model()
+                # Try loading per-cell classifiers first
+                _cell_paths = {
+                    "yes_15min": settings.classifier_model_path_yes_15min,
+                    "yes_daily": settings.classifier_model_path_yes_daily,
+                    "no_15min": settings.classifier_model_path_no_15min,
+                    "no_daily": settings.classifier_model_path_no_daily,
+                }
+                for cell_name, path in _cell_paths.items():
+                    if path:
+                        clf = BinaryClassifier(
+                            max_depth=settings.classifier_max_depth,
+                            n_estimators=settings.classifier_n_estimators,
+                            learning_rate=settings.classifier_learning_rate,
+                            min_child_weight=settings.classifier_min_child_weight,
+                            subsample=settings.classifier_subsample,
+                            use_isotonic_calibration=settings.classifier_use_isotonic_calibration,
+                            model_path=path,
+                        )
+                        if clf.load_model():
+                            self._classifiers[cell_name] = clf
+                            LOGGER.info(
+                                "CryptoEngine: loaded per-cell classifier for %s from %s",
+                                cell_name, path,
+                            )
+
+                # Fallback: if no per-cell classifiers, try global model
+                if not self._classifiers and settings.classifier_model_path:
+                    global_clf = BinaryClassifier(
+                        max_depth=settings.classifier_max_depth,
+                        n_estimators=settings.classifier_n_estimators,
+                        learning_rate=settings.classifier_learning_rate,
+                        min_child_weight=settings.classifier_min_child_weight,
+                        subsample=settings.classifier_subsample,
+                        use_isotonic_calibration=settings.classifier_use_isotonic_calibration,
+                        model_path=settings.classifier_model_path,
+                    )
+                    if global_clf.load_model():
+                        self._classifiers["_global"] = global_clf
+                        LOGGER.info(
+                            "CryptoEngine: loaded global classifier from %s",
+                            settings.classifier_model_path,
+                        )
+
+                if self._classifiers:
+                    LOGGER.info(
+                        "CryptoEngine: %d classifier(s) loaded: %s",
+                        len(self._classifiers),
+                        list(self._classifiers.keys()),
+                    )
             else:
                 LOGGER.warning("CryptoEngine: classifier_enabled but xgboost not installed")
 
@@ -626,15 +807,25 @@ class CryptoEngine:
     # ── Classifier (C2) ────────────────────────────────────────────
 
     def _maybe_retrain_classifier(self) -> None:
-        """Check if the classifier should be retrained based on interval and sample count."""
-        if self._classifier is None or self._feature_store is None:
+        """Check if the classifier should be retrained based on interval and sample count.
+
+        For per-cell classifiers, online retraining is skipped — use the
+        offline ``train_classifier.py --cell`` script instead.  Only the
+        global fallback (``_global`` key) supports online retraining.
+        """
+        if not self._classifiers or self._feature_store is None:
+            return
+
+        # Only retrain global classifier online
+        global_clf = self._classifiers.get("_global")
+        if global_clf is None:
             return
 
         now = time.time()
         interval = self._settings.classifier_retrain_interval_hours * 3600
 
         # Check if enough time has passed since last training
-        if self._classifier.is_trained and (now - self._classifier_last_train) < interval:
+        if global_clf.is_trained and (now - self._classifier_last_train) < interval:
             return
 
         # Check if we have enough samples
@@ -647,27 +838,35 @@ class CryptoEngine:
         if len(y) < self._settings.classifier_min_training_samples:
             return
 
-        LOGGER.info("CryptoEngine: retraining classifier with %d samples", len(y))
-        report = self._classifier.train(X, y, feature_names=FEATURE_COLUMNS)
+        LOGGER.info("CryptoEngine: retraining global classifier with %d samples", len(y))
+        report = global_clf.train(X, y, feature_names=FEATURE_COLUMNS)
         self._classifier_last_train = now
 
         LOGGER.info(
-            "CryptoEngine: classifier retrained -- accuracy=%.3f brier=%.4f",
+            "CryptoEngine: global classifier retrained -- accuracy=%.3f brier=%.4f",
             report.accuracy, report.brier_score,
         )
 
     def _compute_classifier_probability(
-        self, edge_features: np.ndarray,
+        self,
+        edge_features: np.ndarray,
+        strategy_cell: str = "",
     ) -> Optional[ProbabilityEstimate]:
         """Compute probability from the trained classifier.
 
+        Looks up per-cell classifier first, falls back to global.
         Returns None if classifier is not available or not trained.
         """
-        if self._classifier is None or not self._classifier.is_trained:
+        if not self._classifiers:
+            return None
+
+        # Look up per-cell classifier, then global fallback
+        classifier = self._classifiers.get(strategy_cell) or self._classifiers.get("_global")
+        if classifier is None or not classifier.is_trained:
             return None
 
         from arb_bot.crypto.classifier import ProbabilityEstimate as ClassifierEstimate
-        result = self._classifier.predict(edge_features)
+        result = classifier.predict(edge_features)
         if not result.is_classifier:
             return None
 
@@ -679,6 +878,81 @@ class CryptoEngine:
             uncertainty=result.uncertainty,
             num_paths=0,  # Not MC-based
         )
+
+    def _classifier_veto(self, edge: CryptoEdge) -> Tuple[bool, float, Optional["FeatureVector"]]:
+        """Check if the classifier vetoes this trade.
+
+        Uses per-cell classifier if available, falls back to global.
+        Uses per-cell veto threshold if configured.
+
+        Returns (vetoed, p_win, feature_vector).
+        - vetoed: True if classifier says don't trade (p_win < threshold)
+        - p_win: classifier's estimated P(win), or -1 if not available
+        - feature_vector: built FeatureVector (reuse for feature store recording)
+        """
+        if not self._classifiers:
+            return False, -1.0, None
+
+        # Look up per-cell classifier, then global fallback
+        cell_name = edge.strategy_cell or ""
+        classifier = self._classifiers.get(cell_name) or self._classifiers.get("_global")
+        if classifier is None or not classifier.is_trained:
+            return False, -1.0, None
+
+        from arb_bot.crypto.feature_store import FEATURE_COLUMNS, _REGIME_ENCODE
+
+        # Build feature vector
+        fv = self._build_feature_vector(edge)
+
+        # Convert to numpy array matching training schema
+        n_base = len(FEATURE_COLUMNS)
+        features = np.zeros(n_base + 2)  # +2 for side_numeric, is_daily
+        for j, col in enumerate(FEATURE_COLUMNS):
+            val = getattr(fv, col, 0.0)
+            if col == "regime":
+                features[j] = float(_REGIME_ENCODE.get(str(val), 0))
+            else:
+                try:
+                    features[j] = float(val)
+                except (ValueError, TypeError):
+                    features[j] = 0.0
+
+        # Extra derived features (must match training)
+        features[n_base + 0] = 1.0 if edge.side == "yes" else 0.0  # side_numeric
+        features[n_base + 1] = 1.0 if "daily" in (edge.strategy_cell or "") else 0.0  # is_daily
+
+        # Predict
+        result = classifier.predict(features)
+        p_win = result.probability if result.is_classifier else -1.0
+
+        # Per-cell veto threshold (falls back to global)
+        _threshold_map = {
+            "yes_15min": self._settings.classifier_veto_threshold_yes_15min,
+            "yes_daily": self._settings.classifier_veto_threshold_yes_daily,
+            "no_15min": self._settings.classifier_veto_threshold_no_15min,
+            "no_daily": self._settings.classifier_veto_threshold_no_daily,
+        }
+        threshold = _threshold_map.get(cell_name, self._settings.classifier_veto_threshold)
+        vetoed = p_win >= 0 and p_win < threshold
+
+        # Log with classifier source info
+        clf_source = cell_name if cell_name in self._classifiers else "_global"
+        if vetoed:
+            LOGGER.info(
+                "CryptoEngine: classifier veto %s — P(win)=%.2f < %.2f "
+                "(cell=%s, clf=%s)",
+                edge.market.ticker, p_win, threshold,
+                cell_name or "unknown", clf_source,
+            )
+        else:
+            LOGGER.debug(
+                "CryptoEngine: classifier pass %s — P(win)=%.2f "
+                "(cell=%s, clf=%s)",
+                edge.market.ticker, p_win,
+                cell_name or "unknown", clf_source,
+            )
+
+        return vetoed, p_win, fv
 
     # ── Cycle logger ─────────────────────────────────────────────
 
@@ -777,22 +1051,95 @@ class CryptoEngine:
         # 1c. Maybe retrain classifier (C2)
         self._maybe_retrain_classifier()
 
-        # 1d. VPIN halt gate: skip entire cycle if any symbol has extreme VPIN
+        # 1d. VPIN gate: per-symbol tiered gate with momentum zone (v18/v20)
+        _momentum_zone = False
+        _vpin_halted_symbols: set = set()   # Symbols above ceiling — fully halted
+        _vpin_momentum_symbols: set = set() # Symbols in momentum zone
+        _vpin_normal_symbols: set = set()   # Symbols below momentum floor — model-path ok
+        _vpin_stale_symbols: set = set()    # Symbols with stale VPIN (treated as normal)
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
-                if vpin_val is not None and vpin_val > self._settings.vpin_halt_threshold:
-                    LOGGER.info(
-                        "CryptoEngine: VPIN halt — %s VPIN=%.3f > %.3f, skipping cycle",
-                        sym, vpin_val, self._settings.vpin_halt_threshold,
-                    )
-                    return
+                if vpin_val is None:
+                    _vpin_normal_symbols.add(sym)
+                    if hasattr(calc, "is_stale") and calc.is_stale:
+                        _vpin_stale_symbols.add(sym)
+                    continue
+                # Get effective thresholds (adaptive or static)
+                mom_floor, halt_ceil, is_adaptive = self._get_vpin_thresholds(sym)
+                if self._settings.momentum_enabled:
+                    if vpin_val > halt_ceil:
+                        _vpin_halted_symbols.add(sym)
+                    elif vpin_val >= mom_floor:
+                        _vpin_momentum_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
+                else:
+                    if vpin_val > halt_ceil:
+                        _vpin_halted_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
+
+            # Log per-symbol VPIN status
+            if _vpin_stale_symbols:
+                stale_details = ", ".join(
+                    f"{s}(stale {self._vpin_calculators[s].seconds_since_last_trade:.0f}s)"
+                    if hasattr(self._vpin_calculators[s], "seconds_since_last_trade")
+                    else s
+                    for s in sorted(_vpin_stale_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN stale (treated as normal): %s", stale_details)
+            if _vpin_halted_symbols:
+                halted_details = []
+                for s in sorted(_vpin_halted_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        _, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        halted_details.append(f"{s}={v:.3f}(halt@{hc:.3f}/{tag})")
+                if halted_details:
+                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", ", ".join(halted_details))
+            if _vpin_momentum_symbols:
+                mom_details = []
+                for s in sorted(_vpin_momentum_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        mf, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        mom_details.append(f"{s}={v:.3f}(zone@{mf:.3f}-{hc:.3f}/{tag})")
+                if mom_details:
+                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", ", ".join(mom_details))
+                _momentum_zone = True
+
+            # Only skip entire cycle if ALL symbols are halted
+            if _vpin_halted_symbols and not _vpin_momentum_symbols and not _vpin_normal_symbols:
+                LOGGER.info("CryptoEngine: VPIN full halt — all symbols above ceiling, skipping cycle")
+                return
 
         # 2. Generate MC paths for each underlying/horizon combination
         model_probs = self._compute_model_probabilities(market_quotes)
 
         # 2b. Classify market regime
         self._update_regime()
+
+        # 2c. Momentum path (v18/v20): try momentum trades for momentum-zone symbols
+        if _momentum_zone and self._settings.momentum_enabled:
+            await self._try_momentum_trades(market_quotes, momentum_symbols=_vpin_momentum_symbols)
+
+        # If no symbols are in normal zone, skip model-path trades for 15-min markets.
+        # Daily (above/below TTE>30m) markets are still processed — VPIN measures
+        # short-term microstructure toxicity, not structural model-vs-market edges.
+        _has_daily_quotes = any(
+            mq.market.meta.direction in ("above", "below") and mq.time_to_expiry_minutes > 30
+            for mq in market_quotes
+        )
+        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols) and not _has_daily_quotes:
+            await self._settle_expired_positions()
+            cycle_elapsed = time.monotonic() - cycle_start
+            if cycle_elapsed > 1.0:
+                LOGGER.info("CryptoEngine: no normal-VPIN symbols, cycle %d took %.1fs",
+                            self._cycle_count, cycle_elapsed)
+            return
 
         # ── Cycle recorder Hook 1: market snapshots ──
         _rec_cycle_id = None
@@ -818,10 +1165,33 @@ class CryptoEngine:
         # 3. Detect edges
         edges = self._edge_detector.detect_edges(market_quotes, model_probs)
 
+        # 3-vpin. Filter edges for symbols in halted or momentum zone (model-path only)
+        # Daily (above/below) markets with TTE > 30m are EXEMPT from VPIN filtering:
+        # VPIN measures short-term order toxicity, not whether a strike will be
+        # reached over the next hour+.  Daily edges are structural (model vs market),
+        # not microstructure-driven.
+        if _vpin_halted_symbols or _vpin_momentum_symbols:
+            blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
+            pre_count = len(edges)
+            edges = [
+                e for e in edges
+                if _KALSHI_TO_BINANCE.get(e.market.meta.underlying, "") not in blocked_syms
+                or (e.market.meta.direction in ("above", "below")
+                    and e.time_to_expiry_minutes > 30)
+            ]
+            if len(edges) < pre_count:
+                LOGGER.info(
+                    "CryptoEngine: VPIN symbol filter removed %d/%d model-path edges (halted/momentum symbols)",
+                    pre_count - len(edges), pre_count,
+                )
+
         # ── Cycle recorder Hook 2: snapshot raw edges ──
         all_raw_edges = list(edges)
         if _rec_cycle_id is not None:
             _filter_results = {e.market.ticker: FilterResult() for e in edges}
+
+        # 3-cell. Per-cell model adjustments (blending weight, prob haircut)
+        edges = self._apply_cell_model_adjustments(edges)
 
         # 3-regime. Regime min edge filter
         if self._settings.regime_min_edge_enabled and self._current_regime is not None:
@@ -912,6 +1282,9 @@ class CryptoEngine:
                         _filter_results[ticker].passed_zscore = True
 
         # 3-ofi. Counter-trend OFI filter: skip trades opposing the trend in trending regimes
+        # Daily (above/below) markets with TTE > 30m are EXEMPT: the micro regime
+        # (last few minutes) doesn't predict whether price stays above a strike
+        # over the next hour+.
         if (self._settings.regime_skip_counter_trend
             and self._current_regime is not None
             and self._current_regime.is_trending
@@ -920,6 +1293,11 @@ class CryptoEngine:
             trend_dir = self._current_regime.trend_direction  # 1=up, -1=down
             ofi_filtered = []
             for edge in edges:
+                # Exempt daily markets from counter-trend filter
+                if (edge.market.meta.direction in ("above", "below")
+                        and edge.time_to_expiry_minutes > 30):
+                    ofi_filtered.append(edge)
+                    continue
                 direction = edge.market.meta.direction
                 if direction in ("above", "up"):
                     trade_dir = 1 if edge.side == "yes" else -1
@@ -1005,7 +1383,8 @@ class CryptoEngine:
         self._rec_edge_id_map = _rec_edge_id_map
         self._rec_filter_results_current = _filter_results
 
-        # 4. Size and execute edges
+        # 4. Size and execute edges (with per-cell filtering + sizing)
+        from arb_bot.crypto.strategy_cell import StrategyCell, get_cell_config
         trades_opened = 0
         for edge in edges:
             if len(self._positions) >= self._settings.max_concurrent_positions:
@@ -1016,11 +1395,38 @@ class CryptoEngine:
             if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
                 continue
 
-            contracts = self._compute_position_size(edge)
+            # Per-cell filtering and sizing
+            cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
+            cell_cfg = get_cell_config(cell, self._settings) if cell else None
+
+            # Per-cell edge threshold
+            if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
+                LOGGER.info(
+                    "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
+                    edge.market.ticker, edge.edge_cents * 100,
+                    cell.value, cell_cfg.min_edge_pct * 100,
+                )
+                continue
+
+            # Per-cell signal gates
+            if cell is not None and cell_cfg is not None:
+                if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                    continue
+
+            # Quiet hours gate
+            if self._quiet_hours_gate(edge):
+                continue
+
+            # Classifier veto gate
+            vetoed, p_win, fv = self._classifier_veto(edge)
+            if vetoed:
+                continue
+
+            contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
             if contracts <= 0:
                 continue
 
-            self._execute_paper_trade(edge, contracts)
+            self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
             trades_opened += 1
 
         # 5. Check and settle expired positions
@@ -1137,21 +1543,87 @@ class CryptoEngine:
                     mq.no_buy_price,
                 )
 
-        # VPIN halt gate: skip entire cycle if any symbol has extreme VPIN
+        # VPIN gate: per-symbol tiered gate with momentum zone (v18/v20)
+        _momentum_zone = False
+        _vpin_halted_symbols: set = set()
+        _vpin_momentum_symbols: set = set()
+        _vpin_normal_symbols: set = set()
+        _vpin_stale_symbols: set = set()
         if self._settings.vpin_halt_enabled and self._vpin_calculators:
             for sym, calc in self._vpin_calculators.items():
                 vpin_val = calc.get_vpin()
-                if vpin_val is not None and vpin_val > self._settings.vpin_halt_threshold:
-                    LOGGER.info(
-                        "CryptoEngine: VPIN halt — %s VPIN=%.3f > %.3f, skipping cycle",
-                        sym, vpin_val, self._settings.vpin_halt_threshold,
-                    )
-                    return []
+                if vpin_val is None:
+                    _vpin_normal_symbols.add(sym)
+                    if hasattr(calc, "is_stale") and calc.is_stale:
+                        _vpin_stale_symbols.add(sym)
+                    continue
+                # Get effective thresholds (adaptive or static)
+                mom_floor, halt_ceil, is_adaptive = self._get_vpin_thresholds(sym)
+                if self._settings.momentum_enabled:
+                    if vpin_val > halt_ceil:
+                        _vpin_halted_symbols.add(sym)
+                    elif vpin_val >= mom_floor:
+                        _vpin_momentum_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
+                else:
+                    if vpin_val > halt_ceil:
+                        _vpin_halted_symbols.add(sym)
+                    else:
+                        _vpin_normal_symbols.add(sym)
+
+            if _vpin_stale_symbols:
+                stale_details = ", ".join(
+                    f"{s}(stale {self._vpin_calculators[s].seconds_since_last_trade:.0f}s)"
+                    if hasattr(self._vpin_calculators[s], "seconds_since_last_trade")
+                    else s
+                    for s in sorted(_vpin_stale_symbols)
+                )
+                LOGGER.info("CryptoEngine: VPIN stale (treated as normal): %s", stale_details)
+            if _vpin_halted_symbols:
+                halted_details = []
+                for s in sorted(_vpin_halted_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        _, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        halted_details.append(f"{s}={v:.3f}(halt@{hc:.3f}/{tag})")
+                if halted_details:
+                    LOGGER.info("CryptoEngine: VPIN halt symbols: %s", ", ".join(halted_details))
+            if _vpin_momentum_symbols:
+                mom_details = []
+                for s in sorted(_vpin_momentum_symbols):
+                    v = self._vpin_calculators[s].get_vpin()
+                    if v is not None:
+                        mf, hc, ada = self._get_vpin_thresholds(s)
+                        tag = "adaptive" if ada else "static"
+                        mom_details.append(f"{s}={v:.3f}(zone@{mf:.3f}-{hc:.3f}/{tag})")
+                if mom_details:
+                    LOGGER.info("CryptoEngine: VPIN momentum symbols: %s", ", ".join(mom_details))
+                _momentum_zone = True
+
+            if _vpin_halted_symbols and not _vpin_momentum_symbols and not _vpin_normal_symbols:
+                LOGGER.info("CryptoEngine: VPIN full halt — all symbols above ceiling, skipping cycle")
+                return []
 
         model_probs = self._compute_model_probabilities(quotes)
 
         # Classify market regime
         self._update_regime()
+
+        # Momentum path (v18/v20): try momentum trades for momentum-zone symbols
+        if _momentum_zone and self._settings.momentum_enabled:
+            await self._try_momentum_trades(quotes, momentum_symbols=_vpin_momentum_symbols)
+
+        # If no symbols are in normal zone, skip model-path trades for 15-min markets.
+        # Daily (above/below TTE>30m) markets are still processed.
+        _has_daily_quotes = any(
+            mq.market.meta.direction in ("above", "below") and mq.time_to_expiry_minutes > 30
+            for mq in quotes
+        )
+        if not _vpin_normal_symbols and (_vpin_halted_symbols or _vpin_momentum_symbols) and not _has_daily_quotes:
+            await self._settle_expired_positions()
+            return []
 
         # ── Cycle recorder Hook 1: market snapshots ──
         _rec_cycle_id = None
@@ -1176,10 +1648,30 @@ class CryptoEngine:
 
         edges = self._edge_detector.detect_edges(quotes, model_probs)
 
+        # Filter edges for symbols in halted or momentum zone (model-path only)
+        # Daily (above/below) markets with TTE > 30m are EXEMPT from VPIN filtering.
+        if _vpin_halted_symbols or _vpin_momentum_symbols:
+            blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
+            pre_count = len(edges)
+            edges = [
+                e for e in edges
+                if _KALSHI_TO_BINANCE.get(e.market.meta.underlying, "") not in blocked_syms
+                or (e.market.meta.direction in ("above", "below")
+                    and e.time_to_expiry_minutes > 30)
+            ]
+            if len(edges) < pre_count:
+                LOGGER.info(
+                    "CryptoEngine: VPIN symbol filter removed %d/%d model-path edges (halted/momentum symbols)",
+                    pre_count - len(edges), pre_count,
+                )
+
         # ── Cycle recorder Hook 2: snapshot raw edges ──
         all_raw_edges = list(edges)
         if _rec_cycle_id is not None:
             _filter_results = {e.market.ticker: FilterResult() for e in edges}
+
+        # Per-cell model adjustments (blending weight, prob haircut)
+        edges = self._apply_cell_model_adjustments(edges)
 
         # Regime min edge filter
         if self._settings.regime_min_edge_enabled and self._current_regime is not None:
@@ -1270,6 +1762,7 @@ class CryptoEngine:
                         _filter_results[ticker].passed_zscore = True
 
         # Counter-trend OFI filter: skip trades opposing the trend in trending regimes
+        # Daily (above/below) markets with TTE > 30m are EXEMPT.
         if (self._settings.regime_skip_counter_trend
             and self._current_regime is not None
             and self._current_regime.is_trending
@@ -1278,6 +1771,11 @@ class CryptoEngine:
             trend_dir = self._current_regime.trend_direction  # 1=up, -1=down
             ofi_filtered = []
             for edge in edges:
+                # Exempt daily markets from counter-trend filter
+                if (edge.market.meta.direction in ("above", "below")
+                        and edge.time_to_expiry_minutes > 30):
+                    ofi_filtered.append(edge)
+                    continue
                 direction = edge.market.meta.direction
                 if direction in ("above", "up"):
                     trade_dir = 1 if edge.side == "yes" else -1
@@ -1363,6 +1861,7 @@ class CryptoEngine:
         self._rec_edge_id_map = _rec_edge_id_map
         self._rec_filter_results_current = _filter_results
 
+        from arb_bot.crypto.strategy_cell import StrategyCell, get_cell_config as _get_cell_config
         trades_opened = 0
         for edge in edges:
             if len(self._positions) >= self._settings.max_concurrent_positions:
@@ -1373,11 +1872,38 @@ class CryptoEngine:
             if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
                 continue
 
-            contracts = self._compute_position_size(edge)
+            # Per-cell filtering and sizing
+            cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
+            cell_cfg = _get_cell_config(cell, self._settings) if cell else None
+
+            # Per-cell edge threshold
+            if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
+                LOGGER.info(
+                    "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
+                    edge.market.ticker, edge.edge_cents * 100,
+                    cell.value, cell_cfg.min_edge_pct * 100,
+                )
+                continue
+
+            # Per-cell signal gates
+            if cell is not None and cell_cfg is not None:
+                if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                    continue
+
+            # Quiet hours gate
+            if self._quiet_hours_gate(edge):
+                continue
+
+            # Classifier veto gate
+            vetoed, p_win, fv = self._classifier_veto(edge)
+            if vetoed:
+                continue
+
+            contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
             if contracts <= 0:
                 continue
 
-            self._execute_paper_trade(edge, contracts)
+            self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
             trades_opened += 1
 
         await self._settle_expired_positions()
@@ -1405,6 +1931,50 @@ class CryptoEngine:
             )
 
         return edges
+
+    # ── Adaptive VPIN thresholds ────────────────────────────────
+
+    def _get_vpin_thresholds(self, sym: str) -> tuple:
+        """Get effective (momentum_floor, halt_ceiling) for a symbol.
+
+        When adaptive thresholds are enabled and enough history has
+        accumulated, use percentile-based thresholds from the rolling
+        VPIN distribution.  Otherwise fall back to static config values.
+
+        Returns (momentum_floor, halt_ceiling, is_adaptive).
+        """
+        static_floor = self._settings.momentum_vpin_floor
+        static_ceiling = self._settings.momentum_vpin_ceiling
+        static_halt = self._settings.vpin_halt_threshold
+
+        if not self._settings.vpin_adaptive_enabled:
+            if self._settings.momentum_enabled:
+                return (static_floor, static_ceiling, False)
+            return (static_halt, static_halt, False)
+
+        calc = self._vpin_calculators.get(sym)
+        if calc is None or not hasattr(calc, "get_adaptive_momentum_thresholds"):
+            if self._settings.momentum_enabled:
+                return (static_floor, static_ceiling, False)
+            return (static_halt, static_halt, False)
+
+        momentum_t, halt_t = calc.get_adaptive_momentum_thresholds(
+            halt_percentile=self._settings.vpin_adaptive_halt_percentile,
+            momentum_percentile=self._settings.vpin_adaptive_momentum_percentile,
+            halt_floor=self._settings.vpin_adaptive_halt_floor,
+            halt_ceiling=self._settings.vpin_adaptive_halt_ceiling,
+            momentum_floor=self._settings.vpin_adaptive_momentum_floor,
+            momentum_ceiling=self._settings.vpin_adaptive_momentum_ceiling,
+            min_history=self._settings.vpin_adaptive_min_history,
+        )
+
+        if momentum_t is None or halt_t is None:
+            # Not enough history yet — fall back to static
+            if self._settings.momentum_enabled:
+                return (static_floor, static_ceiling, False)
+            return (static_halt, static_halt, False)
+
+        return (momentum_t, halt_t, True)
 
     # ── Regime detection ─────────────────────────────────────────
 
@@ -1669,6 +2239,34 @@ class CryptoEngine:
             if horizon <= 0:
                 continue
 
+            # ── Variance ratio vol correction (v43 — 1A) ──────────
+            # For daily contracts, adjust vol using variance ratio to
+            # account for mean-reversion that makes √T scaling inaccurate.
+            is_daily_contract = (
+                mq.market.meta.direction in ("above", "below")
+                and horizon > 20
+            )
+            if (
+                is_daily_contract
+                and self._settings.variance_ratio_enabled
+                and binance_sym
+            ):
+                vr_returns = self._price_feed.get_returns(
+                    binance_sym, interval_seconds=60,
+                    window_minutes=self._settings.mc_vol_window_minutes,
+                )
+                if len(vr_returns) >= self._settings.variance_ratio_min_samples:
+                    vr_q = max(2, round(horizon))
+                    vr = self._price_model.variance_ratio(vr_returns, vr_q)
+                    vol_before = vol
+                    vol = self._price_model.vol_with_variance_ratio_correction(
+                        vol, horizon, vr,
+                    )
+                    LOGGER.debug(
+                        "Vol correction: raw=%.1f%% VR(%d)=%.2f adjusted=%.1f%%",
+                        vol_before * 100, vr_q, vr, vol * 100,
+                    )
+
             # Volume clock: replace clock-time horizon with effective
             # horizon based on projected volume.  This adjusts BOTH the
             # diffusion variance (sigma^2 * dt) AND the expected jump
@@ -1736,14 +2334,29 @@ class CryptoEngine:
 
                 # Auto-calibrate bucket size on first use
                 if vpin_calc.bucket_volume <= 0:
-                    total_vol = self._price_feed.get_total_volume(
-                        binance_sym,
-                        window_seconds=self._settings.vpin_auto_calibrate_window_minutes * 60,
-                    )
-                    vpin_calc.auto_calibrate_bucket_size(
-                        total_volume=total_vol,
-                        window_minutes=float(self._settings.vpin_auto_calibrate_window_minutes),
-                    )
+                    # Per-symbol minimum bucket volumes — ensures each bucket
+                    # contains ~30 trades for meaningful VPIN.
+                    _min_bv = {"btcusdt": 0.10, "ethusdt": 1.0, "solusdt": 50.0}
+                    min_bv = _min_bv.get(binance_sym, 1.0)
+                    # Try trade-size calibration first
+                    buy_sells = self._price_feed._buy_sells.get(binance_sym, [])
+                    trade_sizes = [vol for _, vol, _ in buy_sells]
+                    if len(trade_sizes) >= 10:
+                        vpin_calc.calibrate_from_trades(
+                            trade_sizes=trade_sizes,
+                            trades_per_bucket=30,
+                            min_bucket_volume=min_bv,
+                        )
+                    else:
+                        total_vol = self._price_feed.get_total_volume(
+                            binance_sym,
+                            window_seconds=self._settings.vpin_auto_calibrate_window_minutes * 60,
+                        )
+                        vpin_calc.auto_calibrate_bucket_size(
+                            total_volume=total_vol,
+                            window_minutes=float(self._settings.vpin_auto_calibrate_window_minutes),
+                            min_bucket_volume=min_bv,
+                        )
 
                 vpin = vpin_calc.get_vpin()
                 signed_vpin = vpin_calc.get_signed_vpin()
@@ -1771,6 +2384,44 @@ class CryptoEngine:
             # Clamp total drift to prevent extreme model predictions
             max_drift = self._settings.max_total_drift
             drift = max(-max_drift, min(max_drift, drift))
+
+            # ── v43 Daily model routing ──────────────────────────────
+            # For daily contracts (above/below, TTE > 20min), use the
+            # dedicated daily pricing model with regime-aware routing
+            # instead of the standard MC/empirical/student-t pipeline.
+            direction = mq.market.meta.direction
+            if direction not in self._settings.allowed_directions:
+                continue
+            strike = mq.market.meta.strike
+
+            if is_daily_contract and self._settings.daily_model_enabled:
+                # OFI weight reversal for daily contracts (2C)
+                if self._settings.ofi_enabled and self._settings.multiscale_ofi_enabled and binance_sym:
+                    ms_windows = [int(w) for w in self._settings.multiscale_ofi_windows.split(",")]
+                    daily_weights = [float(w) for w in self._settings.daily_ofi_weights.split(",")]
+                    ofi_multi = self._price_feed.get_ofi_multiscale(binance_sym, ms_windows)
+                    # Re-weight OFI using daily-specific weights (longer timescales matter more)
+                    cal_result = self._get_ofi_calibration()
+                    alpha = cal_result.alpha if cal_result.alpha != 0 else self._settings.ofi_alpha
+                    daily_ofi = sum(ofi_multi.get(w, 0.0) * wt for w, wt in zip(ms_windows, daily_weights))
+                    ofi_drift_correction = self._apply_ofi_impact(daily_ofi, alpha) - (drift if self._settings.ofi_enabled else 0.0)
+                    # Only apply the difference (since drift already has 15min-weighted OFI)
+                    drift += ofi_drift_correction * 0.5  # partial correction
+
+                if strike is not None and direction in ("above", "below"):
+                    daily_prob = self._compute_daily_probability(
+                        current_price=current_price,
+                        strike=strike,
+                        direction=direction,
+                        horizon_minutes=horizon,
+                        vol=vol,
+                        drift=drift,
+                        binance_sym=binance_sym,
+                    )
+                    if daily_prob is not None:
+                        result[mq.market.ticker] = daily_prob
+                        continue
+                    # Fall through to standard pipeline if daily model returns None
 
             # ── Probability computation: MC or Student-t ──────────
             use_mc = self._settings.probability_model in ("mc_gbm", "ab_test", "ab_empirical")
@@ -1853,7 +2504,7 @@ class CryptoEngine:
                     binance_sym, interval_seconds=60,
                     window_minutes=self._settings.mc_vol_window_minutes,
                 )
-                vol_stderr = self._price_model.estimate_vol_stderr(vol_returns, 60)
+                vol_stderr = self._price_model.estimate_vol_stderr(vol_returns)
 
                 if direction == "above" and strike is not None:
                     st_prob = self._price_model.probability_above_student_t(
@@ -1911,6 +2562,15 @@ class CryptoEngine:
                 emp_returns = self._get_regime_adjusted_empirical_returns(binance_sym)
                 interval_sec = self._settings.empirical_return_interval_seconds
                 horizon_steps = max(1, round(horizon * 60 / interval_sec))
+                if len(emp_returns) < self._settings.empirical_min_samples:
+                    LOGGER.info(
+                        "CryptoEngine: empirical fallback for %s: "
+                        "only %d returns (need %d), regime=%s",
+                        mq.market.ticker, len(emp_returns),
+                        self._settings.empirical_min_samples,
+                        getattr(self._current_regime, 'regime', 'none')
+                        if self._current_regime else 'none',
+                    )
 
                 if direction == "above" and strike is not None:
                     emp_prob = self._price_model.probability_above_empirical(
@@ -1967,9 +2627,13 @@ class CryptoEngine:
                         num_paths=up.num_paths,
                     )
 
-            # Always store empirical prob for feature store (classifier training)
+            # Always store all model probs for feature store + ensemble
             if emp_prob is not None:
                 self._ab_empirical_probs[mq.market.ticker] = emp_prob
+            if mc_prob is not None:
+                self._ab_mc_probs[mq.market.ticker] = mc_prob
+            if st_prob is not None:
+                self._ab_student_t_probs[mq.market.ticker] = st_prob
 
             # Select which probability to use for trading
             if self._settings.probability_model == "student_t":
@@ -1978,8 +2642,6 @@ class CryptoEngine:
                 prob = emp_prob
             elif self._settings.probability_model == "ab_test":
                 prob = mc_prob  # Trade on MC, but log Student-t
-                if st_prob is not None:
-                    self._ab_student_t_probs[mq.market.ticker] = st_prob
             elif self._settings.probability_model == "ab_empirical":
                 prob = mc_prob  # Trade on MC, but log empirical
             else:
@@ -2077,13 +2739,1003 @@ class CryptoEngine:
                     num_paths=prob.num_paths,
                 )
 
+            # ── Model probability cap (v43 Fix A) ──────────────────
+            # Prevent empirical model from saturating at 0.0/1.0 which
+            # causes Kelly to massively oversize on false confidence.
+            cap = self._settings.model_prob_cap
+            floor = self._settings.model_prob_floor
+            if cap < 1.0 or floor > 0.0:
+                raw_p = prob.probability
+                capped_p = max(floor, min(cap, raw_p))
+                if capped_p != raw_p:
+                    LOGGER.debug(
+                        "Prob cap on %s: %.3f → %.3f",
+                        mq.market.ticker, raw_p, capped_p,
+                    )
+                    prob = ProbabilityEstimate(
+                        probability=capped_p,
+                        ci_lower=max(0.0, capped_p - prob.uncertainty),
+                        ci_upper=min(1.0, capped_p + prob.uncertainty),
+                        uncertainty=prob.uncertainty,
+                        num_paths=prob.num_paths,
+                    )
+
             result[mq.market.ticker] = prob
 
         return result
 
+    # ── Strategy cell logic ──────────────────────────────────────
+
+    def _apply_cell_model_adjustments(
+        self, edges: list[CryptoEdge],
+    ) -> list[CryptoEdge]:
+        """Apply per-cell model adjustments: vol dampening, blending, haircut.
+
+        Three-layer per-cell model correction:
+        1. Vol dampening: Recompute empirical bootstrap with dampened returns
+           (fixes root cause of YES overconfidence — IID bootstrap ignores
+           mean-reversion in 1-min returns).
+        2. Re-blend with per-cell model weight (adjusts market vs model deference).
+        3. Probability haircut (residual correction).
+
+        Classifies each edge into a strategy cell, applies corrections,
+        and recalculates edge.  Edges that flip negative are dropped.
+
+        Modifies edges in-place via ``object.__setattr__`` (frozen dataclass).
+        """
+        from arb_bot.crypto.strategy_cell import StrategyCell, classify_cell, get_cell_config
+        from arb_bot.crypto.edge_detector import blend_probabilities
+
+        adjusted: list[CryptoEdge] = []
+        for edge in edges:
+            is_daily = (
+                edge.market.meta.direction in ("above", "below")
+                and edge.time_to_expiry_minutes > 30
+            )
+            cell = classify_cell(edge.side, is_daily)
+            cell_cfg = get_cell_config(cell, self._settings)
+
+            # Tag edge with cell label (for feature store + logging)
+            object.__setattr__(edge, "strategy_cell", cell.value)
+
+            # ── Layer 0: Per-cell probability model override ──
+            # If cell specifies a different probability model than global,
+            # recompute the probability using the cell's preferred model.
+            cell_prob_model = cell_cfg.probability_model
+            global_prob_model = self._settings.probability_model
+            needs_model_switch = (
+                cell_prob_model
+                and cell_prob_model != global_prob_model
+            )
+
+            model_prob = edge.model_prob.probability
+            model_unc = edge.model_uncertainty
+
+            if needs_model_switch:
+                recomputed = None
+                if cell_prob_model == "mc_gbm":
+                    recomputed = self._recompute_with_mc_gbm(
+                        edge, cell_cfg.uncertainty_multiplier,
+                    )
+                elif cell_prob_model == "empirical":
+                    # Recompute with empirical bootstrap (use vol_dampening=1.0
+                    # here; actual dampening applied in Layer 1 if needed)
+                    recomputed = self._recompute_with_vol_dampening(
+                        edge, 1.0, cell_cfg.uncertainty_multiplier,
+                    )
+
+                if recomputed is not None:
+                    model_prob = recomputed.probability
+                    model_unc = recomputed.uncertainty
+                    LOGGER.info(
+                        "CryptoEngine: cell probability model override %s "
+                        "(%s→%s): prob %.1f%%→%.1f%%",
+                        edge.market.ticker, global_prob_model, cell_prob_model,
+                        edge.model_prob.probability * 100, model_prob * 100,
+                    )
+
+            # Determine if any further correction is needed
+            needs_vol_dampening = (
+                abs(cell_cfg.vol_dampening - 1.0) > 0.001
+                and not needs_model_switch  # Already recomputed above
+            )
+            needs_reblend = (
+                abs(cell_cfg.model_weight - 0.7) > 0.001
+                or abs(cell_cfg.prob_haircut - 1.0) > 0.001
+            )
+
+            if not needs_vol_dampening and not needs_reblend and not needs_model_switch:
+                adjusted.append(edge)
+                continue
+
+            # ── Layer 1: Vol dampening (recompute probability) ──
+            if needs_vol_dampening:
+                dampened = self._recompute_with_vol_dampening(
+                    edge, cell_cfg.vol_dampening,
+                    cell_cfg.uncertainty_multiplier,
+                )
+                if dampened is not None:
+                    model_prob = dampened.probability
+                    model_unc = dampened.uncertainty
+                    LOGGER.info(
+                        "CryptoEngine: vol dampening %s (%.2f): "
+                        "prob %.1f%%→%.1f%%, unc %.3f→%.3f",
+                        edge.market.ticker, cell_cfg.vol_dampening,
+                        edge.model_prob.probability * 100, model_prob * 100,
+                        edge.model_uncertainty, model_unc,
+                    )
+
+            # ── Layer 2: Re-blend with per-cell weight ──
+            new_blended = blend_probabilities(
+                model_prob=model_prob,
+                market_prob=edge.market_implied_prob,
+                model_uncertainty=model_unc,
+                base_model_weight=cell_cfg.model_weight,
+            )
+
+            # ── Layer 3: Probability haircut ──
+            new_blended *= cell_cfg.prob_haircut
+            new_blended = max(0.01, min(0.99, new_blended))
+
+            # Recalculate effective edge
+            if edge.side == "yes":
+                new_edge = new_blended - edge.yes_buy_price
+            else:
+                new_edge = (1.0 - new_blended) - edge.no_buy_price
+
+            # Drop if edge flipped negative
+            if new_edge <= 0:
+                LOGGER.info(
+                    "CryptoEngine: cell model correction killed edge on %s "
+                    "(%s: blended %.1f%%→%.1f%%, edge %.1f%%→%.1f%%, "
+                    "dampening=%.2f)",
+                    edge.market.ticker, cell.value,
+                    edge.blended_probability * 100, new_blended * 100,
+                    edge.edge_cents * 100, new_edge * 100,
+                    cell_cfg.vol_dampening,
+                )
+                continue
+
+            # Update edge fields in-place
+            object.__setattr__(edge, "blended_probability", new_blended)
+            object.__setattr__(edge, "edge_cents", new_edge)
+            object.__setattr__(
+                edge, "edge", new_blended - edge.market_implied_prob,
+            )
+            adjusted.append(edge)
+
+        return adjusted
+
+    def _recompute_with_vol_dampening(
+        self,
+        edge: CryptoEdge,
+        vol_dampening: float,
+        uncertainty_multiplier: float,
+    ) -> Optional[ProbabilityEstimate]:
+        """Recompute empirical probability with vol-dampened returns.
+
+        Re-runs the bootstrap with each resampled return scaled by
+        ``vol_dampening`` to model mean-reversion the IID bootstrap misses.
+
+        Returns ``None`` if recomputation isn't possible (missing data).
+        """
+        meta = edge.market.meta
+        underlying = meta.underlying
+        direction = meta.direction
+        strike = meta.strike
+
+        # Map Kalshi underlying to Binance symbol
+        binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+        if not binance_sym:
+            return None
+
+        # Get current price
+        current_price = self._price_feed.get_current_price(binance_sym)
+        if current_price is None or current_price <= 0:
+            return None
+
+        # Get returns (regime-adjusted)
+        emp_returns = self._get_regime_adjusted_empirical_returns(binance_sym)
+        if len(emp_returns) < self._settings.empirical_min_samples:
+            return None
+
+        # Compute horizon steps
+        horizon = edge.time_to_expiry_minutes
+        interval_sec = self._settings.empirical_return_interval_seconds
+        horizon_steps = max(1, round(horizon * 60 / interval_sec))
+
+        # Determine effective strike for up/down contracts
+        effective_strike = strike
+        if direction in ("up", "down"):
+            effective_strike = current_price
+            if meta.interval_start_time is not None:
+                start_ts = meta.interval_start_time.timestamp()
+                looked_up = self._price_feed.get_price_at_time(
+                    binance_sym, start_ts,
+                )
+                if looked_up is not None:
+                    effective_strike = looked_up
+
+        if effective_strike is None or effective_strike <= 0:
+            return None
+
+        # Run vol-dampened empirical bootstrap
+        raw_est = self._price_model.probability_above_empirical(
+            emp_returns, current_price, effective_strike, horizon_steps,
+            bootstrap_paths=self._settings.empirical_bootstrap_paths,
+            min_samples=self._settings.empirical_min_samples,
+            min_uncertainty=self._settings.empirical_min_uncertainty,
+            vol_dampening=vol_dampening,
+        )
+
+        # For below/down, invert
+        if direction in ("below", "down"):
+            raw_est = ProbabilityEstimate(
+                probability=1.0 - raw_est.probability,
+                ci_lower=1.0 - raw_est.ci_upper,
+                ci_upper=1.0 - raw_est.ci_lower,
+                uncertainty=raw_est.uncertainty,
+                num_paths=raw_est.num_paths,
+            )
+
+        # Apply per-cell uncertainty multiplier
+        scaled_unc = raw_est.uncertainty * uncertainty_multiplier
+        return ProbabilityEstimate(
+            probability=raw_est.probability,
+            ci_lower=max(0.0, raw_est.probability - scaled_unc),
+            ci_upper=min(1.0, raw_est.probability + scaled_unc),
+            uncertainty=scaled_unc,
+            num_paths=raw_est.num_paths,
+        )
+
+    def _recompute_with_mc_gbm(
+        self,
+        edge: CryptoEdge,
+        uncertainty_multiplier: float,
+    ) -> Optional[ProbabilityEstimate]:
+        """Recompute probability using MC GBM paths instead of empirical bootstrap.
+
+        Used when a cell's probability_model overrides the global setting to
+        ``mc_gbm``.  Generates fresh GBM paths (with jump diffusion if enabled)
+        and computes P(above/below/up/down) from the terminal distribution.
+
+        Returns ``None`` if recomputation isn't possible (missing data).
+        """
+        meta = edge.market.meta
+        underlying = meta.underlying
+        direction = meta.direction
+        strike = meta.strike
+
+        # Map Kalshi underlying to Binance symbol
+        binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+        if not binance_sym:
+            return None
+
+        # Get current price
+        current_price = self._price_feed.get_current_price(binance_sym)
+        if current_price is None or current_price <= 0:
+            return None
+
+        # Get volatility
+        vol_returns = self._price_feed.get_returns(
+            binance_sym,
+            window_minutes=self._settings.mc_vol_window_minutes,
+            interval_seconds=60,
+        )
+        if len(vol_returns) < 5:
+            return None
+
+        vol = self._price_model.estimate_volatility(
+            vol_returns,
+            interval_seconds=60,
+            method=self._settings.mc_vol_method,
+        )
+        if vol <= 0:
+            return None
+
+        horizon = edge.time_to_expiry_minutes
+
+        # Generate paths (jump-diffusion or plain GBM)
+        drift = 0.0  # Use zero drift for simplicity in per-cell override
+        if self._settings.use_jump_diffusion:
+            if self._settings.hawkes_enabled:
+                import time as _time
+                dynamic_intensity = self._hawkes.intensity(_time.monotonic())
+            else:
+                dynamic_intensity = self._settings.mc_jump_intensity
+            paths = self._price_model.generate_paths_jump_diffusion(
+                current_price, vol, horizon, drift=drift,
+                jump_intensity=dynamic_intensity,
+                jump_mean=self._settings.mc_jump_mean,
+                jump_vol=self._settings.mc_jump_vol,
+            )
+        else:
+            paths = self._price_model.generate_paths(
+                current_price, vol, horizon, drift=drift,
+            )
+
+        # Compute probability based on direction
+        if direction == "above" and strike is not None:
+            raw_est = self._price_model.probability_above_with_control_variate(
+                paths, strike, current_price, vol, horizon, drift,
+            )
+        elif direction == "below" and strike is not None:
+            raw_est = self._price_model.probability_below(paths, strike)
+        elif direction == "up":
+            ref_price = current_price
+            if meta.interval_start_time is not None:
+                start_ts = meta.interval_start_time.timestamp()
+                looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                if looked_up is not None:
+                    ref_price = looked_up
+            raw_est = self._price_model.probability_up(paths, ref_price)
+        elif direction == "down":
+            ref_price = current_price
+            if meta.interval_start_time is not None:
+                start_ts = meta.interval_start_time.timestamp()
+                looked_up = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                if looked_up is not None:
+                    ref_price = looked_up
+            up = self._price_model.probability_up(paths, ref_price)
+            raw_est = ProbabilityEstimate(
+                probability=1.0 - up.probability,
+                ci_lower=1.0 - up.ci_upper,
+                ci_upper=1.0 - up.ci_lower,
+                uncertainty=up.uncertainty,
+                num_paths=up.num_paths,
+            )
+        else:
+            return None
+
+        # Apply per-cell uncertainty multiplier
+        scaled_unc = raw_est.uncertainty * uncertainty_multiplier
+        return ProbabilityEstimate(
+            probability=raw_est.probability,
+            ci_lower=max(0.0, raw_est.probability - scaled_unc),
+            ci_upper=min(1.0, raw_est.probability + scaled_unc),
+            uncertainty=scaled_unc,
+            num_paths=raw_est.num_paths,
+        )
+
+    def _compute_daily_probability(
+        self,
+        current_price: float,
+        strike: float,
+        direction: str,
+        horizon_minutes: float,
+        vol: float,
+        drift: float,
+        binance_sym: str,
+    ) -> Optional[ProbabilityEstimate]:
+        """Dedicated daily contract pricing with regime-aware model routing.
+
+        Uses Merton jump-diffusion, OU mean-reversion, and GBM with
+        proper drift, blended according to the current market regime
+        and strike distance (moneyness).
+
+        Parameters
+        ----------
+        current_price:
+            Current spot price.
+        strike:
+            Settlement strike price.
+        direction:
+            Contract direction ("above" or "below").
+        horizon_minutes:
+            Time to expiry in minutes.
+        vol:
+            Annualized volatility (already VR-corrected if enabled).
+        drift:
+            Total assembled drift from all sources.
+        binance_sym:
+            Binance symbol for price feed lookups.
+
+        Returns ProbabilityEstimate or None if inputs are degenerate.
+        """
+        from arb_bot.crypto.regime_detector import MEAN_REVERTING, HIGH_VOL
+
+        if current_price <= 0 or strike <= 0 or vol <= 0 or horizon_minutes <= 0:
+            return None
+
+        settings = self._settings
+        dt = horizon_minutes / (365.25 * 24.0 * 60.0)
+        sqrt_dt = math.sqrt(dt)
+
+        # ── Moneyness in vol units ────────────────────────────────
+        moneyness = abs(math.log(current_price / strike)) / (vol * sqrt_dt) if vol * sqrt_dt > 0 else 0.0
+
+        # ── Jump intensity from Hawkes (or default) ──────────────
+        if settings.hawkes_enabled:
+            lambda_daily = self._hawkes.intensity(time.monotonic())
+        else:
+            lambda_daily = settings.merton_default_intensity
+
+        # ── Component model probabilities ─────────────────────────
+
+        # 1. Merton jump-diffusion (always computed — handles tails)
+        merton_est = self._price_model.probability_above_merton_series(
+            current_price, strike, vol, horizon_minutes,
+            drift=drift,
+            lambda_daily=lambda_daily,
+            jump_mean=settings.merton_jump_mean,
+            jump_vol=settings.merton_jump_vol,
+            n_terms=settings.merton_n_terms,
+        )
+
+        # 2. OU mean-reversion model
+        ou_est = None
+        returns_1min = self._price_feed.get_returns(
+            binance_sym, interval_seconds=60,
+            window_minutes=settings.mc_vol_window_minutes,
+        )
+        ou_params = self._price_model.estimate_ou_params(returns_1min, interval_seconds=60)
+        if ou_params is not None:
+            theta, mu_ou, sigma_ou = ou_params
+            # Adjust mu with drift signal
+            mu_adjusted = mu_ou + drift * dt
+            ou_est = self._price_model.probability_above_ou(
+                current_price, strike, horizon_minutes,
+                theta=theta, mu=mu_adjusted, sigma=sigma_ou,
+            )
+
+        # 3. GBM analytical (uses real drift, not drift=0)
+        gbm_prob = self._price_model.probability_above_analytical(
+            current_price, strike, vol, horizon_minutes, drift=drift,
+        )
+        gbm_est = ProbabilityEstimate(
+            probability=gbm_prob,
+            ci_lower=max(0.0, gbm_prob - 0.03),
+            ci_upper=min(1.0, gbm_prob + 0.03),
+            uncertainty=0.03,
+            num_paths=0,
+        )
+
+        # ── Model routing by regime × moneyness ──────────────────
+        regime = self._current_regime
+        deep_threshold = settings.daily_moneyness_deep_threshold
+        atm_threshold = settings.daily_moneyness_atm_threshold
+
+        if moneyness > deep_threshold:
+            # Deep OTM/ITM: Merton dominates (tails matter most)
+            w_merton = settings.daily_merton_weight_deep
+            w_ou = (1.0 - w_merton) * 0.5
+            w_gbm = (1.0 - w_merton) * 0.5
+        elif regime is not None and regime.regime == MEAN_REVERTING:
+            # Mean-reverting: OU dominates
+            w_ou = settings.daily_ou_weight_mean_reverting
+            w_merton = (1.0 - w_ou) * 0.5
+            w_gbm = (1.0 - w_ou) * 0.5
+        elif regime is not None and regime.is_trending:
+            # Trending: GBM dominates (drift matters)
+            w_gbm = settings.daily_gbm_weight_trending
+            w_merton = (1.0 - w_gbm) * 0.5
+            w_ou = (1.0 - w_gbm) * 0.5
+        elif moneyness < atm_threshold:
+            # Near ATM, no strong regime: equal weight
+            w_merton = 1.0 / 3.0
+            w_ou = 1.0 / 3.0
+            w_gbm = 1.0 / 3.0
+        else:
+            # Default: slight Merton bias
+            w_merton = 0.4
+            w_ou = 0.3
+            w_gbm = 0.3
+
+        # If OU not available, redistribute its weight
+        if ou_est is None:
+            w_gbm += w_ou * 0.5
+            w_merton += w_ou * 0.5
+            w_ou = 0.0
+
+        # ── Soft regime transition blending ───────────────────────
+        if regime is not None and regime.is_transitioning:
+            tau = settings.daily_regime_transition_tau_minutes
+            # Blend toward equal weights during transitions
+            blend = 0.5  # half-way blend during transition
+            eq = 1.0 / 3.0
+            w_merton = w_merton * (1.0 - blend) + eq * blend
+            w_ou = w_ou * (1.0 - blend) + eq * blend
+            w_gbm = w_gbm * (1.0 - blend) + eq * blend
+
+        # Normalize weights
+        total_w = w_merton + w_ou + w_gbm
+        if total_w > 0:
+            w_merton /= total_w
+            w_ou /= total_w
+            w_gbm /= total_w
+
+        # ── Weighted blend ────────────────────────────────────────
+        p_above = (
+            w_merton * merton_est.probability
+            + w_gbm * gbm_est.probability
+            + (w_ou * ou_est.probability if ou_est is not None else 0.0)
+        )
+
+        # Uncertainty from model disagreement + component uncertainties
+        probs_available = [merton_est.probability, gbm_est.probability]
+        if ou_est is not None:
+            probs_available.append(ou_est.probability)
+        model_spread = max(probs_available) - min(probs_available)
+        blended_unc = max(0.02, model_spread * 0.3 + 0.01)
+
+        # ── Probability floors/ceilings (1C) ─────────────────────
+        if settings.probability_floor_enabled:
+            floor, ceiling = self._price_model.compute_probability_bounds(
+                lambda_daily=lambda_daily,
+                horizon_minutes=horizon_minutes,
+                volatility=vol,
+                moneyness_sigma=moneyness,
+                jump_vol=settings.merton_jump_vol,
+                floor_min=settings.probability_floor_min,
+                ceiling_max=settings.probability_ceiling_max,
+            )
+            p_above = self._price_model.clamp_probability(p_above, floor, ceiling)
+
+        # ── Direction handling ────────────────────────────────────
+        if direction == "above":
+            final_prob = p_above
+        elif direction == "below":
+            final_prob = 1.0 - p_above
+        else:
+            return None
+
+        final_prob = max(0.0, min(1.0, final_prob))
+
+        LOGGER.info(
+            "DailyModel %s: P=%.3f (merton=%.3f×%.2f, gbm=%.3f×%.2f, ou=%s×%.2f) "
+            "m=%.1fσ regime=%s λ=%.1f vol=%.1f%% drift=%.4f",
+            direction, final_prob,
+            merton_est.probability, w_merton,
+            gbm_est.probability, w_gbm,
+            f"{ou_est.probability:.3f}" if ou_est else "N/A", w_ou,
+            moneyness,
+            regime.regime if regime else "none",
+            lambda_daily, vol * 100, drift,
+        )
+
+        return ProbabilityEstimate(
+            probability=final_prob,
+            ci_lower=max(0.0, final_prob - blended_unc),
+            ci_upper=min(1.0, final_prob + blended_unc),
+            uncertainty=blended_unc,
+            num_paths=0,
+        )
+
+    def _compute_ensemble_probability(
+        self,
+        edge: CryptoEdge,
+        is_yes: bool,
+    ) -> tuple[float, float]:
+        """Compute weighted ensemble probability from all 3 models.
+
+        Returns (ensemble_prob, model_disagreement).
+        model_disagreement = max - min across available model probabilities.
+
+        Falls back to the primary model if fewer than 2 models are available.
+        """
+        ticker = edge.market.ticker
+
+        # Collect available model probabilities
+        probs: Dict[str, float] = {}
+        if ticker in self._ab_mc_probs:
+            probs["mc_gbm"] = self._ab_mc_probs[ticker].probability
+        if ticker in self._ab_empirical_probs:
+            probs["empirical"] = self._ab_empirical_probs[ticker].probability
+        if ticker in self._ab_student_t_probs:
+            probs["student_t"] = self._ab_student_t_probs[ticker].probability
+
+        # Model disagreement (even if ensemble is disabled — always capture)
+        if len(probs) >= 2:
+            disagreement = max(probs.values()) - min(probs.values())
+        else:
+            disagreement = 0.0
+
+        # If ensemble disabled or fewer than 2 models, return primary model
+        if not self._settings.ensemble_enabled or len(probs) < 2:
+            return edge.model_prob.probability, disagreement
+
+        # Select weights based on YES/NO cell
+        if is_yes:
+            weights = {
+                "empirical": self._settings.ensemble_weight_empirical_yes,
+                "student_t": self._settings.ensemble_weight_student_t_yes,
+                "mc_gbm": self._settings.ensemble_weight_mc_gbm_yes,
+            }
+        else:
+            weights = {
+                "empirical": self._settings.ensemble_weight_empirical_no,
+                "student_t": self._settings.ensemble_weight_student_t_no,
+                "mc_gbm": self._settings.ensemble_weight_mc_gbm_no,
+            }
+
+        # Weighted average (normalize weights for available models only)
+        total_weight = sum(weights.get(k, 0.0) for k in probs)
+        if total_weight <= 0:
+            return edge.model_prob.probability, disagreement
+
+        ensemble_prob = sum(
+            probs[k] * weights.get(k, 0.0) for k in probs
+        ) / total_weight
+
+        ensemble_prob = max(0.01, min(0.99, ensemble_prob))
+
+        LOGGER.debug(
+            "CryptoEngine: ensemble %s: %s → %.1f%% (disagreement %.1f%%)",
+            ticker,
+            {k: f"{v*100:.1f}%" for k, v in probs.items()},
+            ensemble_prob * 100,
+            disagreement * 100,
+        )
+
+        return ensemble_prob, disagreement
+
+    def _compute_iv_crosscheck(
+        self,
+        edge: CryptoEdge,
+        model_vol: float,
+    ) -> tuple[float, float | None]:
+        """IV cross-check: compare model vol against market-implied vol.
+
+        Returns (edge_multiplier, iv_rv_ratio).
+        edge_multiplier: 1.0 = no change, <1.0 = dampen, >1.0 = boost.
+        iv_rv_ratio: IV/RV ratio for feature store, or None if IV unavailable.
+        """
+        if not self._settings.iv_crosscheck_enabled or model_vol <= 0:
+            return 1.0, None
+
+        # Extract IV from current Kalshi quotes for this contract
+        # We use the current edge's market price as the binary option price
+        market_price = edge.yes_buy_price if edge.side == "yes" else edge.no_buy_price
+        if market_price is None or market_price <= 0:
+            return 1.0, None
+
+        meta = edge.market.meta
+        iv = self._price_model.extract_implied_vol(
+            market_price=market_price,
+            strike=meta.strike or 0,
+            spot=self._price_feed.get_current_price(
+                _KALSHI_TO_BINANCE.get(meta.underlying, "")
+            ) or 0,
+            tte_minutes=edge.time_to_expiry_minutes,
+            direction="above" if meta.direction in ("above", "up") else "below",
+        )
+
+        if iv is None:
+            return 1.0, None
+
+        iv_rv_ratio = iv / model_vol
+
+        # Apply dampen/boost based on ratio
+        multiplier = 1.0
+        if iv_rv_ratio > self._settings.iv_crosscheck_dampen_threshold:
+            multiplier = self._settings.iv_crosscheck_dampen_factor
+            LOGGER.info(
+                "CryptoEngine: IV cross-check DAMPEN %s: IV=%.1f%% vs model=%.1f%% "
+                "(ratio=%.2f > %.2f), edge×%.2f",
+                edge.market.ticker, iv * 100, model_vol * 100,
+                iv_rv_ratio, self._settings.iv_crosscheck_dampen_threshold,
+                multiplier,
+            )
+        elif iv_rv_ratio < self._settings.iv_crosscheck_boost_threshold:
+            multiplier = self._settings.iv_crosscheck_boost_factor
+            LOGGER.info(
+                "CryptoEngine: IV cross-check BOOST %s: IV=%.1f%% vs model=%.1f%% "
+                "(ratio=%.2f < %.2f), edge×%.2f",
+                edge.market.ticker, iv * 100, model_vol * 100,
+                iv_rv_ratio, self._settings.iv_crosscheck_boost_threshold,
+                multiplier,
+            )
+
+        return multiplier, iv_rv_ratio
+
+    def _update_funding_persistence(self, binance_sym: str) -> int:
+        """Track how many consecutive intervals funding rate stays same-sign.
+
+        Returns the current persistence count.
+        """
+        if self._funding_tracker is None:
+            return 0
+
+        funding_sym = binance_sym.upper()
+        rate = self._funding_tracker.get_current_rate(funding_sym)
+        if rate is None:
+            return self._funding_sign_persistence.get(funding_sym, 0)
+
+        # Determine current sign
+        if rate > 0.0001:
+            current_sign = 1
+        elif rate < -0.0001:
+            current_sign = -1
+        else:
+            current_sign = 0
+
+        last_sign = self._funding_last_sign.get(funding_sym, 0)
+        if current_sign == last_sign and current_sign != 0:
+            self._funding_sign_persistence[funding_sym] = (
+                self._funding_sign_persistence.get(funding_sym, 0) + 1
+            )
+        else:
+            self._funding_sign_persistence[funding_sym] = 1 if current_sign != 0 else 0
+
+        self._funding_last_sign[funding_sym] = current_sign
+        return self._funding_sign_persistence.get(funding_sym, 0)
+
+    def _get_cell_rolling_stats(
+        self, cell_name: str,
+    ) -> tuple[float, float, int]:
+        """Get rolling win rate, PnL, and 24h trade count for a cell.
+
+        Returns (win_rate, rolling_pnl, trades_24h).
+        """
+        outcomes = self._cell_outcomes.get(cell_name)
+        if not outcomes or len(outcomes) == 0:
+            return 0.0, 0.0, 0
+
+        now = time.time()
+        wins = sum(1 for _, _, won in outcomes if won)
+        win_rate = wins / len(outcomes) if len(outcomes) > 0 else 0.0
+        rolling_pnl = sum(pnl for _, pnl, _ in outcomes)
+        trades_24h = sum(1 for ts, _, _ in outcomes if now - ts < 86400)
+
+        return win_rate, rolling_pnl, trades_24h
+
+    def _record_cell_outcome(
+        self, cell_name: str, pnl: float, won: bool,
+    ) -> None:
+        """Record a settled trade outcome for per-cell rolling stats."""
+        from collections import deque
+        if cell_name not in self._cell_outcomes:
+            self._cell_outcomes[cell_name] = deque(maxlen=self._cell_outcome_window)
+        self._cell_outcomes[cell_name].append((time.time(), pnl, won))
+
+    def _passes_cell_signal_gates(
+        self,
+        edge: CryptoEdge,
+        cell: "StrategyCell",
+        cell_cfg: "CellConfig",
+    ) -> bool:
+        """Check per-cell signal requirements.
+
+        Returns True if the edge passes all gates for its cell.
+        """
+        underlying = edge.market.meta.underlying
+        binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+
+        # Gate 1: OFI alignment (e.g. YES/15min)
+        if cell_cfg.require_ofi_alignment and binance_sym:
+            ofi = self._price_feed.get_ofi_multiscale(binance_sym, [30, 60, 120])
+            weighted_ofi = (
+                0.5 * ofi.get(30, 0.0)
+                + 0.3 * ofi.get(60, 0.0)
+                + 0.2 * ofi.get(120, 0.0)
+            )
+            # For YES above/up: need positive OFI (buying pressure)
+            # For YES below/down: need negative OFI (selling pressure)
+            direction = edge.market.meta.direction
+            if direction in ("above", "up"):
+                if weighted_ofi < cell_cfg.ofi_alignment_min:
+                    LOGGER.info(
+                        "CryptoEngine: cell OFI reject %s (%s) — OFI=%.2f < %.2f",
+                        edge.market.ticker, cell.value,
+                        weighted_ofi, cell_cfg.ofi_alignment_min,
+                    )
+                    return False
+            elif direction in ("below", "down"):
+                if weighted_ofi > -cell_cfg.ofi_alignment_min:
+                    LOGGER.info(
+                        "CryptoEngine: cell OFI reject %s (%s) — OFI=%.2f > -%.2f",
+                        edge.market.ticker, cell.value,
+                        weighted_ofi, cell_cfg.ofi_alignment_min,
+                    )
+                    return False
+
+        # Gate 2: Price past strike (e.g. YES/15min)
+        if cell_cfg.require_price_past_strike and binance_sym:
+            spot = self._price_feed.get_current_price(binance_sym)
+            strike = edge.market.meta.strike
+            if spot is not None and strike is not None:
+                direction = edge.market.meta.direction
+                # "above" YES: spot should be > strike
+                if direction in ("above", "up") and spot < strike:
+                    LOGGER.info(
+                        "CryptoEngine: cell price-gate reject %s (%s) — "
+                        "spot %.2f < strike %.2f",
+                        edge.market.ticker, cell.value, spot, strike,
+                    )
+                    return False
+                # "below" YES: spot should be < strike
+                if direction in ("below", "down") and spot > strike:
+                    LOGGER.info(
+                        "CryptoEngine: cell price-gate reject %s (%s) — "
+                        "spot %.2f > strike %.2f",
+                        edge.market.ticker, cell.value, spot, strike,
+                    )
+                    return False
+
+        # Gate 3: Trend confirmation (e.g. YES/daily)
+        if cell_cfg.require_trend_confirmation and binance_sym:
+            window_sec = int(cell_cfg.trend_window_minutes * 60)
+            returns = self._price_feed.get_returns(binance_sym, window_sec, 5)
+            if len(returns) >= 2:
+                cumulative_return = sum(returns)
+                direction = edge.market.meta.direction
+                # "above" YES: need positive trend
+                if direction in ("above", "up") and cumulative_return <= 0:
+                    LOGGER.info(
+                        "CryptoEngine: cell trend reject %s (%s) — "
+                        "return=%.4f not positive",
+                        edge.market.ticker, cell.value, cumulative_return,
+                    )
+                    return False
+                # "below" YES: need negative trend
+                if direction in ("below", "down") and cumulative_return >= 0:
+                    LOGGER.info(
+                        "CryptoEngine: cell trend reject %s (%s) — "
+                        "return=%.4f not negative",
+                        edge.market.ticker, cell.value, cumulative_return,
+                    )
+                    return False
+
+        return True
+
+    # ── Online recalibration ─────────────────────────────────────
+
+    def _recal_record(self, predicted_prob: float, outcome_binary: float, cell: str) -> None:
+        """Record a (predicted, outcome) pair for online recalibration."""
+        if not self._settings.recalibration_enabled:
+            return
+
+        if cell not in self._recal_buffer:
+            self._recal_buffer[cell] = []
+
+        self._recal_buffer[cell].append((predicted_prob, outcome_binary))
+
+        # Trim to window size
+        if len(self._recal_buffer[cell]) > self._recal_window:
+            self._recal_buffer[cell] = self._recal_buffer[cell][-self._recal_window:]
+
+        self._recal_trade_count += 1
+
+        # Refit periodically
+        if self._recal_trade_count % self._recal_refit_interval == 0:
+            self._recal_refit(cell)
+
+    def _recal_refit(self, cell: str) -> None:
+        """Refit isotonic regression for a cell's recalibration curve."""
+        buf = self._recal_buffer.get(cell, [])
+        if len(buf) < self._settings.recalibration_min_samples:
+            return
+
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except ImportError:
+            # sklearn not available — use simple piecewise linear fallback
+            self._recal_refit_simple(cell)
+            return
+
+        preds = [p for p, _ in buf]
+        outcomes = [o for _, o in buf]
+
+        ir = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
+        ir.fit(preds, outcomes)
+        self._recal_curve[cell] = ir
+
+        LOGGER.info(
+            "CryptoEngine: recalibration refit for %s (%d samples)",
+            cell, len(buf),
+        )
+
+    def _recal_refit_simple(self, cell: str) -> None:
+        """Simple fallback recalibration without sklearn.
+
+        Bins predictions into 5 buckets and computes realized rate per bucket.
+        Stores as a dict: {bucket_midpoint: realized_rate}.
+        """
+        buf = self._recal_buffer.get(cell, [])
+        if len(buf) < self._settings.recalibration_min_samples:
+            return
+
+        # Bin into 5 buckets: [0-0.2, 0.2-0.4, 0.4-0.6, 0.6-0.8, 0.8-1.0]
+        bins = {0.1: [0, 0], 0.3: [0, 0], 0.5: [0, 0], 0.7: [0, 0], 0.9: [0, 0]}
+        for pred, outcome in buf:
+            if pred < 0.2:
+                mid = 0.1
+            elif pred < 0.4:
+                mid = 0.3
+            elif pred < 0.6:
+                mid = 0.5
+            elif pred < 0.8:
+                mid = 0.7
+            else:
+                mid = 0.9
+            bins[mid][0] += 1  # count
+            bins[mid][1] += outcome  # sum of outcomes
+
+        # Build lookup: midpoint → realized rate
+        lookup = {}
+        for mid, (count, wins) in bins.items():
+            if count >= 3:
+                lookup[mid] = wins / count
+
+        if lookup:
+            self._recal_curve[cell] = lookup
+            LOGGER.info(
+                "CryptoEngine: recalibration refit (simple) for %s (%d samples, %d bins)",
+                cell, len(buf), len(lookup),
+            )
+
+    def _recal_apply(self, raw_prob: float, cell: str) -> float:
+        """Apply recalibration curve to a raw probability estimate.
+
+        Returns the recalibrated probability, or raw_prob if no curve is fitted.
+        """
+        if not self._settings.recalibration_enabled:
+            return raw_prob
+
+        curve = self._recal_curve.get(cell)
+        if curve is None:
+            return raw_prob
+
+        # sklearn IsotonicRegression
+        if hasattr(curve, 'predict'):
+            try:
+                result = float(curve.predict([raw_prob])[0])
+                return max(0.01, min(0.99, result))
+            except Exception:
+                return raw_prob
+
+        # Simple dict lookup fallback
+        if isinstance(curve, dict):
+            # Find nearest bin midpoint
+            if raw_prob < 0.2:
+                mid = 0.1
+            elif raw_prob < 0.4:
+                mid = 0.3
+            elif raw_prob < 0.6:
+                mid = 0.5
+            elif raw_prob < 0.8:
+                mid = 0.7
+            else:
+                mid = 0.9
+
+            if mid in curve:
+                return curve[mid]
+
+        return raw_prob
+
+    # ── Time-of-day gate ────────────────────────────────────────
+
+    def _quiet_hours_gate(self, edge: CryptoEdge) -> bool:
+        """Return True if the trade should be blocked by quiet hours gate.
+
+        During quiet hours, only allow trades with edge >= quiet_hours_min_edge.
+        """
+        if not self._settings.quiet_hours_utc:
+            return False  # No quiet hours configured
+
+        import datetime
+        utc_hour = datetime.datetime.utcnow().hour
+        try:
+            quiet_hours = {int(h.strip()) for h in self._settings.quiet_hours_utc.split(",") if h.strip()}
+        except ValueError:
+            return False
+
+        if utc_hour not in quiet_hours:
+            return False  # Not in quiet hours
+
+        # During quiet hours, require higher edge
+        if abs(edge.edge) < self._settings.quiet_hours_min_edge:
+            LOGGER.info(
+                "CryptoEngine: quiet hours gate blocked %s — edge %.1f%% < min %.1f%% (UTC hour %d)",
+                edge.market.id, edge.edge * 100, self._settings.quiet_hours_min_edge * 100, utc_hour,
+            )
+            return True
+
+        return False
+
     # ── Sizing ────────────────────────────────────────────────────
 
-    def _compute_position_size(self, edge: CryptoEdge) -> int:
+    def _compute_position_size(self, edge: CryptoEdge, cell_cfg: "CellConfig | None" = None) -> int:
         """Compute contracts to trade using simplified Kelly sizing.
 
         Uses: f* = edge / cost, capped by kelly_fraction_cap and max_position.
@@ -2097,8 +3749,33 @@ class CryptoEngine:
         if cost <= 0 or cost >= 1.0:
             return 0
 
-        # 1. Raw Kelly fraction
-        kelly_f = edge.edge_cents / cost
+        # 0. Online recalibration: adjust edge for sizing based on realized
+        #    calibration. If the model is overconfident, this shrinks the edge.
+        edge_for_sizing = edge.edge_cents
+        cell_name = edge.strategy_cell or ""
+        if cell_name and self._settings.recalibration_enabled:
+            recal_prob = self._recal_apply(edge.blended_probability, cell_name)
+            if recal_prob != edge.blended_probability:
+                # Recompute edge: recalibrated model prob vs market
+                if edge.side == "yes":
+                    recal_edge = recal_prob - edge.market_implied_prob
+                else:
+                    recal_edge = (1.0 - recal_prob) - edge.market_implied_prob
+                edge_for_sizing = max(0.0, recal_edge)
+                if edge_for_sizing < edge.edge_cents:
+                    LOGGER.debug(
+                        "CryptoEngine: recal sizing adjustment %s: edge %.1f%%→%.1f%% (prob %.1f%%→%.1f%%)",
+                        edge.market.id if hasattr(edge.market, 'id') else '',
+                        edge.edge_cents * 100, edge_for_sizing * 100,
+                        edge.blended_probability * 100, recal_prob * 100,
+                    )
+
+        # 1. Raw Kelly fraction (with optional edge cap for sizing)
+        if self._settings.kelly_edge_cap > 0:
+            # Cap effective edge used for sizing — model can detect large edges
+            # but sizing treats them as at most edge_cap (e.g., 10¢ = 10%)
+            edge_for_sizing = min(edge_for_sizing, self._settings.kelly_edge_cap)
+        kelly_f = edge_for_sizing / cost
 
         # 2. Compute effective Kelly cap (may be boosted for mean_reverting)
         effective_kelly_cap = self._settings.kelly_fraction_cap
@@ -2144,9 +3821,17 @@ class CryptoEngine:
                 self._settings.regime_transition_sizing_multiplier,
             )
 
-        # 7. Dollar amount and contract conversion
+        # 7. Per-cell Kelly multiplier (from strategy cell config)
+        if cell_cfg is not None:
+            kelly_f *= cell_cfg.kelly_multiplier
+
+        # 8. Dollar amount and contract conversion
         dollar_amount = kelly_f * self._bankroll
-        dollar_amount = min(dollar_amount, self._settings.max_position_per_market)
+        max_pos = (
+            cell_cfg.max_position if cell_cfg is not None
+            else self._settings.max_position_per_market
+        )
+        dollar_amount = min(dollar_amount, max_pos)
         dollar_amount = min(dollar_amount, self._bankroll)
 
         contracts = int(dollar_amount / cost) if cost > 0 else 0
@@ -2288,6 +3973,74 @@ class CryptoEngine:
 
         vpin_at_entry_val = vpin_val
 
+        # ── v42 Tier 1: Temporal features ──────────────────────────
+        import datetime as _dt
+        import math as _math
+        now_utc = _dt.datetime.utcnow()
+        hour_frac = now_utc.hour + now_utc.minute / 60.0
+        hour_sin = _math.sin(2.0 * _math.pi * hour_frac / 24.0)
+        hour_cos = _math.cos(2.0 * _math.pi * hour_frac / 24.0)
+        day_of_week = float(now_utc.weekday())  # Monday=0
+
+        # Nonlinear TTE: captures gamma acceleration near expiry
+        tte = edge.time_to_expiry_minutes
+        inv_sqrt_tte = 1.0 / _math.sqrt(max(tte, 0.1))
+
+        # Model disagreement (ensemble)
+        is_yes = (edge.side == "yes")
+        _, model_disagreement = self._compute_ensemble_probability(edge, is_yes)
+
+        # Hawkes intensity
+        hawkes_val = 0.0
+        if self._settings.hawkes_enabled:
+            hawkes_val = self._hawkes.intensity(time.monotonic())
+
+        # Volume flow rate
+        vol_flow = 0.0
+        if binance_sym:
+            vol_flow = self._price_feed.get_volume_flow_rate(binance_sym, window_seconds=300)
+
+        # ── v42 Tier 2: Meta-features ──────────────────────────────
+        cell_name = getattr(edge, "strategy_cell", "")
+        cell_wr, cell_pnl, cell_24h = self._get_cell_rolling_stats(cell_name)
+
+        # Cross-asset OFI divergence
+        cross_div = 0.0
+        if self._cross_asset is not None and binance_sym and binance_sym != self._cross_asset.leader_symbol:
+            cross_sig = self._cross_asset.compute_features(self._price_feed, binance_sym)
+            if cross_sig is not None:
+                cross_div = cross_sig.cross_ofi_divergence
+
+        # Realized vol at contract horizon (15min and 1h)
+        rv_15m = rv_1h = 0.0
+        if binance_sym:
+            returns_15m = self._price_feed.get_returns(binance_sym, 60, 15)
+            if len(returns_15m) >= 2:
+                rv_15m = float(np.std(returns_15m)) * _math.sqrt(15)  # scale to 15-min vol
+            returns_1h = self._price_feed.get_returns(binance_sym, 300, 60)
+            if len(returns_1h) >= 2:
+                rv_1h = float(np.std(returns_1h)) * _math.sqrt(12)  # scale to 1-hour vol
+
+        # ── v42 Tier 3: IV ratio + funding persistence ─────────────
+        iv_rv = 0.0
+        # Get model vol for IV cross-check
+        model_vol = 0.0
+        if binance_sym:
+            vol_returns = self._price_feed.get_returns(
+                binance_sym, interval_seconds=60,
+                window_minutes=self._settings.mc_vol_window_minutes,
+            )
+            if len(vol_returns) >= 5:
+                model_vol = self._price_model.estimate_volatility(
+                    vol_returns, interval_seconds=60,
+                    method=self._settings.mc_vol_method,
+                )
+        _, iv_ratio_result = self._compute_iv_crosscheck(edge, model_vol)
+        if iv_ratio_result is not None:
+            iv_rv = iv_ratio_result
+
+        funding_persist = self._update_funding_persistence(binance_sym) if binance_sym else 0
+
         return FeatureVector(
             ticker=edge.market.ticker,
             timestamp=time.time(),
@@ -2333,13 +4086,38 @@ class CryptoEngine:
             regime_kelly_multiplier=regime_kelly_mult,
             regime_min_edge_applied=regime_min_edge_val,
             vpin_at_entry=vpin_at_entry_val,
+            # v42 Tier 1
+            hour_utc_sin=hour_sin,
+            hour_utc_cos=hour_cos,
+            day_of_week=day_of_week,
+            inv_sqrt_tte=inv_sqrt_tte,
+            model_disagreement=model_disagreement,
+            hawkes_intensity=hawkes_val,
+            volume_flow_rate=vol_flow,
+            # v42 Tier 2
+            cell_rolling_win_rate=cell_wr,
+            cell_rolling_pnl=cell_pnl,
+            cell_trades_last_24h=cell_24h,
+            cross_ofi_divergence=cross_div,
+            realized_vol_15m=rv_15m,
+            realized_vol_1h=rv_1h,
+            # v42 Tier 3
+            iv_rv_ratio=iv_rv,
+            funding_rate_persistence=funding_persist,
+            # Trade identifiers
             side=edge.side,
             entry_price=edge.yes_buy_price if edge.side == "yes" else edge.no_buy_price,
+            strategy_cell=edge.strategy_cell,
         )
 
     # ── Execution ─────────────────────────────────────────────────
 
-    def _execute_paper_trade(self, edge: CryptoEdge, contracts: int) -> None:
+    def _execute_paper_trade(
+        self,
+        edge: CryptoEdge,
+        contracts: int,
+        prebuilt_fv: Optional["FeatureVector"] = None,
+    ) -> None:
         """Simulate a paper trade."""
         if edge.side == "yes":
             entry_price = edge.yes_buy_price
@@ -2368,18 +4146,19 @@ class CryptoEngine:
             edge=edge,
             model_prob=edge.model_prob.probability,
             market_implied_prob=edge.market_implied_prob,
+            strategy_cell=edge.strategy_cell,
         )
         self._positions[edge.market.ticker] = pos
 
         # Record feature vector for training (C1)
         if self._feature_store is not None:
-            fv = self._build_feature_vector(edge)
+            fv = prebuilt_fv or self._build_feature_vector(edge)
             fv.entry_price = entry_price  # Use actual slippage-adjusted price
             self._feature_store.record_entry(fv)
 
         LOGGER.info(
             "CryptoEngine: PAPER %s %s %d@%.2f¢ (edge=%.1f%%, "
-            "model=%.1f%%, market=%.1f%%, tte=%.1fm)",
+            "model=%.1f%%, market=%.1f%%, tte=%.1fm, cell=%s)",
             edge.side.upper(),
             edge.market.ticker,
             contracts,
@@ -2388,6 +4167,7 @@ class CryptoEngine:
             edge.model_prob.probability * 100,
             edge.market_implied_prob * 100,
             edge.time_to_expiry_minutes,
+            edge.strategy_cell or "unknown",
         )
 
         # ── Cycle recorder Hook 4: record trade ──
@@ -2405,6 +4185,203 @@ class CryptoEngine:
                 fr = self._rec_filter_results_current[edge.market.ticker]
                 fr.contracts_sized = contracts
                 fr.was_traded = True
+
+    # ── Momentum trading (v18) ───────────────────────────────────
+
+    async def _try_momentum_trades(self, market_quotes: list, momentum_symbols: set | None = None) -> None:
+        """Attempt momentum trades in VPIN momentum zone.
+
+        Uses per-symbol regime classification: each symbol is independently
+        checked for high_vol regime and OFI trigger conditions.
+
+        Parameters
+        ----------
+        momentum_symbols : set or None
+            If provided, only consider these symbols for momentum trades.
+            Symbols not in this set are skipped (they may be halted or normal).
+        """
+        if self._current_regime is None:
+            LOGGER.info("CryptoEngine: momentum skip — no regime classified")
+            return
+
+        momentum_count = sum(
+            1 for p in self._positions.values()
+            if getattr(p, 'strategy', 'model') == 'momentum'
+        )
+        if momentum_count >= self._settings.momentum_max_concurrent:
+            LOGGER.debug("CryptoEngine: momentum skip — %d/%d concurrent",
+                          momentum_count, self._settings.momentum_max_concurrent)
+            return
+
+        symbols = self._settings.price_feed_symbols
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+
+        for binance_sym in symbols:
+            # Per-symbol VPIN filter: only trade symbols in momentum zone
+            if momentum_symbols is not None and binance_sym not in momentum_symbols:
+                continue
+            # Per-symbol regime — used for OFI alignment info, NOT as a hard gate.
+            # VPIN zone (0.85-0.95) is the volatility signal; requiring regime=="high_vol"
+            # was redundant and too restrictive (blocked valid momentum opportunities).
+            sym_snap = self._current_regime.per_symbol.get(binance_sym) if self._current_regime.per_symbol else None
+            if sym_snap is None:
+                LOGGER.info("CryptoEngine: momentum skip %s — no per-symbol regime", binance_sym)
+                continue
+            LOGGER.debug("CryptoEngine: momentum %s — regime=%s vol_score=%.2f",
+                         binance_sym, sym_snap.regime, sym_snap.vol_score)
+
+            # Cooldown check
+            last_settled = self._momentum_cooldowns.get(binance_sym)
+            if last_settled is not None:
+                if (time.time() - last_settled) < self._settings.momentum_cooldown_seconds:
+                    continue
+
+            # Get OFI data
+            ofi_multi = self._price_feed.get_ofi_multiscale(binance_sym, [30, 60, 120, 300])
+            if not ofi_multi:
+                continue
+
+            # Per-symbol OFI alignment
+            ofi_alignment = sym_snap.ofi_alignment
+
+            # Compute weighted OFI magnitude + direction
+            weights = {30: 4.0, 60: 3.0, 120: 2.0, 300: 1.0}
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for window, ofi_val in ofi_multi.items():
+                w = weights.get(window, 1.0)
+                weighted_sum += ofi_val * w
+                weight_total += w
+            ofi_direction_raw = weighted_sum / weight_total if weight_total > 0 else 0.0
+            ofi_magnitude = abs(ofi_direction_raw)
+            ofi_direction = 1 if ofi_direction_raw > 0 else -1
+
+            # OFI confirmation streak: require N consecutive aligned cycles
+            streak = _update_ofi_streak(
+                self._ofi_direction_streak,
+                self._ofi_last_direction,
+                binance_sym,
+                ofi_direction=ofi_direction,
+                ofi_alignment=ofi_alignment,
+                min_alignment=self._settings.momentum_ofi_alignment_min,
+            )
+            if streak < self._settings.momentum_min_ofi_streak:
+                LOGGER.debug(
+                    "CryptoEngine: momentum skip %s — OFI streak %d < %d",
+                    binance_sym, streak, self._settings.momentum_min_ofi_streak,
+                )
+                continue
+
+            # OFI acceleration filter: skip if flow is fading (short < medium)
+            if self._settings.momentum_require_ofi_acceleration:
+                if not _check_ofi_acceleration(ofi_multi):
+                    LOGGER.debug(
+                        "CryptoEngine: momentum skip %s — OFI decelerating",
+                        binance_sym,
+                    )
+                    continue
+
+            # Trigger checks
+            if ofi_alignment < self._settings.momentum_ofi_alignment_min:
+                continue
+            if ofi_magnitude < self._settings.momentum_ofi_magnitude_min:
+                continue
+
+            # Get spot price
+            spot = self._price_feed.get_current_price(binance_sym)
+            if spot is None or spot <= 0:
+                continue
+
+            # Filter quotes to this underlying
+            underlying = binance_sym.replace("usdt", "").upper()
+            sym_quotes = [q for q in market_quotes if q.market.meta.underlying == underlying]
+
+            result = _select_momentum_contract(sym_quotes, spot, ofi_direction, self._settings)
+            if result is None:
+                LOGGER.debug("CryptoEngine: momentum — no contract for %s (dir=%+d)", binance_sym, ofi_direction)
+                continue
+
+            quote, side = result
+
+            if quote.market.ticker in self._positions:
+                continue
+
+            buy_price = quote.yes_buy_price if side == "yes" else quote.no_buy_price
+            contracts = _compute_momentum_size(self._bankroll, buy_price, ofi_alignment, self._settings)
+            if contracts <= 0:
+                continue
+
+            self._execute_momentum_trade(quote, side, contracts, ofi_alignment, ofi_magnitude)
+
+            LOGGER.info(
+                "CryptoEngine: MOMENTUM %s %s %d@%.2f¢ (OFI dir=%+d, align=%.2f, mag=%.0f, tte=%.1fm)",
+                side.upper(), quote.market.ticker, contracts, buy_price * 100,
+                ofi_direction, ofi_alignment, ofi_magnitude, quote.time_to_expiry_minutes,
+            )
+
+            momentum_count += 1
+            if momentum_count >= self._settings.momentum_max_concurrent:
+                break
+
+    def _execute_momentum_trade(self, quote, side: str, contracts: int,
+                                 ofi_alignment: float, ofi_magnitude: float) -> None:
+        """Execute a momentum paper trade."""
+        buy_price = quote.yes_buy_price if side == "yes" else quote.no_buy_price
+        slippage = self._settings.paper_slippage_cents / 100.0
+        entry_price = min(0.99, buy_price + slippage)
+
+        capital_needed = entry_price * contracts
+        if capital_needed > self._bankroll:
+            contracts = int(self._bankroll / entry_price)
+            if contracts <= 0:
+                return
+            capital_needed = entry_price * contracts
+
+        self._bankroll -= capital_needed
+
+        # Synthetic edge for position tracking
+        synthetic_edge = CryptoEdge(
+            market=quote.market,
+            model_prob=ProbabilityEstimate(probability=0.0, uncertainty=1.0, ci_low=0.0, ci_high=1.0),
+            market_implied_prob=quote.implied_probability,
+            edge=0.0,
+            edge_cents=0.0,
+            side=side,
+            recommended_price=buy_price,
+            model_uncertainty=1.0,
+            time_to_expiry_minutes=quote.time_to_expiry_minutes,
+            yes_buy_price=quote.yes_buy_price,
+            no_buy_price=quote.no_buy_price,
+        )
+
+        pos = CryptoPosition(
+            ticker=quote.market.ticker,
+            side=side,
+            contracts=contracts,
+            entry_price=entry_price,
+            entry_time=time.time(),
+            edge=synthetic_edge,
+            model_prob=0.0,
+            market_implied_prob=quote.implied_probability,
+            strategy="momentum",
+        )
+        self._positions[quote.market.ticker] = pos
+
+        if self._feature_store is not None:
+            fv = self._build_feature_vector(synthetic_edge)
+            fv.entry_price = entry_price
+            fv.strategy = "momentum"
+            self._feature_store.record_entry(fv)
+
+        # Cycle recorder hook
+        if (self._cycle_recorder is not None
+                and hasattr(self, '_rec_cycle_id_current')
+                and self._rec_cycle_id_current is not None):
+            self._cycle_recorder.record_trade(
+                self._rec_cycle_id_current, None, quote.market.ticker,
+                side, contracts, entry_price,
+            )
 
     async def _settle_expired_positions(self) -> None:
         """Settle positions whose markets have expired.
@@ -2425,6 +4402,12 @@ class CryptoEngine:
             if self._http_client is None:
                 # No HTTP client — fall back to simulated settlement
                 self._positions.pop(ticker)
+                # Record momentum cooldown (v18)
+                if getattr(pos, 'strategy', 'model') == 'momentum':
+                    underlying = pos.edge.market.meta.underlying
+                    binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+                    if binance_sym:
+                        self._momentum_cooldowns[binance_sym] = time.time()
                 pnl = self._simulate_settlement(pos)
                 self._session_pnl += pnl
                 self._bankroll += pos.entry_price * pos.contracts + pnl
@@ -2444,6 +4427,7 @@ class CryptoEngine:
                     time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
                     settled=True,
                     actual_outcome="simulated",
+                    strategy_cell=getattr(pos, 'strategy_cell', ''),
                 )
                 self._trades.append(record)
                 LOGGER.info(
@@ -2465,6 +4449,12 @@ class CryptoEngine:
                 # Real outcome available
                 self._positions.pop(ticker)
                 self._pending_settlement.pop(ticker, None)
+                # Record momentum cooldown (v18)
+                if getattr(pos, 'strategy', 'model') == 'momentum':
+                    underlying = pos.edge.market.meta.underlying
+                    binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+                    if binance_sym:
+                        self._momentum_cooldowns[binance_sym] = time.time()
 
                 settled_yes = outcome
                 if pos.side == "yes":
@@ -2488,6 +4478,15 @@ class CryptoEngine:
                 if self._feature_store is not None:
                     self._feature_store.record_outcome(ticker, settled_yes)
 
+                # v42: Record cell outcome for rolling meta-features
+                cell_name = getattr(pos, 'strategy_cell', '')
+                won = (
+                    (settled_yes and pos.side == "yes")
+                    or (not settled_yes and pos.side == "no")
+                )
+                if cell_name:
+                    self._record_cell_outcome(cell_name, pnl, won)
+
                 record = CryptoTradeRecord(
                     ticker=ticker,
                     side=pos.side,
@@ -2503,6 +4502,7 @@ class CryptoEngine:
                     time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
                     settled=True,
                     actual_outcome="yes" if settled_yes else "no",
+                    strategy_cell=getattr(pos, 'strategy_cell', ''),
                 )
                 self._trades.append(record)
                 LOGGER.info(
@@ -2511,6 +4511,18 @@ class CryptoEngine:
                     pos.entry_price * 100, pnl,
                     "YES" if settled_yes else "NO",
                 )
+
+                # ── Online recalibration: feed settlement outcome ──
+                _recal_cell = getattr(pos, 'strategy_cell', '')
+                if _recal_cell:
+                    # For YES side: outcome_binary = 1 if settled_yes else 0
+                    # For NO side: outcome_binary = 0 if settled_yes else 1
+                    if pos.side == "yes":
+                        _recal_outcome = 1.0 if settled_yes else 0.0
+                    else:
+                        _recal_outcome = 0.0 if settled_yes else 1.0
+                    self._recal_record(pos.model_prob, _recal_outcome, _recal_cell)
+
                 # ── Cycle recorder: settlement hook (real) ──
                 if self._cycle_recorder is not None:
                     self._cycle_recorder.record_settlement(
@@ -2529,6 +4541,12 @@ class CryptoEngine:
                         # Grace period exceeded — mark unsettled
                         self._positions.pop(ticker)
                         self._pending_settlement.pop(ticker, None)
+                        # Record momentum cooldown (v18)
+                        if getattr(pos, 'strategy', 'model') == 'momentum':
+                            underlying = pos.edge.market.meta.underlying
+                            binance_sym = _KALSHI_TO_BINANCE.get(underlying, "")
+                            if binance_sym:
+                                self._momentum_cooldowns[binance_sym] = time.time()
                         self._bankroll += pos.entry_price * pos.contracts  # return capital
 
                         record = CryptoTradeRecord(
@@ -2546,6 +4564,7 @@ class CryptoEngine:
                             time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
                             settled=False,
                             actual_outcome="unsettled",
+                            strategy_cell=getattr(pos, 'strategy_cell', ''),
                         )
                         self._trades.append(record)
                         LOGGER.warning(
@@ -2609,6 +4628,15 @@ class CryptoEngine:
         if self._feature_store is not None:
             self._feature_store.record_outcome(ticker, settled_yes)
 
+        # v42: Record cell outcome for rolling meta-features
+        cell_name = getattr(pos, 'strategy_cell', '')
+        won = (
+            (settled_yes and pos.side == "yes")
+            or (not settled_yes and pos.side == "no")
+        )
+        if cell_name:
+            self._record_cell_outcome(cell_name, pnl, won)
+
         record = CryptoTradeRecord(
             ticker=ticker,
             side=pos.side,
@@ -2624,6 +4652,7 @@ class CryptoEngine:
             time_to_expiry_minutes=pos.edge.time_to_expiry_minutes,
             settled=True,
             actual_outcome="yes" if settled_yes else "no",
+            strategy_cell=getattr(pos, 'strategy_cell', ''),
         )
         self._trades.append(record)
         return record
