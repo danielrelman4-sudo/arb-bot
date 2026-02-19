@@ -140,6 +140,7 @@ class CryptoSettings:
     max_position_per_market: float = 50.0
     max_concurrent_positions: int = 10
     max_positions_per_underlying: int = 3
+    max_new_trades_per_cycle: int = 10   # Max new trades opened per scan cycle (v44 Fix G)
     kelly_fraction_cap: float = 0.10
     kelly_edge_cap: float = 0.0  # 0 = disabled; e.g., 0.10 caps edge at 10¢ for sizing
 
@@ -555,6 +556,7 @@ def load_crypto_settings() -> CryptoSettings:
         max_position_per_market=_as_float(os.getenv("ARB_CRYPTO_MAX_POSITION_PER_MARKET"), 50.0),
         max_concurrent_positions=_as_int(os.getenv("ARB_CRYPTO_MAX_CONCURRENT_POSITIONS"), 10),
         max_positions_per_underlying=_as_int(os.getenv("ARB_CRYPTO_MAX_POSITIONS_PER_UNDERLYING"), 3),
+        max_new_trades_per_cycle=_as_int(os.getenv("ARB_CRYPTO_MAX_NEW_TRADES_PER_CYCLE"), 10),
         kelly_fraction_cap=_as_float(os.getenv("ARB_CRYPTO_KELLY_FRACTION_CAP"), 0.10),
         kelly_edge_cap=_as_float(os.getenv("ARB_CRYPTO_KELLY_EDGE_CAP"), 0.0),
         quiet_hours_utc=os.getenv("ARB_CRYPTO_QUIET_HOURS_UTC", ""),

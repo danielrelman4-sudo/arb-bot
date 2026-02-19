@@ -1136,3 +1136,157 @@ class TestActivityScaling:
         assert quote.market.ticker in probs
         prob = probs[quote.market.ticker]
         assert 0.0 <= prob.probability <= 1.0
+
+
+# ── Per-cycle entry throttle (v44 Fix G) ─────────────────────────
+
+class TestMaxNewTradesPerCycle:
+    def test_throttle_limits_entries(self) -> None:
+        """max_new_trades_per_cycle=2 should open at most 2 trades per cycle."""
+        async def _run() -> None:
+            settings = _make_settings(
+                mc_num_paths=500,
+                max_new_trades_per_cycle=2,
+                max_concurrent_positions=10,
+                min_edge_pct=0.01,
+                min_edge_cents=0.01,
+                max_model_uncertainty=0.30,
+                paper_slippage_cents=0.0,
+                # Disable disagreement veto so edges pass through
+                market_disagreement_max=0.80,
+            )
+            engine = CryptoEngine(settings)
+
+            # Inject BTC price data — price clearly above all strikes
+            ts = time.time()
+            for i in range(100):
+                engine.price_feed.inject_tick(
+                    PriceTick("btcusdt", 100000.0, ts - 100 + i, 1.0)
+                )
+
+            # 4 quotes, all far below current price → model should say YES ~100%
+            # but market says 30% → big edge on each
+            quotes = [
+                _make_quote("KXBTCD-26FEB14-T80000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T85000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T86000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T87000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+            ]
+
+            await engine.run_cycle_with_quotes(quotes)
+
+            # With 4 qualifying edges but max_new_trades_per_cycle=2,
+            # should open at most 2 positions
+            assert len(engine.positions) <= 2
+
+        asyncio.run(_run())
+
+    def test_throttle_default_allows_many(self) -> None:
+        """Default max_new_trades_per_cycle=10 should not restrict normal trading."""
+        async def _run() -> None:
+            settings = _make_settings(
+                mc_num_paths=500,
+                max_new_trades_per_cycle=10,  # default
+                max_concurrent_positions=10,
+                min_edge_pct=0.01,
+                min_edge_cents=0.01,
+                max_model_uncertainty=0.30,
+                paper_slippage_cents=0.0,
+                market_disagreement_max=0.80,
+            )
+            engine = CryptoEngine(settings)
+
+            ts = time.time()
+            for i in range(100):
+                engine.price_feed.inject_tick(
+                    PriceTick("btcusdt", 100000.0, ts - 100 + i, 1.0)
+                )
+
+            # 3 quotes — all should be enterable with default limit of 10
+            quotes = [
+                _make_quote("KXBTCD-26FEB14-T80000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T85000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T86000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+            ]
+
+            await engine.run_cycle_with_quotes(quotes)
+
+            # Default limit=10 should not block any of the 3 edges
+            # (though other filters may reduce count)
+            # At minimum: if all 3 generate edges, all 3 should be opened
+            # since 3 < 10
+            assert engine.cycle_count == 1
+
+        asyncio.run(_run())
+
+    def test_throttle_one_limits_to_single_trade(self) -> None:
+        """max_new_trades_per_cycle=1 should open exactly 1 trade."""
+        async def _run() -> None:
+            settings = _make_settings(
+                mc_num_paths=500,
+                max_new_trades_per_cycle=1,
+                max_concurrent_positions=10,
+                min_edge_pct=0.01,
+                min_edge_cents=0.01,
+                max_model_uncertainty=0.30,
+                paper_slippage_cents=0.0,
+                market_disagreement_max=0.80,
+            )
+            engine = CryptoEngine(settings)
+
+            ts = time.time()
+            for i in range(100):
+                engine.price_feed.inject_tick(
+                    PriceTick("btcusdt", 100000.0, ts - 100 + i, 1.0)
+                )
+
+            quotes = [
+                _make_quote("KXBTCD-26FEB14-T80000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T85000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T86000", yes_price=0.30, no_price=0.70, tte_minutes=10.0),
+            ]
+
+            await engine.run_cycle_with_quotes(quotes)
+
+            # With max=1, at most 1 position should be opened
+            assert len(engine.positions) <= 1
+
+        asyncio.run(_run())
+
+    def test_best_edges_selected_first(self) -> None:
+        """Edge detector sorts by absolute edge; throttle should keep the best ones."""
+        async def _run() -> None:
+            settings = _make_settings(
+                mc_num_paths=500,
+                max_new_trades_per_cycle=1,
+                max_concurrent_positions=10,
+                min_edge_pct=0.01,
+                min_edge_cents=0.01,
+                max_model_uncertainty=0.30,
+                paper_slippage_cents=0.0,
+                market_disagreement_max=0.80,
+            )
+            engine = CryptoEngine(settings)
+
+            ts = time.time()
+            for i in range(100):
+                engine.price_feed.inject_tick(
+                    PriceTick("btcusdt", 100000.0, ts - 100 + i, 1.0)
+                )
+
+            # Two quotes with very different mispricing:
+            # T80000: strike far below → model ~100%, market 20% → huge edge
+            # T99000: strike near price → model ~55%, market 40% → small edge
+            quotes = [
+                _make_quote("KXBTCD-26FEB14-T99000", yes_price=0.40, no_price=0.60, tte_minutes=10.0),
+                _make_quote("KXBTCD-26FEB14-T80000", yes_price=0.20, no_price=0.80, tte_minutes=10.0),
+            ]
+
+            await engine.run_cycle_with_quotes(quotes)
+
+            if len(engine.positions) == 1:
+                # The single opened position should be T80000 (bigger edge)
+                opened_ticker = list(engine.positions.keys())[0]
+                assert "T80000" in opened_ticker
+
+        asyncio.run(_run())

@@ -1428,6 +1428,9 @@ class CryptoEngine:
 
             self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
             trades_opened += 1
+            # Per-cycle entry throttle (v44 Fix G)
+            if trades_opened >= self._settings.max_new_trades_per_cycle:
+                break
 
         # 5. Check and settle expired positions
         await self._settle_expired_positions()
@@ -1905,6 +1908,9 @@ class CryptoEngine:
 
             self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
             trades_opened += 1
+            # Per-cycle entry throttle (v44 Fix G)
+            if trades_opened >= self._settings.max_new_trades_per_cycle:
+                break
 
         await self._settle_expired_positions()
         self._log_cycle(len(edges))

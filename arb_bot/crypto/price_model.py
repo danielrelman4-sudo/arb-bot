@@ -872,8 +872,15 @@ class PriceModel:
         # Wilson CI
         result = self._wilson_ci(p_hat, bootstrap_paths)
 
-        # Enforce uncertainty floor
-        unc = max(min_uncertainty, result.uncertainty)
+        # Effective-sample-size uncertainty floor (v44 Fix F).
+        # Wilson CI uses n=bootstrap_paths (2000), but those are resamples
+        # from only len(returns) unique observations.  When all paths agree
+        # (p_hat≈1.0), Wilson reports uncertainty≈0 — epistemically wrong
+        # for a small sample.  Floor at 1/(2√n_unique): the standard error
+        # of a binomial at p=0.5, which is the maximum-entropy baseline.
+        n_unique = len(returns)
+        sample_floor = 1.0 / (2.0 * math.sqrt(max(n_unique, 1)))
+        unc = max(min_uncertainty, result.uncertainty, sample_floor)
         return ProbabilityEstimate(
             probability=result.probability,
             ci_lower=max(0.0, result.probability - unc),

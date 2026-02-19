@@ -424,6 +424,7 @@ async def run_paper_test(
         max_position_per_market=50.0,
         max_concurrent_positions=20,  # Relaxed from 10 — allow more simultaneous trades for data
         max_positions_per_underlying=5,  # Relaxed from 3 — allow more trades per underlying
+        max_new_trades_per_cycle=2,  # v44 Fix G: max 2 new entries per scan cycle (prevents correlated triple wipeout)
         kelly_fraction_cap=0.06,
         kelly_edge_cap=0.10,                  # v41: Cap edge at 10% for Kelly sizing (prevents overconfident large positions)
         scan_interval_seconds=scan_interval,
@@ -658,7 +659,7 @@ async def run_paper_test(
         iv_crosscheck_boost_threshold=0.8,
         iv_crosscheck_boost_factor=1.1,
         # ── v43: Post-mortem fixes ────────────────────────────────
-        model_prob_cap=0.90,               # Fix A: prevent empirical model saturating at P=1.0
+        model_prob_cap=0.95,               # Fix A: safety rail only — v44 Fix F handles saturation via uncertainty floor
         model_prob_floor=0.10,             # Fix A: prevent P=0.0 extremes
         market_disagreement_max=0.30,      # Fix B: skip when model vs market > 30pp
         # ── v43: Daily pricing model ──────────────────────────────

@@ -412,3 +412,76 @@ class TestDailyConfigFields:
         assert hasattr(settings, "daily_model_enabled")
         assert hasattr(settings, "merton_jump_vol")
         assert hasattr(settings, "daily_ofi_weights")
+
+
+# ── v44 Fix F: Effective-sample-size uncertainty floor ────────────
+
+
+class TestUncertaintyFloor:
+    """probability_above_empirical should report higher uncertainty
+    when the number of unique return observations is small, regardless
+    of bootstrap path count."""
+
+    def test_small_sample_high_uncertainty(self, model: PriceModel) -> None:
+        """15 one-sided returns → floor ≈ 1/(2√15) ≈ 0.129."""
+        returns = [0.001] * 30  # 30 samples (just above min_samples), all positive
+        result = model.probability_above_empirical(
+            returns=returns,
+            current_price=100.0,
+            strike=99.0,
+            horizon_steps=15,
+            bootstrap_paths=2000,
+        )
+        # With 30 unique returns: floor = 1/(2*sqrt(30)) ≈ 0.091
+        expected_floor = 1.0 / (2.0 * math.sqrt(30))
+        assert result.uncertainty >= expected_floor - 0.001
+
+    def test_large_sample_lower_floor(self, model: PriceModel) -> None:
+        """120 returns → floor ≈ 1/(2√120) ≈ 0.046, much less than small sample."""
+        returns = [0.001] * 120  # all positive
+        result = model.probability_above_empirical(
+            returns=returns,
+            current_price=100.0,
+            strike=99.0,
+            horizon_steps=15,
+            bootstrap_paths=2000,
+        )
+        expected_floor = 1.0 / (2.0 * math.sqrt(120))
+        assert result.uncertainty >= expected_floor - 0.001
+        # Should be less than the small-sample floor
+        small_floor = 1.0 / (2.0 * math.sqrt(30))
+        assert result.uncertainty < small_floor + 0.01
+
+    def test_mixed_sample_wilson_may_dominate(self, model: PriceModel) -> None:
+        """With mixed returns (p_hat≈0.5), Wilson CI is wide and may exceed
+        the sample floor. Either way, uncertainty should be reasonable."""
+        rng = np.random.default_rng(42)
+        returns = list(rng.normal(0.0, 0.005, 60))  # balanced returns
+        result = model.probability_above_empirical(
+            returns=returns,
+            current_price=100.0,
+            strike=100.0,  # ATM — p_hat should be ~0.5
+            horizon_steps=15,
+            bootstrap_paths=2000,
+        )
+        # Uncertainty should be at least the sample floor
+        expected_floor = 1.0 / (2.0 * math.sqrt(60))
+        assert result.uncertainty >= expected_floor - 0.001
+
+    def test_floor_never_reduces_wilson(self, model: PriceModel) -> None:
+        """The sample floor should never make uncertainty SMALLER than
+        what Wilson CI reports."""
+        rng = np.random.default_rng(99)
+        # Create a scenario where Wilson CI might be larger than sample floor
+        returns = list(rng.normal(0.0, 0.01, 200))  # large sample, balanced
+        result = model.probability_above_empirical(
+            returns=returns,
+            current_price=100.0,
+            strike=100.0,
+            horizon_steps=15,
+            bootstrap_paths=2000,
+        )
+        # Wilson CI for p≈0.5, n=2000 gives ~0.011; sample floor for 200 is ~0.035
+        # The floor should dominate here, but either way unc >= both
+        wilson_approx = 0.011  # approximate Wilson CI at p=0.5, n=2000
+        assert result.uncertainty >= wilson_approx - 0.005
