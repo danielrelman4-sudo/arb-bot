@@ -117,6 +117,7 @@ class EdgeDetector:
         min_model_market_divergence: float = 0.12,
         dynamic_edge_enabled: bool = False,
         dynamic_edge_k: float = 2.0,
+        market_disagreement_max: float = 1.0,
     ) -> None:
         self._min_edge_pct = min_edge_pct
         self._min_edge_pct_daily = min_edge_pct_daily
@@ -127,6 +128,7 @@ class EdgeDetector:
         self._min_model_market_divergence = min_model_market_divergence
         self._dynamic_edge_enabled = dynamic_edge_enabled
         self._dynamic_edge_k = dynamic_edge_k
+        self._market_disagreement_max = market_disagreement_max
 
     def detect_edges(
         self,
@@ -237,6 +239,21 @@ class EdgeDetector:
                         ticker, effective_edge * 100, dynamic_floor * 100,
                         min_edge * 100, self._dynamic_edge_k,
                         model.uncertainty, side,
+                    )
+                    continue
+
+            # Market disagreement veto (v43 Fix B)
+            # Skip trades where model and market strongly disagree —
+            # the worst v42b losses were all where model said 70%+ but market said <30%.
+            if self._market_disagreement_max < 1.0:
+                disagreement = abs(model.probability - market_prob)
+                if disagreement > self._market_disagreement_max:
+                    LOGGER.info(
+                        "Edge on %s rejected: market disagreement %.1f%% > max %.1f%% "
+                        "(model=%.1f%%, market=%.1f%%, side=%s)",
+                        ticker, disagreement * 100,
+                        self._market_disagreement_max * 100,
+                        model.probability * 100, market_prob * 100, side,
                     )
                     continue
 

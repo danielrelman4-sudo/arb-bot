@@ -258,6 +258,7 @@ class CryptoEngine:
             min_model_market_divergence=settings.min_model_market_divergence,
             dynamic_edge_enabled=settings.dynamic_edge_threshold_enabled,
             dynamic_edge_k=settings.dynamic_edge_uncertainty_multiplier,
+            market_disagreement_max=settings.market_disagreement_max,
         )
         self._calibrator = ModelCalibrator(
             min_samples_for_calibration=settings.calibration_min_samples,
@@ -2238,6 +2239,34 @@ class CryptoEngine:
             if horizon <= 0:
                 continue
 
+            # ── Variance ratio vol correction (v43 — 1A) ──────────
+            # For daily contracts, adjust vol using variance ratio to
+            # account for mean-reversion that makes √T scaling inaccurate.
+            is_daily_contract = (
+                mq.market.meta.direction in ("above", "below")
+                and horizon > 20
+            )
+            if (
+                is_daily_contract
+                and self._settings.variance_ratio_enabled
+                and binance_sym
+            ):
+                vr_returns = self._price_feed.get_returns(
+                    binance_sym, interval_seconds=60,
+                    window_minutes=self._settings.mc_vol_window_minutes,
+                )
+                if len(vr_returns) >= self._settings.variance_ratio_min_samples:
+                    vr_q = max(2, round(horizon))
+                    vr = self._price_model.variance_ratio(vr_returns, vr_q)
+                    vol_before = vol
+                    vol = self._price_model.vol_with_variance_ratio_correction(
+                        vol, horizon, vr,
+                    )
+                    LOGGER.debug(
+                        "Vol correction: raw=%.1f%% VR(%d)=%.2f adjusted=%.1f%%",
+                        vol_before * 100, vr_q, vr, vol * 100,
+                    )
+
             # Volume clock: replace clock-time horizon with effective
             # horizon based on projected volume.  This adjusts BOTH the
             # diffusion variance (sigma^2 * dt) AND the expected jump
@@ -2355,6 +2384,44 @@ class CryptoEngine:
             # Clamp total drift to prevent extreme model predictions
             max_drift = self._settings.max_total_drift
             drift = max(-max_drift, min(max_drift, drift))
+
+            # ── v43 Daily model routing ──────────────────────────────
+            # For daily contracts (above/below, TTE > 20min), use the
+            # dedicated daily pricing model with regime-aware routing
+            # instead of the standard MC/empirical/student-t pipeline.
+            direction = mq.market.meta.direction
+            if direction not in self._settings.allowed_directions:
+                continue
+            strike = mq.market.meta.strike
+
+            if is_daily_contract and self._settings.daily_model_enabled:
+                # OFI weight reversal for daily contracts (2C)
+                if self._settings.ofi_enabled and self._settings.multiscale_ofi_enabled and binance_sym:
+                    ms_windows = [int(w) for w in self._settings.multiscale_ofi_windows.split(",")]
+                    daily_weights = [float(w) for w in self._settings.daily_ofi_weights.split(",")]
+                    ofi_multi = self._price_feed.get_ofi_multiscale(binance_sym, ms_windows)
+                    # Re-weight OFI using daily-specific weights (longer timescales matter more)
+                    cal_result = self._get_ofi_calibration()
+                    alpha = cal_result.alpha if cal_result.alpha != 0 else self._settings.ofi_alpha
+                    daily_ofi = sum(ofi_multi.get(w, 0.0) * wt for w, wt in zip(ms_windows, daily_weights))
+                    ofi_drift_correction = self._apply_ofi_impact(daily_ofi, alpha) - (drift if self._settings.ofi_enabled else 0.0)
+                    # Only apply the difference (since drift already has 15min-weighted OFI)
+                    drift += ofi_drift_correction * 0.5  # partial correction
+
+                if strike is not None and direction in ("above", "below"):
+                    daily_prob = self._compute_daily_probability(
+                        current_price=current_price,
+                        strike=strike,
+                        direction=direction,
+                        horizon_minutes=horizon,
+                        vol=vol,
+                        drift=drift,
+                        binance_sym=binance_sym,
+                    )
+                    if daily_prob is not None:
+                        result[mq.market.ticker] = daily_prob
+                        continue
+                    # Fall through to standard pipeline if daily model returns None
 
             # ── Probability computation: MC or Student-t ──────────
             use_mc = self._settings.probability_model in ("mc_gbm", "ab_test", "ab_empirical")
@@ -2671,6 +2738,27 @@ class CryptoEngine:
                     uncertainty=scaled_unc,
                     num_paths=prob.num_paths,
                 )
+
+            # ── Model probability cap (v43 Fix A) ──────────────────
+            # Prevent empirical model from saturating at 0.0/1.0 which
+            # causes Kelly to massively oversize on false confidence.
+            cap = self._settings.model_prob_cap
+            floor = self._settings.model_prob_floor
+            if cap < 1.0 or floor > 0.0:
+                raw_p = prob.probability
+                capped_p = max(floor, min(cap, raw_p))
+                if capped_p != raw_p:
+                    LOGGER.debug(
+                        "Prob cap on %s: %.3f → %.3f",
+                        mq.market.ticker, raw_p, capped_p,
+                    )
+                    prob = ProbabilityEstimate(
+                        probability=capped_p,
+                        ci_lower=max(0.0, capped_p - prob.uncertainty),
+                        ci_upper=min(1.0, capped_p + prob.uncertainty),
+                        uncertainty=prob.uncertainty,
+                        num_paths=prob.num_paths,
+                    )
 
             result[mq.market.ticker] = prob
 
@@ -3007,6 +3095,210 @@ class CryptoEngine:
             ci_upper=min(1.0, raw_est.probability + scaled_unc),
             uncertainty=scaled_unc,
             num_paths=raw_est.num_paths,
+        )
+
+    def _compute_daily_probability(
+        self,
+        current_price: float,
+        strike: float,
+        direction: str,
+        horizon_minutes: float,
+        vol: float,
+        drift: float,
+        binance_sym: str,
+    ) -> Optional[ProbabilityEstimate]:
+        """Dedicated daily contract pricing with regime-aware model routing.
+
+        Uses Merton jump-diffusion, OU mean-reversion, and GBM with
+        proper drift, blended according to the current market regime
+        and strike distance (moneyness).
+
+        Parameters
+        ----------
+        current_price:
+            Current spot price.
+        strike:
+            Settlement strike price.
+        direction:
+            Contract direction ("above" or "below").
+        horizon_minutes:
+            Time to expiry in minutes.
+        vol:
+            Annualized volatility (already VR-corrected if enabled).
+        drift:
+            Total assembled drift from all sources.
+        binance_sym:
+            Binance symbol for price feed lookups.
+
+        Returns ProbabilityEstimate or None if inputs are degenerate.
+        """
+        from arb_bot.crypto.regime_detector import MEAN_REVERTING, HIGH_VOL
+
+        if current_price <= 0 or strike <= 0 or vol <= 0 or horizon_minutes <= 0:
+            return None
+
+        settings = self._settings
+        dt = horizon_minutes / (365.25 * 24.0 * 60.0)
+        sqrt_dt = math.sqrt(dt)
+
+        # ── Moneyness in vol units ────────────────────────────────
+        moneyness = abs(math.log(current_price / strike)) / (vol * sqrt_dt) if vol * sqrt_dt > 0 else 0.0
+
+        # ── Jump intensity from Hawkes (or default) ──────────────
+        if settings.hawkes_enabled:
+            lambda_daily = self._hawkes.intensity(time.monotonic())
+        else:
+            lambda_daily = settings.merton_default_intensity
+
+        # ── Component model probabilities ─────────────────────────
+
+        # 1. Merton jump-diffusion (always computed — handles tails)
+        merton_est = self._price_model.probability_above_merton_series(
+            current_price, strike, vol, horizon_minutes,
+            drift=drift,
+            lambda_daily=lambda_daily,
+            jump_mean=settings.merton_jump_mean,
+            jump_vol=settings.merton_jump_vol,
+            n_terms=settings.merton_n_terms,
+        )
+
+        # 2. OU mean-reversion model
+        ou_est = None
+        returns_1min = self._price_feed.get_returns(
+            binance_sym, interval_seconds=60,
+            window_minutes=settings.mc_vol_window_minutes,
+        )
+        ou_params = self._price_model.estimate_ou_params(returns_1min, interval_seconds=60)
+        if ou_params is not None:
+            theta, mu_ou, sigma_ou = ou_params
+            # Adjust mu with drift signal
+            mu_adjusted = mu_ou + drift * dt
+            ou_est = self._price_model.probability_above_ou(
+                current_price, strike, horizon_minutes,
+                theta=theta, mu=mu_adjusted, sigma=sigma_ou,
+            )
+
+        # 3. GBM analytical (uses real drift, not drift=0)
+        gbm_prob = self._price_model.probability_above_analytical(
+            current_price, strike, vol, horizon_minutes, drift=drift,
+        )
+        gbm_est = ProbabilityEstimate(
+            probability=gbm_prob,
+            ci_lower=max(0.0, gbm_prob - 0.03),
+            ci_upper=min(1.0, gbm_prob + 0.03),
+            uncertainty=0.03,
+            num_paths=0,
+        )
+
+        # ── Model routing by regime × moneyness ──────────────────
+        regime = self._current_regime
+        deep_threshold = settings.daily_moneyness_deep_threshold
+        atm_threshold = settings.daily_moneyness_atm_threshold
+
+        if moneyness > deep_threshold:
+            # Deep OTM/ITM: Merton dominates (tails matter most)
+            w_merton = settings.daily_merton_weight_deep
+            w_ou = (1.0 - w_merton) * 0.5
+            w_gbm = (1.0 - w_merton) * 0.5
+        elif regime is not None and regime.regime == MEAN_REVERTING:
+            # Mean-reverting: OU dominates
+            w_ou = settings.daily_ou_weight_mean_reverting
+            w_merton = (1.0 - w_ou) * 0.5
+            w_gbm = (1.0 - w_ou) * 0.5
+        elif regime is not None and regime.is_trending:
+            # Trending: GBM dominates (drift matters)
+            w_gbm = settings.daily_gbm_weight_trending
+            w_merton = (1.0 - w_gbm) * 0.5
+            w_ou = (1.0 - w_gbm) * 0.5
+        elif moneyness < atm_threshold:
+            # Near ATM, no strong regime: equal weight
+            w_merton = 1.0 / 3.0
+            w_ou = 1.0 / 3.0
+            w_gbm = 1.0 / 3.0
+        else:
+            # Default: slight Merton bias
+            w_merton = 0.4
+            w_ou = 0.3
+            w_gbm = 0.3
+
+        # If OU not available, redistribute its weight
+        if ou_est is None:
+            w_gbm += w_ou * 0.5
+            w_merton += w_ou * 0.5
+            w_ou = 0.0
+
+        # ── Soft regime transition blending ───────────────────────
+        if regime is not None and regime.is_transitioning:
+            tau = settings.daily_regime_transition_tau_minutes
+            # Blend toward equal weights during transitions
+            blend = 0.5  # half-way blend during transition
+            eq = 1.0 / 3.0
+            w_merton = w_merton * (1.0 - blend) + eq * blend
+            w_ou = w_ou * (1.0 - blend) + eq * blend
+            w_gbm = w_gbm * (1.0 - blend) + eq * blend
+
+        # Normalize weights
+        total_w = w_merton + w_ou + w_gbm
+        if total_w > 0:
+            w_merton /= total_w
+            w_ou /= total_w
+            w_gbm /= total_w
+
+        # ── Weighted blend ────────────────────────────────────────
+        p_above = (
+            w_merton * merton_est.probability
+            + w_gbm * gbm_est.probability
+            + (w_ou * ou_est.probability if ou_est is not None else 0.0)
+        )
+
+        # Uncertainty from model disagreement + component uncertainties
+        probs_available = [merton_est.probability, gbm_est.probability]
+        if ou_est is not None:
+            probs_available.append(ou_est.probability)
+        model_spread = max(probs_available) - min(probs_available)
+        blended_unc = max(0.02, model_spread * 0.3 + 0.01)
+
+        # ── Probability floors/ceilings (1C) ─────────────────────
+        if settings.probability_floor_enabled:
+            floor, ceiling = self._price_model.compute_probability_bounds(
+                lambda_daily=lambda_daily,
+                horizon_minutes=horizon_minutes,
+                volatility=vol,
+                moneyness_sigma=moneyness,
+                jump_vol=settings.merton_jump_vol,
+                floor_min=settings.probability_floor_min,
+                ceiling_max=settings.probability_ceiling_max,
+            )
+            p_above = self._price_model.clamp_probability(p_above, floor, ceiling)
+
+        # ── Direction handling ────────────────────────────────────
+        if direction == "above":
+            final_prob = p_above
+        elif direction == "below":
+            final_prob = 1.0 - p_above
+        else:
+            return None
+
+        final_prob = max(0.0, min(1.0, final_prob))
+
+        LOGGER.info(
+            "DailyModel %s: P=%.3f (merton=%.3f×%.2f, gbm=%.3f×%.2f, ou=%s×%.2f) "
+            "m=%.1fσ regime=%s λ=%.1f vol=%.1f%% drift=%.4f",
+            direction, final_prob,
+            merton_est.probability, w_merton,
+            gbm_est.probability, w_gbm,
+            f"{ou_est.probability:.3f}" if ou_est else "N/A", w_ou,
+            moneyness,
+            regime.regime if regime else "none",
+            lambda_daily, vol * 100, drift,
+        )
+
+        return ProbabilityEstimate(
+            probability=final_prob,
+            ci_lower=max(0.0, final_prob - blended_unc),
+            ci_upper=min(1.0, final_prob + blended_unc),
+            uncertainty=blended_unc,
+            num_paths=0,
         )
 
     def _compute_ensemble_probability(

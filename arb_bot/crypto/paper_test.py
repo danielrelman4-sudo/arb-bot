@@ -399,6 +399,7 @@ async def run_paper_test(
     scan_interval: float,
     max_tte: int,
     probability_model: str = "empirical",
+    daily_model: bool = False,
 ) -> None:
     """Run the crypto engine paper test."""
 
@@ -556,7 +557,7 @@ async def run_paper_test(
         # ── Regime-conditional improvements ──────────────────────────
         # Tier 1: Regime Kelly multiplier
         regime_sizing_enabled=True,
-        regime_kelly_mean_reverting=1.5,
+        regime_kelly_mean_reverting=0.7,   # v43 Fix C: was 1.5 — boosted sizing in overconfident regime (7/9 MR trades lost)
         regime_kelly_trending_up=0.4,
         regime_kelly_trending_down=0.5,
         regime_kelly_high_vol=0.3,  # Was 0.0; zero blocks ALL trades in high-vol (common in crypto)
@@ -576,7 +577,7 @@ async def run_paper_test(
         regime_empirical_window_high_vol=30,
         regime_empirical_window_trending=60,
         # Tier 2: Mean-reverting size boost
-        regime_kelly_cap_boost_mean_reverting=1.5,
+        regime_kelly_cap_boost_mean_reverting=1.0,  # v43 Fix C: was 1.5 — no cap boost in mean-reverting
         # Tier 3: Conditional trend drift
         regime_conditional_drift=True,
         # Tier 3: Transition caution zone
@@ -616,6 +617,7 @@ async def run_paper_test(
         cell_yes_15min_uncertainty_mult=1.5,
         cell_yes_15min_kelly_multiplier=0.6,
         cell_yes_15min_max_position=25.0,
+        cell_yes_15min_empirical_window=15,   # v43 Fix D: was 30 — 30m lookback too long for 15m contracts
         # YES/daily — empirical with horizon-aware vol scaling
         cell_yes_daily_probability_model="empirical",
         cell_yes_daily_min_edge_pct=0.08,            # 8% — higher bar for daily (model extrapolating)
@@ -633,6 +635,7 @@ async def run_paper_test(
         cell_no_15min_uncertainty_mult=1.5,
         cell_no_15min_kelly_multiplier=0.6,
         cell_no_15min_max_position=25.0,
+        cell_no_15min_empirical_window=15,    # v43 Fix D: was 30 — match YES/15min lookback
         # NO/daily — mc_gbm: thin tails = proven alpha for "price won't move that far"
         cell_no_daily_probability_model="mc_gbm",
         cell_no_daily_min_edge_pct=0.08,             # 8% — higher bar for daily (model extrapolating)
@@ -654,6 +657,29 @@ async def run_paper_test(
         iv_crosscheck_dampen_factor=0.7,
         iv_crosscheck_boost_threshold=0.8,
         iv_crosscheck_boost_factor=1.1,
+        # ── v43: Post-mortem fixes ────────────────────────────────
+        model_prob_cap=0.90,               # Fix A: prevent empirical model saturating at P=1.0
+        model_prob_floor=0.10,             # Fix A: prevent P=0.0 extremes
+        market_disagreement_max=0.30,      # Fix B: skip when model vs market > 30pp
+        # ── v43: Daily pricing model ──────────────────────────────
+        daily_model_enabled=daily_model,
+        variance_ratio_enabled=True,
+        variance_ratio_min_samples=50,
+        merton_enabled=True,
+        merton_jump_mean=0.0,
+        merton_jump_vol=0.02,
+        merton_default_intensity=3.0,
+        merton_n_terms=15,
+        probability_floor_enabled=True,
+        probability_floor_min=0.005,
+        probability_ceiling_max=0.995,
+        daily_ou_weight_mean_reverting=0.7,
+        daily_gbm_weight_trending=0.7,
+        daily_merton_weight_deep=0.8,
+        daily_regime_transition_tau_minutes=5.0,
+        daily_moneyness_deep_threshold=3.0,
+        daily_moneyness_atm_threshold=1.0,
+        daily_ofi_weights="0.1,0.2,0.3,0.4",
     )
 
     engine = CryptoEngine(settings)
@@ -725,6 +751,11 @@ async def run_paper_test(
     print(f"  IV cross-check: {'ON' if settings.iv_crosscheck_enabled else 'OFF (collecting data)'}"
           f" (dampen>{settings.iv_crosscheck_dampen_threshold:.1f}x, boost<{settings.iv_crosscheck_boost_threshold:.1f}x)")
     print(f"  New features:   15 v42 columns (temporal, hawkes, ensemble, meta, IV, funding)")
+    print(f"  Daily model:    {'ON (v43 Merton/OU/GBM hybrid)' if settings.daily_model_enabled else 'OFF'}")
+    print(f"  VR correction:  {'ON' if settings.variance_ratio_enabled else 'OFF'} (min_samples={settings.variance_ratio_min_samples})")
+    print(f"  Prob bounds:    {'ON' if settings.probability_floor_enabled else 'OFF'} (floor={settings.probability_floor_min}, ceil={settings.probability_ceiling_max})")
+    print(f"  Prob cap:       [{settings.model_prob_floor:.2f}, {settings.model_prob_cap:.2f}]  (v43 Fix A)")
+    print(f"  Mkt disagree:   max={settings.market_disagreement_max:.0%}  (v43 Fix B)")
     print(f"{'='*70}\n")
 
     # Wire up cycle recorder if enabled
@@ -947,17 +978,27 @@ async def run_paper_test(
             quotes: list[CryptoMarketQuote] = []
             skipped = 0
             skipped_tte = 0
+            skipped_daily = 0
             for raw in raw_markets:
                 q = kalshi_raw_to_quote(raw, now, min_book_volume=settings.min_book_volume)
-                if q is not None and q.time_to_expiry_minutes <= max_tte:
+                if q is None:
+                    skipped += 1
+                    continue
+                # v43 Fix E: Exclude daily contracts by ticker when targeting 15min only.
+                # Daily tickers: KXBTCD-*, KXETHD-*, KXSOLD-* — these leak through
+                # TTE filter near their expiry hour.
+                if max_tte < 30 and q.market.meta.interval == "daily":
+                    skipped_daily += 1
+                    skipped += 1
+                    continue
+                if q.time_to_expiry_minutes <= max_tte:
                     quotes.append(q)
-                elif q is not None:
+                else:
                     skipped_tte += 1
                     skipped += 1
-                else:
-                    skipped += 1
 
-            print(f"   Markets: {len(quotes)} tradeable, {skipped} filtered (TTE={skipped_tte})")
+            daily_str = f", daily={skipped_daily}" if skipped_daily else ""
+            print(f"   Markets: {len(quotes)} tradeable, {skipped} filtered (TTE={skipped_tte}{daily_str})")
 
             if quotes:
                 # Group by interval type
@@ -1202,6 +1243,8 @@ def main() -> None:
     parser.add_argument("--model", choices=["mc_gbm", "student_t", "ab_test", "empirical", "ab_empirical"],
                         default="empirical",
                         help="Probability model (default: empirical)")
+    parser.add_argument("--daily-model", action="store_true",
+                        help="Enable v43 daily pricing model (Merton/OU/GBM hybrid)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1222,6 +1265,7 @@ def main() -> None:
         scan_interval=args.scan_interval,
         max_tte=args.max_tte,
         probability_model=args.model,
+        daily_model=args.daily_model,
     ))
 
 

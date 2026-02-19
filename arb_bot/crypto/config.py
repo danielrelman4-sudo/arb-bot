@@ -438,6 +438,43 @@ class CryptoSettings:
     iv_crosscheck_boost_threshold: float = 0.8   # If IV/model_vol < this, edge is more real
     iv_crosscheck_boost_factor: float = 1.1      # Multiply confidence when boosted
 
+    # ── Daily pricing model (v43) ───────────────────────────────
+    daily_model_enabled: bool = False  # Disabled until tested in paper mode
+
+    # 1A: Variance ratio vol correction
+    variance_ratio_enabled: bool = True
+    variance_ratio_min_samples: int = 50
+
+    # 1B: Merton jump-diffusion series
+    merton_enabled: bool = True
+    merton_jump_mean: float = 0.0      # Log-normal mean of jump size (μ_J)
+    merton_jump_vol: float = 0.02      # Log-normal std of jump size (σ_J)
+    merton_default_intensity: float = 3.0  # Jumps per day fallback if Hawkes unavailable
+    merton_n_terms: int = 15
+
+    # 1C: Probability floors/ceilings
+    probability_floor_enabled: bool = True
+    probability_floor_min: float = 0.005
+    probability_ceiling_max: float = 0.995
+
+    # 2A/2B: OU + regime-based model routing
+    daily_ou_weight_mean_reverting: float = 0.7
+    daily_gbm_weight_trending: float = 0.7
+    daily_merton_weight_deep: float = 0.8
+    daily_regime_transition_tau_minutes: float = 5.0
+    daily_moneyness_deep_threshold: float = 3.0
+    daily_moneyness_atm_threshold: float = 1.0
+
+    # 2C: OFI drift weights for daily contracts (reversed vs 15min)
+    daily_ofi_weights: str = "0.1,0.2,0.3,0.4"
+
+    # ── v43 post-mortem fixes ────────────────────────────────────
+    # Fix A: Cap model probability to prevent saturation at 0/1
+    model_prob_cap: float = 0.90
+    model_prob_floor: float = 0.10
+    # Fix B: Market disagreement veto — skip when model vs market > threshold
+    market_disagreement_max: float = 0.30
+
     # ── Settlement ────────────────────────────────────────────────
     settlement_grace_minutes: float = 10.0  # How long to wait for Kalshi settlement data
 
@@ -718,4 +755,26 @@ def load_crypto_settings() -> CryptoSettings:
         iv_crosscheck_boost_threshold=_as_float(os.getenv("ARB_CRYPTO_IV_CROSSCHECK_BOOST_THRESHOLD"), 0.8),
         iv_crosscheck_boost_factor=_as_float(os.getenv("ARB_CRYPTO_IV_CROSSCHECK_BOOST_FACTOR"), 1.1),
         settlement_grace_minutes=_as_float(os.getenv("ARB_CRYPTO_SETTLEMENT_GRACE_MINUTES"), 10.0),
+        # v43 daily pricing model
+        daily_model_enabled=_as_bool(os.getenv("ARB_CRYPTO_DAILY_MODEL_ENABLED"), False),
+        variance_ratio_enabled=_as_bool(os.getenv("ARB_CRYPTO_VARIANCE_RATIO_ENABLED"), True),
+        variance_ratio_min_samples=_as_int(os.getenv("ARB_CRYPTO_VARIANCE_RATIO_MIN_SAMPLES"), 50),
+        merton_enabled=_as_bool(os.getenv("ARB_CRYPTO_MERTON_ENABLED"), True),
+        merton_jump_mean=_as_float(os.getenv("ARB_CRYPTO_MERTON_JUMP_MEAN"), 0.0),
+        merton_jump_vol=_as_float(os.getenv("ARB_CRYPTO_MERTON_JUMP_VOL"), 0.02),
+        merton_default_intensity=_as_float(os.getenv("ARB_CRYPTO_MERTON_DEFAULT_INTENSITY"), 3.0),
+        merton_n_terms=_as_int(os.getenv("ARB_CRYPTO_MERTON_N_TERMS"), 15),
+        probability_floor_enabled=_as_bool(os.getenv("ARB_CRYPTO_PROBABILITY_FLOOR_ENABLED"), True),
+        probability_floor_min=_as_float(os.getenv("ARB_CRYPTO_PROBABILITY_FLOOR_MIN"), 0.005),
+        probability_ceiling_max=_as_float(os.getenv("ARB_CRYPTO_PROBABILITY_CEILING_MAX"), 0.995),
+        daily_ou_weight_mean_reverting=_as_float(os.getenv("ARB_CRYPTO_DAILY_OU_WEIGHT_MEAN_REVERTING"), 0.7),
+        daily_gbm_weight_trending=_as_float(os.getenv("ARB_CRYPTO_DAILY_GBM_WEIGHT_TRENDING"), 0.7),
+        daily_merton_weight_deep=_as_float(os.getenv("ARB_CRYPTO_DAILY_MERTON_WEIGHT_DEEP"), 0.8),
+        daily_regime_transition_tau_minutes=_as_float(os.getenv("ARB_CRYPTO_DAILY_REGIME_TRANSITION_TAU_MINUTES"), 5.0),
+        daily_moneyness_deep_threshold=_as_float(os.getenv("ARB_CRYPTO_DAILY_MONEYNESS_DEEP_THRESHOLD"), 3.0),
+        daily_moneyness_atm_threshold=_as_float(os.getenv("ARB_CRYPTO_DAILY_MONEYNESS_ATM_THRESHOLD"), 1.0),
+        daily_ofi_weights=os.getenv("ARB_CRYPTO_DAILY_OFI_WEIGHTS", "0.1,0.2,0.3,0.4"),
+        model_prob_cap=_as_float(os.getenv("ARB_CRYPTO_MODEL_PROB_CAP"), 0.90),
+        model_prob_floor=_as_float(os.getenv("ARB_CRYPTO_MODEL_PROB_FLOOR"), 0.10),
+        market_disagreement_max=_as_float(os.getenv("ARB_CRYPTO_MARKET_DISAGREEMENT_MAX"), 0.30),
     )
