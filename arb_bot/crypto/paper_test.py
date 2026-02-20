@@ -116,7 +116,7 @@ async def fetch_okx_klines(
     after: str | None = None  # OKX uses "after" for pagination (older data)
 
     try:
-        remaining = min(minutes, 300)  # Cap at 5 hours of 1m candles
+        remaining = minutes
         while remaining > 0:
             batch = min(remaining, 100)
             params: dict[str, str] = {
@@ -794,9 +794,10 @@ async def run_paper_test(
             await engine._funding_tracker.start(client)
 
         # 1. Bootstrap with OKX klines
-        print("Loading historical prices from OKX REST API...")
+        kline_minutes = settings.price_history_minutes
+        print(f"Loading historical prices from OKX REST API ({kline_minutes}m)...")
         for sym in binance_symbols:
-            klines = await fetch_okx_klines(sym, 60, client)
+            klines = await fetch_okx_klines(sym, kline_minutes, client)
             if klines:
                 for ts, close in klines:
                     engine.price_feed.inject_tick(
