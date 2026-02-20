@@ -1407,7 +1407,7 @@ class CryptoEngine:
         self._rec_edge_id_map = _rec_edge_id_map
         self._rec_filter_results_current = _filter_results
 
-        # 4. Size and execute edges (with per-cell filtering + sizing)
+        # 4. Size and execute edges
         from arb_bot.crypto.strategy_cell import StrategyCell, get_cell_config
         trades_opened = 0
         for edge in edges:
@@ -1419,38 +1419,47 @@ class CryptoEngine:
             if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
                 continue
 
-            # Per-cell filtering and sizing
-            cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
-            cell_cfg = get_cell_config(cell, self._settings) if cell else None
+            if self._settings.garch_enabled:
+                # GARCH fast path: skip all old-model filters (cell matrix,
+                # classifier veto, signal gates). Just size and trade.
+                contracts = self._compute_position_size(edge, cell_cfg=None)
+                if contracts <= 0:
+                    continue
+                self._execute_paper_trade(edge, contracts)
+            else:
+                # Legacy path with per-cell filtering and sizing
+                cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
+                cell_cfg = get_cell_config(cell, self._settings) if cell else None
 
-            # Per-cell edge threshold
-            if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
-                LOGGER.info(
-                    "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
-                    edge.market.ticker, edge.edge_cents * 100,
-                    cell.value, cell_cfg.min_edge_pct * 100,
-                )
-                continue
-
-            # Per-cell signal gates
-            if cell is not None and cell_cfg is not None:
-                if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                # Per-cell edge threshold
+                if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
+                    LOGGER.info(
+                        "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
+                        edge.market.ticker, edge.edge_cents * 100,
+                        cell.value, cell_cfg.min_edge_pct * 100,
+                    )
                     continue
 
-            # Quiet hours gate
-            if self._quiet_hours_gate(edge):
-                continue
+                # Per-cell signal gates
+                if cell is not None and cell_cfg is not None:
+                    if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                        continue
 
-            # Classifier veto gate
-            vetoed, p_win, fv = self._classifier_veto(edge)
-            if vetoed:
-                continue
+                # Quiet hours gate
+                if self._quiet_hours_gate(edge):
+                    continue
 
-            contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
-            if contracts <= 0:
-                continue
+                # Classifier veto gate
+                vetoed, p_win, fv = self._classifier_veto(edge)
+                if vetoed:
+                    continue
 
-            self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
+                contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
+                if contracts <= 0:
+                    continue
+
+                self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
+
             trades_opened += 1
             # Per-cycle entry throttle (v44 Fix G)
             if trades_opened >= self._settings.max_new_trades_per_cycle:
@@ -1901,38 +1910,46 @@ class CryptoEngine:
             if self._count_positions_for_underlying(underlying) >= self._settings.max_positions_per_underlying:
                 continue
 
-            # Per-cell filtering and sizing
-            cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
-            cell_cfg = _get_cell_config(cell, self._settings) if cell else None
+            if self._settings.garch_enabled:
+                # GARCH fast path: skip all old-model filters
+                contracts = self._compute_position_size(edge, cell_cfg=None)
+                if contracts <= 0:
+                    continue
+                self._execute_paper_trade(edge, contracts)
+            else:
+                # Legacy path with per-cell filtering and sizing
+                cell = StrategyCell(edge.strategy_cell) if edge.strategy_cell else None
+                cell_cfg = _get_cell_config(cell, self._settings) if cell else None
 
-            # Per-cell edge threshold
-            if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
-                LOGGER.info(
-                    "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
-                    edge.market.ticker, edge.edge_cents * 100,
-                    cell.value, cell_cfg.min_edge_pct * 100,
-                )
-                continue
-
-            # Per-cell signal gates
-            if cell is not None and cell_cfg is not None:
-                if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                # Per-cell edge threshold
+                if cell_cfg is not None and edge.edge_cents < cell_cfg.min_edge_pct:
+                    LOGGER.info(
+                        "CryptoEngine: cell reject %s — edge %.1f%% < %s floor %.1f%%",
+                        edge.market.ticker, edge.edge_cents * 100,
+                        cell.value, cell_cfg.min_edge_pct * 100,
+                    )
                     continue
 
-            # Quiet hours gate
-            if self._quiet_hours_gate(edge):
-                continue
+                # Per-cell signal gates
+                if cell is not None and cell_cfg is not None:
+                    if not self._passes_cell_signal_gates(edge, cell, cell_cfg):
+                        continue
 
-            # Classifier veto gate
-            vetoed, p_win, fv = self._classifier_veto(edge)
-            if vetoed:
-                continue
+                # Quiet hours gate
+                if self._quiet_hours_gate(edge):
+                    continue
 
-            contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
-            if contracts <= 0:
-                continue
+                # Classifier veto gate
+                vetoed, p_win, fv = self._classifier_veto(edge)
+                if vetoed:
+                    continue
 
-            self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
+                contracts = self._compute_position_size(edge, cell_cfg=cell_cfg)
+                if contracts <= 0:
+                    continue
+
+                self._execute_paper_trade(edge, contracts, prebuilt_fv=fv)
+
             trades_opened += 1
             # Per-cycle entry throttle (v44 Fix G)
             if trades_opened >= self._settings.max_new_trades_per_cycle:

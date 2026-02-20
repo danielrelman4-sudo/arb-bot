@@ -663,7 +663,7 @@ async def run_paper_test(
         # ── v43: Post-mortem fixes ────────────────────────────────
         model_prob_cap=0.95,               # Fix A: safety rail only — v44 Fix F handles saturation via uncertainty floor
         model_prob_floor=0.10,             # Fix A: prevent P=0.0 extremes
-        market_disagreement_max=0.30,      # Fix B: skip when model vs market > 30pp
+        market_disagreement_max=1.0 if garch_enabled else 0.30,  # Disabled for GARCH (disagreement IS the signal)
         # ── v43: Daily pricing model ──────────────────────────────
         daily_model_enabled=daily_model,
         # ── v45: GARCH vol-spread model ──────────────────────────
