@@ -633,7 +633,7 @@ async def run_paper_test(
         cell_yes_daily_max_position=25.0,
         # NO/15min — mc_gbm: Gaussian tails underestimate extremes → edge for "won't reach X"
         cell_no_15min_probability_model="mc_gbm",
-        cell_no_15min_min_edge_pct=1.0,              # DISABLED — 25% WR in v40, no edge (100% edge = impossible)
+        cell_no_15min_min_edge_pct=0.04,             # 4% — same as global min (was 100% to disable old model)
         cell_no_15min_model_weight=0.65,             # Trust model for short horizon
         cell_no_15min_uncertainty_mult=1.5,
         cell_no_15min_kelly_multiplier=0.6,
