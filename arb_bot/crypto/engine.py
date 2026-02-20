@@ -2450,15 +2450,25 @@ class CryptoEngine:
             # ── v45: GARCH vol-spread model ──────────────────────────
             # When enabled, compute GARCH-based probability from the
             # divergence between GARCH-forecasted vol and market-implied vol.
-            # The result feeds into the standard post-processing pipeline
-            # (z-score clamp, calibration, uncertainty scaling, prob cap).
-            # Works for any contract type that has a strike; compute_signal
-            # returns None gracefully when it can't produce a signal.
+            # Works for any contract with a strike (above/below) or an
+            # interval start price (up/down — treat as above/below ref_price).
             garch_prob: Optional[ProbabilityEstimate] = None
+
+            # Resolve effective strike for up/down contracts (no explicit strike)
+            effective_strike = strike
+            garch_direction = direction
+            if strike is None and direction in ("up", "down"):
+                if mq.market.meta.interval_start_time is not None:
+                    start_ts = mq.market.meta.interval_start_time.timestamp()
+                    effective_strike = self._price_feed.get_price_at_time(binance_sym, start_ts)
+                if effective_strike is None:
+                    effective_strike = current_price
+                garch_direction = "above" if direction == "up" else "below"
+
             if (
                 self._settings.garch_enabled
                 and binance_sym in self._garch_models
-                and strike is not None
+                and effective_strike is not None
             ):
                 garch_model = self._garch_models[binance_sym]
                 garch_returns_1m = self._price_feed.get_returns(
@@ -2479,13 +2489,13 @@ class CryptoEngine:
 
                     if garch_market_price is not None and 0.01 < garch_market_price < 0.99:
                         signal = garch_model.compute_signal(
-                            garch_returns_arr, current_price, strike, horizon,
-                            garch_market_price, direction, drift=drift,
+                            garch_returns_arr, current_price, effective_strike, horizon,
+                            garch_market_price, garch_direction, drift=drift,
                         )
                         if signal is not None:
                             garch_est = garch_model.compute_garch_probability(
-                                current_price, strike, signal.garch_vol,
-                                horizon, drift=drift, direction=direction,
+                                current_price, effective_strike, signal.garch_vol,
+                                horizon, drift=drift, direction=garch_direction,
                             )
 
                             # Blend GARCH probability with market price
