@@ -255,6 +255,7 @@ class CryptoEngine:
             min_edge_pct_daily=settings.min_edge_pct_daily,
             min_edge_cents=settings.min_edge_cents,
             max_model_uncertainty=settings.max_model_uncertainty,
+            use_blending=not settings.garch_enabled,  # GARCH is the model — don't blend back toward market
             min_edge_pct_no_side=settings.min_edge_pct_no_side,
             min_model_market_divergence=settings.min_model_market_divergence,
             dynamic_edge_enabled=settings.dynamic_edge_threshold_enabled,
