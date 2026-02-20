@@ -1192,7 +1192,9 @@ class CryptoEngine:
         # VPIN measures short-term order toxicity, not whether a strike will be
         # reached over the next hour+.  Daily edges are structural (model vs market),
         # not microstructure-driven.
-        if _vpin_halted_symbols or _vpin_momentum_symbols:
+        # When GARCH is enabled, skip VPIN edge filtering — GARCH vol forecast
+        # already incorporates the volatility regime that VPIN tries to detect.
+        if not self._settings.garch_enabled and (_vpin_halted_symbols or _vpin_momentum_symbols):
             blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
             pre_count = len(edges)
             edges = [
@@ -1675,7 +1677,9 @@ class CryptoEngine:
 
         # Filter edges for symbols in halted or momentum zone (model-path only)
         # Daily (above/below) markets with TTE > 30m are EXEMPT from VPIN filtering.
-        if _vpin_halted_symbols or _vpin_momentum_symbols:
+        # When GARCH is enabled, skip VPIN edge filtering — GARCH vol forecast
+        # already incorporates the volatility regime that VPIN tries to detect.
+        if not self._settings.garch_enabled and (_vpin_halted_symbols or _vpin_momentum_symbols):
             blocked_syms = _vpin_halted_symbols | _vpin_momentum_symbols
             pre_count = len(edges)
             edges = [
