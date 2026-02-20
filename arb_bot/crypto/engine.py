@@ -3733,7 +3733,7 @@ class CryptoEngine:
         if abs(edge.edge) < self._settings.quiet_hours_min_edge:
             LOGGER.info(
                 "CryptoEngine: quiet hours gate blocked %s — edge %.1f%% < min %.1f%% (UTC hour %d)",
-                edge.market.id, edge.edge * 100, self._settings.quiet_hours_min_edge * 100, utc_hour,
+                edge.market.ticker, edge.edge * 100, self._settings.quiet_hours_min_edge * 100, utc_hour,
             )
             return True
 
