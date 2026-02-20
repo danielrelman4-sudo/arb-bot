@@ -415,6 +415,7 @@ async def run_paper_test(
         symbols=[f"KX{u}" for u in underlyings],
         price_feed_symbols=[s.lower() for s in binance_symbols],
         mc_num_paths=mc_paths,
+        price_history_minutes=1440 if garch_enabled else 60,  # GARCH needs 24h of 1-min data at startup
         min_edge_pct=min_edge,
         min_edge_pct_daily=min_edge,  # Same as min_edge; per-cell logic applies stricter thresholds
         min_edge_cents=min_edge,

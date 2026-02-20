@@ -369,7 +369,7 @@ class PriceFeed:
 
         all_candles: list[list] = []
         after: str | None = None
-        remaining = min(self._history_minutes, 300)
+        remaining = self._history_minutes
 
         try:
             import aiohttp
