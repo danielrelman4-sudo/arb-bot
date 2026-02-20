@@ -2444,12 +2444,12 @@ class CryptoEngine:
 
                     # Get market price from best bid/ask midpoint
                     garch_market_price = None
-                    if mq.best_yes_ask is not None and mq.best_yes_bid is not None:
-                        garch_market_price = (mq.best_yes_ask + mq.best_yes_bid) / 200.0
-                    elif mq.best_yes_ask is not None:
-                        garch_market_price = mq.best_yes_ask / 100.0
-                    elif mq.best_yes_bid is not None:
-                        garch_market_price = mq.best_yes_bid / 100.0
+                    if mq.yes_bid_price is not None and mq.yes_buy_price is not None:
+                        garch_market_price = (mq.yes_buy_price + mq.yes_bid_price) / 2.0
+                    elif mq.yes_buy_price is not None:
+                        garch_market_price = mq.yes_buy_price
+                    elif mq.yes_bid_price is not None:
+                        garch_market_price = mq.yes_bid_price
 
                     if garch_market_price is not None and 0.01 < garch_market_price < 0.99:
                         signal = garch_model.compute_signal(
