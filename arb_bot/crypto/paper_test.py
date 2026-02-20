@@ -400,6 +400,7 @@ async def run_paper_test(
     max_tte: int,
     probability_model: str = "empirical",
     daily_model: bool = False,
+    garch_enabled: bool = False,
 ) -> None:
     """Run the crypto engine paper test."""
 
@@ -664,6 +665,19 @@ async def run_paper_test(
         market_disagreement_max=0.30,      # Fix B: skip when model vs market > 30pp
         # ── v43: Daily pricing model ──────────────────────────────
         daily_model_enabled=daily_model,
+        # ── v45: GARCH vol-spread model ──────────────────────────
+        garch_enabled=garch_enabled,
+        garch_lookback_minutes=1440,          # 24h of 1-min data
+        garch_min_obs=120,                    # Min 2h before producing signals
+        garch_refit_interval_minutes=60,      # Re-estimate hourly
+        garch_vol_spread_entry_z=1.5,         # Min |z| for directional signal
+        garch_spread_history_size=500,        # Rolling window for z-scoring
+        garch_probability_weight=0.6,         # 60% GARCH, 40% market
+        garch_market_weight=0.4,
+        garch_min_moneyness_sigma=0.3,        # Filter ATM (no edge)
+        garch_max_moneyness_sigma=2.5,        # Filter deep OTM (no liquidity)
+        garch_uncertainty_base=0.03,          # Base uncertainty
+        garch_interval_seconds=60,            # 1-min intervals
         variance_ratio_enabled=True,
         variance_ratio_min_samples=50,
         merton_enabled=True,
@@ -757,6 +771,8 @@ async def run_paper_test(
     print(f"  Prob bounds:    {'ON' if settings.probability_floor_enabled else 'OFF'} (floor={settings.probability_floor_min}, ceil={settings.probability_ceiling_max})")
     print(f"  Prob cap:       [{settings.model_prob_floor:.2f}, {settings.model_prob_cap:.2f}]  (v43 Fix A)")
     print(f"  Mkt disagree:   max={settings.market_disagreement_max:.0%}  (v43 Fix B)")
+    print(f"  GARCH model:    {'ON (v45 vol-spread)' if settings.garch_enabled else 'OFF'}"
+          f"{' (lookback=' + str(settings.garch_lookback_minutes) + 'm, refit=' + str(settings.garch_refit_interval_minutes) + 'm, z_entry=' + str(settings.garch_vol_spread_entry_z) + ')' if settings.garch_enabled else ''}")
     print(f"{'='*70}\n")
 
     # Wire up cycle recorder if enabled
@@ -1246,6 +1262,8 @@ def main() -> None:
                         help="Probability model (default: empirical)")
     parser.add_argument("--daily-model", action="store_true",
                         help="Enable v43 daily pricing model (Merton/OU/GBM hybrid)")
+    parser.add_argument("--garch", action="store_true",
+                        help="Enable v45 GARCH vol-spread model (replaces bootstrap/MC)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1267,6 +1285,7 @@ def main() -> None:
         max_tte=args.max_tte,
         probability_model=args.model,
         daily_model=args.daily_model,
+        garch_enabled=args.garch,
     ))
 
 

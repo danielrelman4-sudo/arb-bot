@@ -43,6 +43,7 @@ from arb_bot.crypto.price_model import PriceModel, ProbabilityEstimate
 from arb_bot.crypto.regime_detector import RegimeDetector, RegimeSnapshot, MarketRegime
 from arb_bot.crypto.cycle_recorder import FilterResult
 from arb_bot.crypto.staleness_detector import StalenessDetector
+from arb_bot.crypto.vol_spread_model import VolSpreadModel
 
 LOGGER = logging.getLogger(__name__)
 
@@ -382,6 +383,26 @@ class CryptoEngine:
         # v42: Funding rate persistence tracking
         self._funding_sign_persistence: Dict[str, int] = {}  # symbol → consecutive same-sign count
         self._funding_last_sign: Dict[str, int] = {}  # symbol → last sign (-1, 0, 1)
+
+        # v45: GARCH vol-spread model
+        self._garch_models: Dict[str, VolSpreadModel] = {}  # binance_sym → VolSpreadModel
+        if settings.garch_enabled:
+            from arb_bot.crypto.garch_vol import GarchForecaster
+            for sym in settings.price_feed_symbols:
+                forecaster = GarchForecaster(
+                    min_obs=settings.garch_min_obs,
+                    refit_interval=settings.garch_refit_interval_minutes,
+                    lookback_obs=settings.garch_lookback_minutes,
+                    interval_seconds=settings.garch_interval_seconds,
+                )
+                self._garch_models[sym] = VolSpreadModel(
+                    garch_forecaster=forecaster,
+                    spread_history_size=settings.garch_spread_history_size,
+                    entry_z_threshold=settings.garch_vol_spread_entry_z,
+                    min_moneyness_sigma=settings.garch_min_moneyness_sigma,
+                    max_moneyness_sigma=settings.garch_max_moneyness_sigma,
+                    uncertainty_base=settings.garch_uncertainty_base,
+                )
 
         # Confidence scorer (B2)
         self._confidence_scorer = None
@@ -2399,6 +2420,106 @@ class CryptoEngine:
             if direction not in self._settings.allowed_directions:
                 continue
             strike = mq.market.meta.strike
+
+            # ── v45: GARCH vol-spread model ──────────────────────────
+            # When enabled, compute GARCH-based probability from the
+            # divergence between GARCH-forecasted vol and market-implied vol.
+            # The result feeds into the standard post-processing pipeline
+            # (z-score clamp, calibration, uncertainty scaling, prob cap).
+            # Works for any contract type that has a strike; compute_signal
+            # returns None gracefully when it can't produce a signal.
+            garch_prob: Optional[ProbabilityEstimate] = None
+            if (
+                self._settings.garch_enabled
+                and binance_sym in self._garch_models
+                and strike is not None
+            ):
+                garch_model = self._garch_models[binance_sym]
+                garch_returns_1m = self._price_feed.get_returns(
+                    binance_sym, interval_seconds=60,
+                    window_minutes=self._settings.garch_lookback_minutes,
+                )
+                if len(garch_returns_1m) >= self._settings.garch_min_obs:
+                    garch_returns_arr = np.array(garch_returns_1m, dtype=np.float64)
+
+                    # Get market price from best bid/ask midpoint
+                    garch_market_price = None
+                    if mq.best_yes_ask is not None and mq.best_yes_bid is not None:
+                        garch_market_price = (mq.best_yes_ask + mq.best_yes_bid) / 200.0
+                    elif mq.best_yes_ask is not None:
+                        garch_market_price = mq.best_yes_ask / 100.0
+                    elif mq.best_yes_bid is not None:
+                        garch_market_price = mq.best_yes_bid / 100.0
+
+                    if garch_market_price is not None and 0.01 < garch_market_price < 0.99:
+                        signal = garch_model.compute_signal(
+                            garch_returns_arr, current_price, strike, horizon,
+                            garch_market_price, direction, drift=drift,
+                        )
+                        if signal is not None:
+                            garch_est = garch_model.compute_garch_probability(
+                                current_price, strike, signal.garch_vol,
+                                horizon, drift=drift, direction=direction,
+                            )
+
+                            # Blend GARCH probability with market price
+                            gw = self._settings.garch_probability_weight
+                            mw = self._settings.garch_market_weight
+                            blended_p = gw * garch_est.probability + mw * garch_market_price
+                            blended_p = max(0.01, min(0.99, blended_p))
+
+                            garch_prob = ProbabilityEstimate(
+                                probability=blended_p,
+                                ci_lower=max(0.0, blended_p - garch_est.uncertainty),
+                                ci_upper=min(1.0, blended_p + garch_est.uncertainty),
+                                uncertainty=garch_est.uncertainty,
+                                num_paths=0,
+                            )
+
+                            LOGGER.info(
+                                "GARCH %s: garch_vol=%.1f%% iv=%.1f%% "
+                                "spread=%.4f z=%.2f signal=%s "
+                                "garch_p=%.3f market=%.3f blended=%.3f conf=%.3f",
+                                mq.market.ticker,
+                                signal.garch_vol * 100,
+                                signal.implied_vol * 100,
+                                signal.vol_spread,
+                                signal.vol_spread_zscore,
+                                signal.signal_direction,
+                                garch_est.probability,
+                                garch_market_price,
+                                blended_p,
+                                signal.confidence,
+                            )
+
+            # When GARCH is enabled and produced a probability, skip the
+            # old pipeline entirely — it's proven not to work.  If GARCH
+            # couldn't produce a signal for this contract, skip it too
+            # rather than falling back to a broken model.
+            if self._settings.garch_enabled:
+                if garch_prob is not None:
+                    # Jump straight to post-processing with the GARCH result.
+                    prob = garch_prob
+                    # Apply prob cap (v43 Fix A) — still useful as a safety rail
+                    cap = self._settings.model_prob_cap
+                    floor = self._settings.model_prob_floor
+                    if cap < 1.0 or floor > 0.0:
+                        raw_p = prob.probability
+                        capped_p = max(floor, min(cap, raw_p))
+                        if capped_p != raw_p:
+                            prob = ProbabilityEstimate(
+                                probability=capped_p,
+                                ci_lower=max(0.0, capped_p - prob.uncertainty),
+                                ci_upper=min(1.0, capped_p + prob.uncertainty),
+                                uncertainty=prob.uncertainty,
+                                num_paths=0,
+                            )
+                    result[mq.market.ticker] = prob
+                    continue
+                else:
+                    # GARCH enabled but couldn't produce signal — skip, don't
+                    # fall back to the old models.
+                    continue
 
             if is_daily_contract and self._settings.daily_model_enabled:
                 # OFI weight reversal for daily contracts (2C)
