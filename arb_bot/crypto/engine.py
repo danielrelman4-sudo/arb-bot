@@ -1215,10 +1215,12 @@ class CryptoEngine:
             _filter_results = {e.market.ticker: FilterResult() for e in edges}
 
         # 3-cell. Per-cell model adjustments (blending weight, prob haircut)
-        edges = self._apply_cell_model_adjustments(edges)
+        # Skip when GARCH is enabled — these are old-model corrections.
+        if not self._settings.garch_enabled:
+            edges = self._apply_cell_model_adjustments(edges)
 
         # 3-regime. Regime min edge filter
-        if self._settings.regime_min_edge_enabled and self._current_regime is not None:
+        if not self._settings.garch_enabled and self._settings.regime_min_edge_enabled and self._current_regime is not None:
             regime = self._current_regime.regime
             _regime_min_edges = {
                 "mean_reverting": self._settings.regime_min_edge_mean_reverting,
@@ -1709,10 +1711,12 @@ class CryptoEngine:
             _filter_results = {e.market.ticker: FilterResult() for e in edges}
 
         # Per-cell model adjustments (blending weight, prob haircut)
-        edges = self._apply_cell_model_adjustments(edges)
+        # Skip when GARCH is enabled — these are old-model corrections.
+        if not self._settings.garch_enabled:
+            edges = self._apply_cell_model_adjustments(edges)
 
         # Regime min edge filter
-        if self._settings.regime_min_edge_enabled and self._current_regime is not None:
+        if not self._settings.garch_enabled and self._settings.regime_min_edge_enabled and self._current_regime is not None:
             regime = self._current_regime.regime
             _regime_min_edges = {
                 "mean_reverting": self._settings.regime_min_edge_mean_reverting,
