@@ -671,10 +671,10 @@ async def run_paper_test(
         garch_lookback_minutes=1440,          # 24h of 1-min data
         garch_min_obs=120,                    # Min 2h before producing signals
         garch_refit_interval_minutes=60,      # Re-estimate hourly
-        garch_vol_spread_entry_z=1.5,         # Min |z| for directional signal
+        garch_vol_spread_entry_z=0.0,         # Disabled — let edge detector filter
         garch_spread_history_size=500,        # Rolling window for z-scoring
-        garch_probability_weight=0.6,         # 60% GARCH, 40% market
-        garch_market_weight=0.4,
+        garch_probability_weight=1.0,         # Pure GARCH probability
+        garch_market_weight=0.0,              # No market blending
         garch_min_moneyness_sigma=0.3,        # Filter ATM (no edge)
         garch_max_moneyness_sigma=2.5,        # Filter deep OTM (no liquidity)
         garch_uncertainty_base=0.03,          # Base uncertainty
