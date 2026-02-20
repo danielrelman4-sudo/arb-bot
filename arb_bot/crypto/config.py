@@ -481,10 +481,10 @@ class CryptoSettings:
     garch_lookback_minutes: int = 1440        # 24h of 1-min data for fitting
     garch_min_obs: int = 120                  # Minimum observations to fit (2h)
     garch_refit_interval_minutes: int = 60    # Re-estimate params every 60 min
-    garch_vol_spread_entry_z: float = 1.5     # Min |z-score| for buy/sell signal
+    garch_vol_spread_entry_z: float = 0.0     # Min |z-score| for buy/sell signal (0 = disabled)
     garch_spread_history_size: int = 500      # Rolling window for z-scoring
-    garch_probability_weight: float = 0.6     # Weight on GARCH probability
-    garch_market_weight: float = 0.4          # Weight on market price
+    garch_probability_weight: float = 1.0     # Weight on GARCH probability
+    garch_market_weight: float = 0.0          # Weight on market price
     garch_min_moneyness_sigma: float = 0.3    # Min moneyness in sigma units
     garch_max_moneyness_sigma: float = 2.5    # Max moneyness in sigma units
     garch_uncertainty_base: float = 0.03      # Base uncertainty for GARCH estimates
@@ -798,10 +798,10 @@ def load_crypto_settings() -> CryptoSettings:
         garch_lookback_minutes=_as_int(os.getenv("ARB_CRYPTO_GARCH_LOOKBACK_MINUTES"), 1440),
         garch_min_obs=_as_int(os.getenv("ARB_CRYPTO_GARCH_MIN_OBS"), 120),
         garch_refit_interval_minutes=_as_int(os.getenv("ARB_CRYPTO_GARCH_REFIT_INTERVAL_MINUTES"), 60),
-        garch_vol_spread_entry_z=_as_float(os.getenv("ARB_CRYPTO_GARCH_VOL_SPREAD_ENTRY_Z"), 1.5),
+        garch_vol_spread_entry_z=_as_float(os.getenv("ARB_CRYPTO_GARCH_VOL_SPREAD_ENTRY_Z"), 0.0),
         garch_spread_history_size=_as_int(os.getenv("ARB_CRYPTO_GARCH_SPREAD_HISTORY_SIZE"), 500),
-        garch_probability_weight=_as_float(os.getenv("ARB_CRYPTO_GARCH_PROBABILITY_WEIGHT"), 0.6),
-        garch_market_weight=_as_float(os.getenv("ARB_CRYPTO_GARCH_MARKET_WEIGHT"), 0.4),
+        garch_probability_weight=_as_float(os.getenv("ARB_CRYPTO_GARCH_PROBABILITY_WEIGHT"), 1.0),
+        garch_market_weight=_as_float(os.getenv("ARB_CRYPTO_GARCH_MARKET_WEIGHT"), 0.0),
         garch_min_moneyness_sigma=_as_float(os.getenv("ARB_CRYPTO_GARCH_MIN_MONEYNESS_SIGMA"), 0.3),
         garch_max_moneyness_sigma=_as_float(os.getenv("ARB_CRYPTO_GARCH_MAX_MONEYNESS_SIGMA"), 2.5),
         garch_uncertainty_base=_as_float(os.getenv("ARB_CRYPTO_GARCH_UNCERTAINTY_BASE"), 0.03),
